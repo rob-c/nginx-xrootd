@@ -524,6 +524,45 @@ typedef struct {
 } ClientRmRequest;           /* 24 bytes */
 
 /* ------------------------------------------------------------------ */
+/* kXR_rmdir (3015)                                                     */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    kXR_char   streamid[2];
+    kXR_unt16  requestid;    /* kXR_rmdir */
+    kXR_char   reserved[16];
+    kXR_int32  dlen;         /* path length */
+    /* null-terminated path follows as payload */
+} ClientRmdirRequest;        /* 24 bytes */
+
+/* ------------------------------------------------------------------ */
+/* kXR_mv (3009)                                                        */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    kXR_char   streamid[2];
+    kXR_unt16  requestid;    /* kXR_mv */
+    kXR_char   reserved[14];
+    kXR_int16  arg1len;      /* byte length of source path in payload */
+    kXR_int32  dlen;         /* total payload length (src + '\0' + dst) */
+    /* payload: source path (arg1len bytes, null-terminated) followed
+     *          immediately by dest path (null-terminated) */
+} ClientMvRequest;           /* 24 bytes */
+
+/* ------------------------------------------------------------------ */
+/* kXR_chmod (3002)                                                     */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    kXR_char   streamid[2];
+    kXR_unt16  requestid;    /* kXR_chmod */
+    kXR_char   reserved[14];
+    kXR_unt16  mode;         /* POSIX permission bits */
+    kXR_int32  dlen;         /* path length */
+    /* null-terminated path follows as payload */
+} ClientChmodRequest;        /* 24 bytes */
+
+/* ------------------------------------------------------------------ */
 /* kXR_endsess (3023)                                                   */
 /* ------------------------------------------------------------------ */
 

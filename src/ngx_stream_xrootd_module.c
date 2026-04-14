@@ -351,6 +351,12 @@ static ngx_int_t xrootd_handle_mkdir(xrootd_ctx_t *ctx,
     ngx_connection_t *c, ngx_stream_xrootd_srv_conf_t *conf);
 static ngx_int_t xrootd_handle_rm(xrootd_ctx_t *ctx,
     ngx_connection_t *c, ngx_stream_xrootd_srv_conf_t *conf);
+static ngx_int_t xrootd_handle_rmdir(xrootd_ctx_t *ctx,
+    ngx_connection_t *c, ngx_stream_xrootd_srv_conf_t *conf);
+static ngx_int_t xrootd_handle_mv(xrootd_ctx_t *ctx,
+    ngx_connection_t *c, ngx_stream_xrootd_srv_conf_t *conf);
+static ngx_int_t xrootd_handle_chmod(xrootd_ctx_t *ctx,
+    ngx_connection_t *c, ngx_stream_xrootd_srv_conf_t *conf);
 
 static ngx_int_t xrootd_send_ok(xrootd_ctx_t *ctx, ngx_connection_t *c,
     const void *body, uint32_t bodylen);
@@ -362,6 +368,9 @@ static ngx_int_t xrootd_send_pgwrite_status(xrootd_ctx_t *ctx,
 static void xrootd_build_resp_hdr(const u_char *streamid, uint16_t status,
     uint32_t dlen, ServerResponseHdr *out);
 
+static int  xrootd_resolve_path_noexist(ngx_log_t *log,
+    const ngx_str_t *root, const char *reqpath,
+    char *resolved, size_t resolvsz);
 static int  xrootd_resolve_path(ngx_log_t *log,
     const ngx_str_t *root, const char *reqpath,
     char *resolved, size_t resolvsz);
@@ -1333,15 +1342,33 @@ xrootd_dispatch(xrootd_ctx_t *ctx, ngx_connection_t *c,
         return xrootd_handle_rm(ctx, c, conf);
 
     case kXR_writev:
-    case kXR_rmdir:
-    case kXR_mv:
-    case kXR_chmod:
         if (!conf->allow_write) {
             return xrootd_send_error(ctx, c, kXR_fsReadOnly,
                                      "this is a read-only server");
         }
         return xrootd_send_error(ctx, c, kXR_Unsupported,
                                  "operation not implemented");
+
+    case kXR_rmdir:
+        if (!conf->allow_write) {
+            return xrootd_send_error(ctx, c, kXR_fsReadOnly,
+                                     "this is a read-only server");
+        }
+        return xrootd_handle_rmdir(ctx, c, conf);
+
+    case kXR_mv:
+        if (!conf->allow_write) {
+            return xrootd_send_error(ctx, c, kXR_fsReadOnly,
+                                     "this is a read-only server");
+        }
+        return xrootd_handle_mv(ctx, c, conf);
+
+    case kXR_chmod:
+        if (!conf->allow_write) {
+            return xrootd_send_error(ctx, c, kXR_fsReadOnly,
+                                     "this is a read-only server");
+        }
+        return xrootd_handle_chmod(ctx, c, conf);
 
     default:
         ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
@@ -2948,13 +2975,27 @@ xrootd_handle_mkdir(xrootd_ctx_t *ctx, ngx_connection_t *c,
         mode = 0755;
     }
 
-    /* For mkdir the directory doesn't exist yet; resolve parent to verify root */
-    if (!xrootd_resolve_path_write(c->log, &conf->root,
-                                   (const char *) ctx->payload,
-                                   resolved, sizeof(resolved))) {
-        xrootd_log_access(ctx, c, "MKDIR", (char *) ctx->payload, "-",
-                          0, kXR_NotFound, "invalid path", 0);
-        return xrootd_send_error(ctx, c, kXR_NotFound, "invalid path");
+    /*
+     * Resolve the target path.  For recursive mkdir intermediate directories
+     * do not exist yet, so we use xrootd_resolve_path_noexist (no realpath).
+     * For a single-level mkdir the parent must exist, so use the write resolver.
+     */
+    if (recursive) {
+        if (!xrootd_resolve_path_noexist(c->log, &conf->root,
+                                          (const char *) ctx->payload,
+                                          resolved, sizeof(resolved))) {
+            xrootd_log_access(ctx, c, "MKDIR", (char *) ctx->payload, "-",
+                              0, kXR_NotFound, "invalid path", 0);
+            return xrootd_send_error(ctx, c, kXR_NotFound, "invalid path");
+        }
+    } else {
+        if (!xrootd_resolve_path_write(c->log, &conf->root,
+                                       (const char *) ctx->payload,
+                                       resolved, sizeof(resolved))) {
+            xrootd_log_access(ctx, c, "MKDIR", (char *) ctx->payload, "-",
+                              0, kXR_NotFound, "invalid path", 0);
+            return xrootd_send_error(ctx, c, kXR_NotFound, "invalid path");
+        }
     }
 
     if (recursive) {
@@ -3023,6 +3064,189 @@ xrootd_handle_rm(xrootd_ctx_t *ctx, ngx_connection_t *c,
     }
 
     xrootd_log_access(ctx, c, "RM", resolved, "-", 1, 0, NULL, 0);
+    return xrootd_send_ok(ctx, c, NULL, 0);
+}
+
+/*
+ * kXR_rmdir — remove an empty directory.
+ *
+ * Path is in the payload.  Fails with kXR_NotFound if path doesn't exist,
+ * kXR_FSError (ENOTEMPTY) if the directory is not empty.
+ */
+static ngx_int_t
+xrootd_handle_rmdir(xrootd_ctx_t *ctx, ngx_connection_t *c,
+                    ngx_stream_xrootd_srv_conf_t *conf)
+{
+    char resolved[PATH_MAX];
+
+    if (ctx->payload == NULL || ctx->cur_dlen == 0) {
+        return xrootd_send_error(ctx, c, kXR_ArgMissing, "no path given");
+    }
+
+    if (!xrootd_resolve_path(c->log, &conf->root,
+                              (const char *) ctx->payload,
+                              resolved, sizeof(resolved))) {
+        xrootd_log_access(ctx, c, "RMDIR", (char *) ctx->payload, "-",
+                          0, kXR_NotFound, "directory not found", 0);
+        return xrootd_send_error(ctx, c, kXR_NotFound, "directory not found");
+    }
+
+    if (rmdir(resolved) != 0) {
+        int err = errno;
+        if (err == ENOTEMPTY || err == EEXIST) {
+            xrootd_log_access(ctx, c, "RMDIR", resolved, "-",
+                              0, kXR_FSError, "directory not empty", 0);
+            return xrootd_send_error(ctx, c, kXR_FSError,
+                                     "directory not empty");
+        }
+        if (err == EACCES || err == EPERM) {
+            xrootd_log_access(ctx, c, "RMDIR", resolved, "-",
+                              0, kXR_NotAuthorized, "permission denied", 0);
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "permission denied");
+        }
+        if (err == ENOTDIR) {
+            xrootd_log_access(ctx, c, "RMDIR", resolved, "-",
+                              0, kXR_NotFile, "not a directory", 0);
+            return xrootd_send_error(ctx, c, kXR_NotFile, "not a directory");
+        }
+        xrootd_log_access(ctx, c, "RMDIR", resolved, "-",
+                          0, kXR_IOError, strerror(err), 0);
+        return xrootd_send_error(ctx, c, kXR_IOError, strerror(err));
+    }
+
+    xrootd_log_access(ctx, c, "RMDIR", resolved, "-", 1, 0, NULL, 0);
+    return xrootd_send_ok(ctx, c, NULL, 0);
+}
+
+/*
+ * kXR_mv — rename/move a file or directory.
+ *
+ * The header's arg1len gives the byte length of the source path.
+ * Payload layout: src[arg1len] (null-terminated) + dest (null-terminated).
+ * Both paths must be inside the server root; rename() is used, so cross-
+ * device moves are not supported.
+ */
+static ngx_int_t
+xrootd_handle_mv(xrootd_ctx_t *ctx, ngx_connection_t *c,
+                 ngx_stream_xrootd_srv_conf_t *conf)
+{
+    ClientMvRequest *req = (ClientMvRequest *) ctx->hdr_buf;
+    char src_resolved[PATH_MAX];
+    char dst_resolved[PATH_MAX];
+    char src_buf[PATH_MAX];      /* null-terminated copy of source path */
+    int16_t  src_len;
+    const char *src_path, *dst_path;
+
+    if (ctx->payload == NULL || ctx->cur_dlen == 0) {
+        return xrootd_send_error(ctx, c, kXR_ArgMissing, "no paths given");
+    }
+
+    /*
+     * Wire format (from XrdClFileSystem.cc):
+     *   arg1len = source.length()       (NOT including any terminator)
+     *   dlen    = src.length() + dst.length() + 1
+     *   payload = src[arg1len] + ' ' + dst[...]
+     * The separator between source and destination is a single space (0x20).
+     */
+    src_len = (int16_t) ntohs((uint16_t) req->arg1len);
+    if (src_len <= 0 || (uint32_t)(src_len + 1) >= ctx->cur_dlen) {
+        return xrootd_send_error(ctx, c, kXR_ArgInvalid,
+                                 "invalid arg1len for mv");
+    }
+
+    src_path = (const char *) ctx->payload;
+    /* Separator byte at src_len must be a space */
+    if (ctx->payload[src_len] != ' ') {
+        return xrootd_send_error(ctx, c, kXR_ArgInvalid,
+                                 "mv payload separator not a space");
+    }
+    dst_path = (const char *) ctx->payload + src_len + 1;
+
+    /* Copy source path into a null-terminated buffer for resolve */
+    if (src_len >= (int16_t) sizeof(src_buf)) {
+        return xrootd_send_error(ctx, c, kXR_ArgTooLong, "source path too long");
+    }
+    ngx_memcpy(src_buf, src_path, src_len);
+    src_buf[src_len] = '\0';
+
+    if (!xrootd_resolve_path(c->log, &conf->root, src_buf,
+                              src_resolved, sizeof(src_resolved))) {
+        xrootd_log_access(ctx, c, "MV", src_buf, "-",
+                          0, kXR_NotFound, "source not found", 0);
+        return xrootd_send_error(ctx, c, kXR_NotFound, "source not found");
+    }
+
+    if (!xrootd_resolve_path_write(c->log, &conf->root, dst_path,
+                                    dst_resolved, sizeof(dst_resolved))) {
+        xrootd_log_access(ctx, c, "MV", src_buf, "-",
+                          0, kXR_NotFound, "invalid destination path", 0);
+        return xrootd_send_error(ctx, c, kXR_NotFound,
+                                 "invalid destination path");
+    }
+
+    if (rename(src_resolved, dst_resolved) != 0) {
+        int err = errno;
+        if (err == EACCES || err == EPERM) {
+            xrootd_log_access(ctx, c, "MV", src_resolved, "-",
+                              0, kXR_NotAuthorized, "permission denied", 0);
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "permission denied");
+        }
+        xrootd_log_access(ctx, c, "MV", src_resolved, "-",
+                          0, kXR_IOError, strerror(err), 0);
+        return xrootd_send_error(ctx, c, kXR_IOError, strerror(err));
+    }
+
+    xrootd_log_access(ctx, c, "MV", src_resolved, dst_resolved, 1, 0, NULL, 0);
+    return xrootd_send_ok(ctx, c, NULL, 0);
+}
+
+/*
+ * kXR_chmod — change the permission bits of a file or directory.
+ *
+ * The header's mode field carries the Unix permission bits (9 bits).
+ * Path is in the payload.
+ */
+static ngx_int_t
+xrootd_handle_chmod(xrootd_ctx_t *ctx, ngx_connection_t *c,
+                    ngx_stream_xrootd_srv_conf_t *conf)
+{
+    ClientChmodRequest *req = (ClientChmodRequest *) ctx->hdr_buf;
+    char    resolved[PATH_MAX];
+    mode_t  mode;
+
+    if (ctx->payload == NULL || ctx->cur_dlen == 0) {
+        return xrootd_send_error(ctx, c, kXR_ArgMissing, "no path given");
+    }
+
+    mode = ntohs(req->mode) & 0777;
+    if (mode == 0) {
+        mode = 0644;  /* sensible default if client sends 0 */
+    }
+
+    if (!xrootd_resolve_path(c->log, &conf->root,
+                              (const char *) ctx->payload,
+                              resolved, sizeof(resolved))) {
+        xrootd_log_access(ctx, c, "CHMOD", (char *) ctx->payload, "-",
+                          0, kXR_NotFound, "path not found", 0);
+        return xrootd_send_error(ctx, c, kXR_NotFound, "path not found");
+    }
+
+    if (chmod(resolved, mode) != 0) {
+        int err = errno;
+        if (err == EACCES || err == EPERM) {
+            xrootd_log_access(ctx, c, "CHMOD", resolved, "-",
+                              0, kXR_NotAuthorized, "permission denied", 0);
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "permission denied");
+        }
+        xrootd_log_access(ctx, c, "CHMOD", resolved, "-",
+                          0, kXR_IOError, strerror(err), 0);
+        return xrootd_send_error(ctx, c, kXR_IOError, strerror(err));
+    }
+
+    xrootd_log_access(ctx, c, "CHMOD", resolved, "-", 1, 0, NULL, 0);
     return xrootd_send_ok(ctx, c, NULL, 0);
 }
 
@@ -4057,6 +4281,67 @@ xrootd_log_access(xrootd_ctx_t *ctx, ngx_connection_t *c,
 /* ================================================================== */
 /*  Helpers                                                             */
 /* ================================================================== */
+
+/*
+ * xrootd_resolve_path_noexist
+ *
+ * Like xrootd_resolve_path_write but does NOT require any component of the
+ * path to exist — suitable for recursive mkdir where no intermediate directory
+ * has been created yet.
+ *
+ * Security: rejects any path component that is exactly ".." to prevent
+ * traversal.  The root is trusted (set via nginx config directive).
+ *
+ * Returns 1 on success (resolved[] filled), 0 on failure.
+ */
+static int
+xrootd_resolve_path_noexist(ngx_log_t *log, const ngx_str_t *root,
+                              const char *reqpath, char *resolved, size_t resolvsz)
+{
+    char        combined[PATH_MAX * 2];
+    const char *p;
+    int         n;
+
+    /* Strip leading slashes */
+    while (*reqpath == '/') {
+        reqpath++;
+    }
+
+    if (*reqpath == '\0') {
+        return 0;   /* empty or root-only path not allowed */
+    }
+
+    /* Scan for ".." components — any found is a traversal attempt */
+    p = reqpath;
+    while (*p) {
+        const char *seg_end = strchr(p, '/');
+        size_t      seg_len = seg_end ? (size_t)(seg_end - p) : strlen(p);
+
+        if (seg_len == 2 && p[0] == '.' && p[1] == '.') {
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                          "xrootd: path traversal attempt: %s", reqpath);
+            return 0;
+        }
+        if (seg_end == NULL) {
+            break;
+        }
+        p = seg_end + 1;
+    }
+
+    n = snprintf(combined, sizeof(combined), "%.*s/%s",
+                 (int) root->len, (char *) root->data, reqpath);
+    if (n < 0 || (size_t) n >= sizeof(combined)) {
+        ngx_log_error(NGX_LOG_WARN, log, 0, "xrootd: path too long");
+        return 0;
+    }
+
+    if ((size_t) n >= resolvsz) {
+        return 0;
+    }
+
+    ngx_cpystrn((u_char *) resolved, (u_char *) combined, resolvsz);
+    return 1;
+}
 
 /*
  * xrootd_resolve_path
