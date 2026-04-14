@@ -39,8 +39,12 @@ CONNECT → HANDSHAKE → kXR_protocol → kXR_login [→ kXR_auth (GSI)]
                kXR_stat              kXR_open (rd or wr)
                kXR_ping                  │
                kXR_dirlist          kXR_read  / kXR_pgwrite  (repeat)
-               kXR_mkdir            kXR_sync
+               kXR_mkdir            kXR_write / kXR_sync
+               kXR_rmdir            kXR_truncate
                kXR_rm               kXR_close
+               kXR_mv
+               kXR_chmod
+               kXR_truncate
                kXR_endsess
 ```
 
@@ -61,13 +65,16 @@ CONNECT → HANDSHAKE → kXR_protocol → kXR_login [→ kXR_auth (GSI)]
 | `kXR_write` | v3/v4 raw write; offset + data payload |
 | `kXR_sync` | fsync an open write handle |
 | `kXR_truncate` | Truncate by path or open handle |
-| `kXR_mkdir` | Create directory; supports recursive creation via `kXR_mkdirpath` |
+| `kXR_mkdir` | Create directory; recursive creation via `kXR_mkdirpath`; parent auto-creation via `kXR_mkpath` on open |
+| `kXR_rmdir` | Remove an empty directory |
 | `kXR_rm` | Remove a file |
+| `kXR_mv` | Rename or move a file or directory (`rename(2)` — same filesystem only) |
+| `kXR_chmod` | Change permission bits (9-bit Unix mode from request header) |
 | `kXR_close` | Closes an open handle; logs throughput |
 | `kXR_dirlist` | Lists a directory; supports `kXR_dstat` for per-entry stat |
 | `kXR_endsess` | Graceful session termination |
 
-Up to 16 files may be open simultaneously per connection. Write operations require `xrootd_allow_write on` (default: off).
+Up to 16 files may be open simultaneously per connection. Write operations (`kXR_pgwrite`, `kXR_write`, `kXR_mkdir`, `kXR_rmdir`, `kXR_rm`, `kXR_mv`, `kXR_chmod`, `kXR_sync`, `kXR_truncate`) require `xrootd_allow_write on` (default: off).
 
 ---
 
@@ -113,7 +120,7 @@ make -j$(nproc)
 | `xrootd on\|off` | `server` | `off` | Enable the XRootD protocol handler |
 | `xrootd_root path` | `server` | `/` | Filesystem root for file access. All client paths are resolved relative to this directory; path traversal is rejected. |
 | `xrootd_auth none\|gsi` | `server` | `none` | Authentication mode |
-| `xrootd_allow_write on\|off` | `server` | `off` | Allow write operations (`kXR_pgwrite`, `kXR_write`, `kXR_mkdir`, `kXR_rm`, `kXR_sync`, `kXR_truncate`). Off by default so read-only deployments are safe without any extra configuration. |
+| `xrootd_allow_write on\|off` | `server` | `off` | Allow write operations (`kXR_pgwrite`, `kXR_write`, `kXR_mkdir`, `kXR_rmdir`, `kXR_rm`, `kXR_mv`, `kXR_chmod`, `kXR_sync`, `kXR_truncate`). Off by default so read-only deployments are safe without any extra configuration. |
 | `xrootd_certificate path` | `server` | — | Server certificate PEM (GSI only) |
 | `xrootd_certificate_key path` | `server` | — | Server private key PEM (GSI only) |
 | `xrootd_trusted_ca path` | `server` | — | CA certificate (or bundle) PEM (GSI only) |
@@ -154,6 +161,24 @@ stream {
         listen 1095;
         xrootd on;
         xrootd_auth gsi;
+        xrootd_root /data/store;
+        xrootd_certificate     /etc/grid-security/hostcert.pem;
+        xrootd_certificate_key /etc/grid-security/hostkey.pem;
+        xrootd_trusted_ca      /etc/grid-security/ca.pem;
+        xrootd_access_log /var/log/nginx/xrootd_gsi_access.log;
+    }
+}
+```
+
+### Read-write GSI example
+
+```nginx
+stream {
+    server {
+        listen 1095;
+        xrootd on;
+        xrootd_auth gsi;
+        xrootd_allow_write on;
         xrootd_root /data/store;
         xrootd_certificate     /etc/grid-security/hostcert.pem;
         xrootd_certificate_key /etc/grid-security/hostkey.pem;
@@ -449,6 +474,55 @@ The module caps general payloads at `XROOTD_MAX_PATH + 64` (~4 KB) to prevent ov
 
 ---
 
+### 13. `kXR_mv` payload uses a space separator, not a null
+
+The `ClientMvRequest.arg1len` field encodes the **byte length of the source path, not including any terminator**. The payload is:
+
+```
+src[arg1len] + ' ' (0x20) + dst[...]
+```
+
+The separator between source and destination is a single ASCII space — not a null byte. `arg1len` is the source string length without any trailing zero. This is visible in `XrdClFileSystem.cc`:
+
+```cpp
+req->arg1len = fSource.length();              // no +1
+*msg->GetBuffer(24 + fSource.length()) = ' '; // space separator
+```
+
+Parsing the source as null-terminated at `src[arg1len - 1]` fails for every path.
+
+---
+
+### 14. `kXR_new` requires `O_EXCL` only when `kXR_delete` is not also set
+
+`kXR_new` means "create the file; fail if it already exists" — equivalent to `O_CREAT|O_EXCL`. However, xrdcp routinely sends `kXR_new|kXR_delete` together to mean "create or overwrite", which maps to `O_CREAT|O_TRUNC` (no `O_EXCL`). The correct mapping is:
+
+| Flags | OS flags |
+|---|---|
+| `kXR_new` only | `O_CREAT \| O_EXCL` |
+| `kXR_new \| kXR_delete` | `O_CREAT \| O_TRUNC` |
+| `kXR_delete` only | `O_CREAT \| O_TRUNC` |
+
+Omitting `O_EXCL` for `kXR_new` alone silently opens and truncates existing files instead of returning an error.
+
+---
+
+### 15. `kXR_mkdir` with `kXR_mkdirpath`: resolve path without requiring parent to exist
+
+The write-path resolver (`xrootd_resolve_path_write`) calls `realpath(3)` on the parent directory to canonicalize it. For a recursive `mkdir -p a/b/c`, neither `a` nor `a/b` exists yet, so `realpath` fails and the request is rejected before any directory is created.
+
+**Fix:** When `kXR_mkdirpath` is set (or `kXR_mkpath` on open), use a separate resolver (`xrootd_resolve_path_noexist`) that validates the path by scanning for `..` components rather than calling `realpath`. The root directory itself is always trusted (set via nginx config); any relative path with no `..` segment is safe.
+
+---
+
+### 16. Opening a directory path returns a valid fd on Linux
+
+`open(dir_path, O_RDONLY)` succeeds on Linux and returns a directory file descriptor. The XRootD spec requires `kXR_open` to fail with `kXR_isDirectory` when the client tries to open a directory as a file. Without an explicit `stat()` check after path resolution, the module hands back a directory fd and subsequent `read(2)` calls return `EISDIR`.
+
+**Fix:** After resolving a read-mode open path, `stat(2)` the result and return `kXR_isDirectory` if `S_ISDIR(st.st_mode)`.
+
+---
+
 ## Protocol reference
 
 The implementation was derived from three authoritative sources checked against each other:
@@ -486,8 +560,10 @@ nginx-xrootd/
 │   ├── xrootd_protocol.h          # XRootD wire constants and packed structs
 │   └── ngx_stream_xrootd_module.c # nginx stream module implementation
 └── tests/
-    ├── test_xrootd.py             # functional tests (stat, read, dirlist, GSI)
-    ├── test_write.py              # upload tests (pgwrite, integrity, read-only enforcement)
+    ├── test_xrootd.py             # functional tests (stat, read, dirlist, GSI auth)
+    ├── test_write.py              # upload tests (pgwrite, integrity, GSI write)
+    ├── test_fs_ops.py             # filesystem ops (mkdir, rmdir, rm, mv, chmod; anon + GSI)
+    ├── test_file_api.py           # comprehensive File/FileSystem API tests (71 tests)
     ├── test_throughput.py         # throughput benchmarks (anon vs GSI)
     └── test_concurrent.py         # concurrent transfer tests (n=1..8)
 ```
