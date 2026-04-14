@@ -4,11 +4,11 @@
  * nginx stream module implementing the XRootD root:// protocol.
  * Acts as a read-only data server (kXR_DataServer) at the TCP level.
  *
- * Supports:
+ * Supported requests:
  *   handshake / protocol negotiation
- *   anonymous login (no auth)
- *   kXR_protocol   — negotiate capabilities
- *   kXR_login      — accept any username, return 16-byte session id
+ *   kXR_protocol   — negotiate capabilities and security mode
+ *   kXR_login      — accept username; triggers GSI auth when configured
+ *   kXR_auth       — GSI/x509 proxy certificate authentication
  *   kXR_ping       — liveness check
  *   kXR_stat       — path-based and handle-based stat
  *   kXR_open       — open files for reading
@@ -16,24 +16,108 @@
  *   kXR_close      — close an open handle
  *   kXR_dirlist    — list a directory (with optional per-entry stat)
  *   kXR_endsess    — graceful session termination
+ *   write ops      — rejected with kXR_fsReadOnly (read-only server)
  *
- * nginx.conf example:
+ * -------------------------------------------------------------------------
+ * ANONYMOUS CONNECTION FLOW
+ * -------------------------------------------------------------------------
+ *
+ *   Client                                              Server
+ *   ──────                                              ──────
+ *   20-byte handshake (ClientInitHandShake) ──────────>
+ *                                           <────────── 8-byte hdr + 8-byte body
+ *   kXR_protocol (capability negotiation)  ──────────>
+ *                                           <────────── kXR_ok + pval + flags
+ *                                                        [+ SecurityInfo if secreqs set]
+ *   kXR_login (username)                   ──────────>
+ *                                           <────────── kXR_ok + 16-byte sessid
+ *   kXR_stat / kXR_open / kXR_dirlist /    ──────────>
+ *   kXR_read / kXR_close / kXR_ping        <────────── response
+ *   kXR_endsess                            ──────────>
+ *                                           <────────── kXR_ok
+ *   [TCP close]
+ *
+ * -------------------------------------------------------------------------
+ * GSI / x509 CONNECTION FLOW
+ * -------------------------------------------------------------------------
+ *
+ *   Client                                              Server
+ *   ──────                                              ──────
+ *   handshake                              ──────────>
+ *                                           <────────── handshake response
+ *   kXR_protocol (secreqs=1)               ──────────>
+ *                                           <────────── kXR_ok + SecurityInfo
+ *                                                        (secopt=force, nProt=1, "gsi ")
+ *   kXR_login                              ──────────>
+ *                                           <────────── kXR_ok + sessid
+ *                                                        + "&P=gsi,v:10000,c:ssl,ca:<hash>"
+ *   kXR_auth [kXGC_certreq, step=1000]     ──────────>
+ *     XrdSutBuffer{ "gsi\0", step=1000,
+ *       kXRS_main{ kXRS_rtag(random) } }
+ *                                           <────────── kXR_authmore + XrdSutBuffer{
+ *                                                          "gsi\0", step=kXGS_cert(2001),
+ *                                                          kXRS_puk(DH blob),
+ *                                                          kXRS_cipher_alg("aes-256-cbc:..."),
+ *                                                          kXRS_md_alg("sha256:sha1"),
+ *                                                          kXRS_x509(server cert PEM),
+ *                                                          kXRS_main{ kXRS_signed_rtag } }
+ *   kXR_auth [kXGC_cert, step=1001]        ──────────>
+ *     XrdSutBuffer{ "gsi\0", step=1001,
+ *       kXRS_puk(client DH blob),
+ *       kXRS_cipher_alg, kXRS_md_alg,
+ *       kXRS_main=AES(session_key,
+ *         { kXRS_x509(proxy chain PEM),
+ *           kXRS_rtag }) }
+ *                                           <────────── kXR_ok  (auth complete)
+ *   kXR_stat / kXR_open / ...              ──────────>
+ *                                           <────────── response
+ *
+ * See the "GSI Authentication Protocol" block comment near xrootd_handle_auth
+ * for detailed wire format documentation and implementation gotchas.
+ *
+ * -------------------------------------------------------------------------
+ * nginx.conf example
+ * -------------------------------------------------------------------------
  *
  *   stream {
+ *       # Anonymous endpoint
  *       server {
  *           listen 1094;
  *           xrootd on;
  *           xrootd_root /data/store;
  *       }
+ *
+ *       # GSI/x509 authenticated endpoint
+ *       server {
+ *           listen 1095;
+ *           xrootd on;
+ *           xrootd_auth gsi;
+ *           xrootd_root /data/store;
+ *           xrootd_certificate     /etc/grid-security/hostcert.pem;
+ *           xrootd_certificate_key /etc/grid-security/hostkey.pem;
+ *           xrootd_trusted_ca      /etc/grid-security/ca.pem;
+ *       }
  *   }
  *
- * Build:
+ * -------------------------------------------------------------------------
+ * Build
+ * -------------------------------------------------------------------------
+ *
  *   ./configure --with-stream --add-module=/path/to/nginx-xrootd
  *   make && make install
  *
- * Protocol reference: XRootD Protocol Specification v5.2.0,
- *   xrootd/xrootd src/XProtocol/XProtocol.hh (canonical),
- *   dcache/xrootd4j (Java reference impl).
+ * -------------------------------------------------------------------------
+ * Protocol references
+ * -------------------------------------------------------------------------
+ *
+ *   XRootD Protocol Specification v5.2.0:
+ *     https://xrootd.web.cern.ch/doc/dev56/XRdv520.htm
+ *   Canonical wire constants:
+ *     xrootd/xrootd src/XProtocol/XProtocol.hh
+ *   GSI security protocol (source of truth for the auth handshake):
+ *     xrootd/xrootd src/XrdSecgsi/ (XrdSecProtocolgsi.cc, XrdCryptosslCipher.cc)
+ *   Java reference implementation:
+ *     dcache/xrootd4j
  */
 
 #include <ngx_config.h>
@@ -46,6 +130,19 @@
 #include <dirent.h>
 #include <limits.h>
 #include <arpa/inet.h>
+
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <openssl/pem.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/bn.h>
+#include <openssl/rand.h>
+#include <openssl/rsa.h>
+#include <openssl/params.h>
+#include <openssl/param_build.h>
+#include <openssl/core_names.h>
 
 #include "xrootd_protocol.h"
 
@@ -120,7 +217,9 @@ typedef struct {
 
     /* Session */
     u_char     sessid[XROOTD_SESSION_ID_LEN];
-    ngx_flag_t logged_in;
+    ngx_flag_t logged_in;    /* kXR_login received */
+    ngx_flag_t auth_done;    /* authentication completed (always 1 when auth=none) */
+    char       dn[512];      /* authenticated subject DN (GSI), or empty */
 
     /* Open file table; index 0..XROOTD_MAX_FILES-1 is the handle number */
     xrootd_file_t  files[XROOTD_MAX_FILES];
@@ -130,15 +229,34 @@ typedef struct {
     size_t     wbuf_len;
     size_t     wbuf_pos;
 
+    /* GSI handshake state: ephemeral DH key kept from kXGS_cert until kXGC_cert */
+    EVP_PKEY  *gsi_dh_key;   /* freed after kXGC_cert processing */
+
 } xrootd_ctx_t;
 
 /* ------------------------------------------------------------------ */
 /* Module configuration                                                 */
 /* ------------------------------------------------------------------ */
 
+/* xrootd_auth directive values */
+#define XROOTD_AUTH_NONE   0   /* no authentication required (anonymous) */
+#define XROOTD_AUTH_GSI    1   /* GSI/x509 authentication required       */
+
 typedef struct {
     ngx_flag_t  enable;
-    ngx_str_t   root;         /* local filesystem root directory */
+    ngx_str_t   root;              /* local filesystem root directory    */
+    ngx_uint_t  auth;              /* XROOTD_AUTH_NONE or XROOTD_AUTH_GSI */
+
+    /* GSI certificate paths (set via directives) */
+    ngx_str_t   certificate;       /* path to hostcert.pem               */
+    ngx_str_t   certificate_key;   /* path to hostkey.pem                */
+    ngx_str_t   trusted_ca;        /* path to ca.pem                     */
+
+    /* Loaded OpenSSL objects — initialised in postconfiguration          */
+    X509        *gsi_cert;         /* server certificate                 */
+    EVP_PKEY    *gsi_key;          /* server private key                 */
+    X509_STORE  *gsi_store;        /* trusted CA verification store      */
+    uint32_t     gsi_ca_hash;      /* CA subject hash for kXRS_issuer_hash */
 } ngx_stream_xrootd_srv_conf_t;
 
 /* ------------------------------------------------------------------ */
@@ -150,6 +268,7 @@ static char *ngx_stream_xrootd_merge_srv_conf(ngx_conf_t *cf,
     void *parent, void *child);
 static char *ngx_stream_xrootd_enable(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+static ngx_int_t ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf);
 
 static void ngx_stream_xrootd_handler(ngx_stream_session_t *s);
 static void ngx_stream_xrootd_recv(ngx_event_t *rev);
@@ -160,14 +279,23 @@ static ngx_int_t xrootd_queue_response(xrootd_ctx_t *ctx,
 static ngx_int_t xrootd_flush_pending(xrootd_ctx_t *ctx,
     ngx_connection_t *c);
 
+/* GSI helpers — defined later in this file */
+static int gsi_find_bucket(const u_char *payload, size_t plen,
+    uint32_t target_type,
+    const u_char **data_out, size_t *len_out);
+static STACK_OF(X509) *xrootd_gsi_parse_x509(xrootd_ctx_t *ctx,
+    ngx_connection_t *c);
+
 static ngx_int_t xrootd_process_handshake(xrootd_ctx_t *ctx,
     ngx_connection_t *c);
 static ngx_int_t xrootd_dispatch(xrootd_ctx_t *ctx,
     ngx_connection_t *c, ngx_stream_xrootd_srv_conf_t *conf);
 
 static ngx_int_t xrootd_handle_protocol(xrootd_ctx_t *ctx,
-    ngx_connection_t *c);
+    ngx_connection_t *c, ngx_stream_xrootd_srv_conf_t *conf);
 static ngx_int_t xrootd_handle_login(xrootd_ctx_t *ctx,
+    ngx_connection_t *c, ngx_stream_xrootd_srv_conf_t *conf);
+static ngx_int_t xrootd_handle_auth(xrootd_ctx_t *ctx,
     ngx_connection_t *c);
 static ngx_int_t xrootd_handle_ping(xrootd_ctx_t *ctx,
     ngx_connection_t *c);
@@ -205,6 +333,12 @@ static void xrootd_make_stat_body(const struct stat *st, ngx_flag_t is_vfs,
 /* Module directives                                                    */
 /* ------------------------------------------------------------------ */
 
+static ngx_conf_enum_t xrootd_auth_modes[] = {
+    { ngx_string("none"), XROOTD_AUTH_NONE },
+    { ngx_string("gsi"),  XROOTD_AUTH_GSI  },
+    { ngx_null_string,    0                }
+};
+
 static ngx_command_t ngx_stream_xrootd_commands[] = {
 
     { ngx_string("xrootd"),
@@ -221,6 +355,34 @@ static ngx_command_t ngx_stream_xrootd_commands[] = {
       offsetof(ngx_stream_xrootd_srv_conf_t, root),
       NULL },
 
+    { ngx_string("xrootd_auth"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_enum_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_xrootd_srv_conf_t, auth),
+      xrootd_auth_modes },
+
+    { ngx_string("xrootd_certificate"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_xrootd_srv_conf_t, certificate),
+      NULL },
+
+    { ngx_string("xrootd_certificate_key"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_xrootd_srv_conf_t, certificate_key),
+      NULL },
+
+    { ngx_string("xrootd_trusted_ca"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_xrootd_srv_conf_t, trusted_ca),
+      NULL },
+
     ngx_null_command
 };
 
@@ -230,7 +392,7 @@ static ngx_command_t ngx_stream_xrootd_commands[] = {
 
 static ngx_stream_module_t ngx_stream_xrootd_module_ctx = {
     NULL,                                 /* preconfiguration  */
-    NULL,                                 /* postconfiguration */
+    ngx_stream_xrootd_postconfiguration,  /* postconfiguration */
     NULL,                                 /* create main conf  */
     NULL,                                 /* init main conf    */
     ngx_stream_xrootd_create_srv_conf,    /* create srv conf   */
@@ -264,7 +426,12 @@ ngx_stream_xrootd_create_srv_conf(ngx_conf_t *cf)
         return NULL;
     }
 
-    conf->enable = NGX_CONF_UNSET;
+    conf->enable    = NGX_CONF_UNSET;
+    conf->auth      = NGX_CONF_UNSET_UINT;
+    conf->gsi_cert  = NULL;
+    conf->gsi_key   = NULL;
+    conf->gsi_store = NULL;
+    conf->gsi_ca_hash = 0;
 
     return conf;
 }
@@ -277,6 +444,10 @@ ngx_stream_xrootd_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_str_value(conf->root, prev->root, "/");
+    ngx_conf_merge_uint_value(conf->auth, prev->auth, XROOTD_AUTH_NONE);
+    ngx_conf_merge_str_value(conf->certificate,     prev->certificate,     "");
+    ngx_conf_merge_str_value(conf->certificate_key, prev->certificate_key, "");
+    ngx_conf_merge_str_value(conf->trusted_ca,      prev->trusted_ca,      "");
 
     return NGX_CONF_OK;
 }
@@ -306,6 +477,135 @@ ngx_stream_xrootd_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     cscf->handler = ngx_stream_xrootd_handler;
 
     return NGX_CONF_OK;
+}
+
+/* ================================================================== */
+/*  Post-configuration: load GSI certificates                          */
+/* ================================================================== */
+
+/*
+ * ngx_stream_xrootd_postconfiguration
+ *
+ * Called after the configuration is fully parsed.  For every server
+ * block that has xrootd_auth gsi, load the host certificate, private
+ * key, and trusted CA into OpenSSL objects so they are ready for use
+ * at request time without re-reading disk per connection.
+ *
+ * We walk the stream server blocks via the core module's server array.
+ */
+static ngx_int_t
+ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
+{
+    ngx_stream_core_main_conf_t   *cmcf;
+    ngx_stream_core_srv_conf_t   **cscfp;
+    ngx_stream_xrootd_srv_conf_t  *xcf;
+    ngx_uint_t                     i;
+
+    cmcf  = ngx_stream_conf_get_module_main_conf(cf, ngx_stream_core_module);
+    cscfp = cmcf->servers.elts;
+
+    for (i = 0; i < cmcf->servers.nelts; i++) {
+        xcf = ngx_stream_conf_get_module_srv_conf(cscfp[i], ngx_stream_xrootd_module);
+
+        if (!xcf->enable || xcf->auth != XROOTD_AUTH_GSI) {
+            continue;
+        }
+
+        if (xcf->certificate.len == 0 || xcf->certificate_key.len == 0
+            || xcf->trusted_ca.len == 0)
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "xrootd_auth gsi requires xrootd_certificate, "
+                "xrootd_certificate_key and xrootd_trusted_ca");
+            return NGX_ERROR;
+        }
+
+        /* Load server certificate */
+        {
+            FILE *fp = fopen((char *) xcf->certificate.data, "r");
+            if (fp == NULL) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                    "xrootd: cannot open certificate \"%s\"",
+                    xcf->certificate.data);
+                return NGX_ERROR;
+            }
+            xcf->gsi_cert = PEM_read_X509(fp, NULL, NULL, NULL);
+            fclose(fp);
+            if (xcf->gsi_cert == NULL) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "xrootd: cannot parse certificate \"%s\"",
+                    xcf->certificate.data);
+                return NGX_ERROR;
+            }
+        }
+
+        /* Load server private key */
+        {
+            FILE *fp = fopen((char *) xcf->certificate_key.data, "r");
+            if (fp == NULL) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                    "xrootd: cannot open private key \"%s\"",
+                    xcf->certificate_key.data);
+                return NGX_ERROR;
+            }
+            xcf->gsi_key = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
+            fclose(fp);
+            if (xcf->gsi_key == NULL) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "xrootd: cannot parse private key \"%s\"",
+                    xcf->certificate_key.data);
+                return NGX_ERROR;
+            }
+        }
+
+        /* Build trusted CA X509_STORE */
+        {
+            FILE  *fp;
+            X509  *ca;
+            X509_LOOKUP *lookup;
+
+            xcf->gsi_store = X509_STORE_new();
+            if (xcf->gsi_store == NULL) {
+                return NGX_ERROR;
+            }
+
+            /* Allow proxy certs in chain verification */
+            X509_STORE_set_flags(xcf->gsi_store,
+                                 X509_V_FLAG_ALLOW_PROXY_CERTS);
+
+            lookup = X509_STORE_add_lookup(xcf->gsi_store,
+                                           X509_LOOKUP_file());
+            if (lookup == NULL) {
+                return NGX_ERROR;
+            }
+            if (!X509_LOOKUP_load_file(lookup,
+                                       (char *) xcf->trusted_ca.data,
+                                       X509_FILETYPE_PEM))
+            {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "xrootd: cannot load trusted CA \"%s\"",
+                    xcf->trusted_ca.data);
+                return NGX_ERROR;
+            }
+
+            /* Compute CA hash (for kXRS_issuer_hash in kXGS_init) */
+            fp = fopen((char *) xcf->trusted_ca.data, "r");
+            if (fp) {
+                ca = PEM_read_X509(fp, NULL, NULL, NULL);
+                fclose(fp);
+                if (ca) {
+                    xcf->gsi_ca_hash = (uint32_t) X509_subject_name_hash(ca);
+                    X509_free(ca);
+                }
+            }
+        }
+
+        ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
+            "xrootd: GSI auth configured — cert=%s ca_hash=%08x",
+            xcf->certificate.data, xcf->gsi_ca_hash);
+    }
+
+    return NGX_OK;
 }
 
 /* ================================================================== */
@@ -739,10 +1039,13 @@ xrootd_dispatch(xrootd_ctx_t *ctx, ngx_connection_t *c,
     switch (ctx->cur_reqid) {
 
     case kXR_protocol:
-        return xrootd_handle_protocol(ctx, c);
+        return xrootd_handle_protocol(ctx, c, conf);
 
     case kXR_login:
-        return xrootd_handle_login(ctx, c);
+        return xrootd_handle_login(ctx, c, conf);
+
+    case kXR_auth:
+        return xrootd_handle_auth(ctx, c);
 
     case kXR_ping:
         return xrootd_handle_ping(ctx, c);
@@ -755,37 +1058,37 @@ xrootd_dispatch(xrootd_ctx_t *ctx, ngx_connection_t *c,
      * Sending kXR_NotAuthorized is the correct response per spec.
      */
     case kXR_stat:
-        if (!ctx->logged_in) {
+        if (!ctx->logged_in || !ctx->auth_done) {
             return xrootd_send_error(ctx, c, kXR_NotAuthorized,
-                                     "login required");
+                                     "authentication required");
         }
         return xrootd_handle_stat(ctx, c, conf);
 
     case kXR_open:
-        if (!ctx->logged_in) {
+        if (!ctx->logged_in || !ctx->auth_done) {
             return xrootd_send_error(ctx, c, kXR_NotAuthorized,
-                                     "login required");
+                                     "authentication required");
         }
         return xrootd_handle_open(ctx, c, conf);
 
     case kXR_read:
-        if (!ctx->logged_in) {
+        if (!ctx->logged_in || !ctx->auth_done) {
             return xrootd_send_error(ctx, c, kXR_NotAuthorized,
-                                     "login required");
+                                     "authentication required");
         }
         return xrootd_handle_read(ctx, c);
 
     case kXR_close:
-        if (!ctx->logged_in) {
+        if (!ctx->logged_in || !ctx->auth_done) {
             return xrootd_send_error(ctx, c, kXR_NotAuthorized,
-                                     "login required");
+                                     "authentication required");
         }
         return xrootd_handle_close(ctx, c);
 
     case kXR_dirlist:
-        if (!ctx->logged_in) {
+        if (!ctx->logged_in || !ctx->auth_done) {
             return xrootd_send_error(ctx, c, kXR_NotAuthorized,
-                                     "login required");
+                                     "authentication required");
         }
         return xrootd_handle_dirlist(ctx, c, conf);
 
@@ -825,33 +1128,46 @@ xrootd_dispatch(xrootd_ctx_t *ctx, ngx_connection_t *c,
  *   kXR_ableTLS  0x02 — client supports TLS
  *   kXR_bifreqs  0x08 — client wants back-information frames
  *
- * When kXR_secreqs is set we must append a 4-byte SecurityInfo structure
- * immediately after pval+flags.  Sending it with secopt=0 and nProt=0
- * signals "no authentication required" so the client proceeds straight
- * to kXR_login.  Omitting it causes v5 clients to stall waiting for data
- * that never arrives.
+ * When kXR_secreqs is set we append SecurityInfo after pval+flags.
  *
- * SecurityInfo layout (4 bytes, big-endian):
+ * SecurityInfo header (4 bytes):
  *   secver  [1]  version, always 0
- *   secopt  [1]  options: 0x01=kXR_secOFrce (force auth), 0=no auth forced
- *   nProt   [1]  number of protocol entries that follow (0 = none)
- *   rsvd    [1]  reserved, 0
+ *   secopt  [1]  0x01=kXR_secOFrce (auth required), 0=anonymous ok
+ *   nProt   [1]  number of SecurityProtocol entries that follow
+ *   rsvd    [1]  0
+ *
+ * SecurityProtocol entry (8 bytes each, when nProt > 0):
+ *   prot[4]      protocol name, space-padded (e.g. "gsi ")
+ *   plvl[1]      security level (0 = kXR_secNone)
+ *   pargs[3]     reserved, 0
+ *
+ * For auth=gsi:  secopt=0x01, nProt=1, entry={"gsi ",0,{0,0,0}}  → 12 bytes
+ * For auth=none: secopt=0x00, nProt=0                             →  4 bytes
  */
 static ngx_int_t
-xrootd_handle_protocol(xrootd_ctx_t *ctx, ngx_connection_t *c)
+xrootd_handle_protocol(xrootd_ctx_t *ctx, ngx_connection_t *c,
+                       ngx_stream_xrootd_srv_conf_t *conf)
 {
     ServerProtocolBody  body;
     u_char             *buf;
     size_t              bodylen, total;
     u_char              client_flags;
+    int                 want_gsi;
 
     /* flags byte is at offset 4 of the 16-byte body section */
     client_flags = ctx->cur_body[4];
+    want_gsi     = (conf->auth == XROOTD_AUTH_GSI);
 
-    /* Body = pval(4) + flags(4) + optional SecurityInfo(4) */
+    /*
+     * Body = pval(4) + flags(4) [+ SecurityInfo if client asked]
+     * SecurityInfo = 4-byte header [+ 8 bytes per protocol entry]
+     */
     bodylen = sizeof(body);
-    if (client_flags & 0x01) {   /* kXR_secreqs */
-        bodylen += 4;            /* SecurityInfo */
+    if (client_flags & 0x01) {                  /* kXR_secreqs */
+        bodylen += 4;                            /* SecurityInfo header */
+        if (want_gsi) {
+            bodylen += 8;                        /* one SecurityProtocol entry */
+        }
     }
 
     total = XRD_RESPONSE_HDR_LEN + bodylen;
@@ -865,27 +1181,39 @@ xrootd_handle_protocol(xrootd_ctx_t *ctx, ngx_connection_t *c)
                            (ServerResponseHdr *) buf);
 
     body.pval  = htonl(kXR_PROTOCOLVERSION);
-    body.flags = htonl(kXR_isServer);   /* read-only data server */
+    body.flags = htonl(kXR_isServer);
     ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN, &body, sizeof(body));
 
-    if (client_flags & 0x01) {   /* kXR_secreqs: append SecurityInfo */
+    if (client_flags & 0x01) {
         u_char *si = buf + XRD_RESPONSE_HDR_LEN + sizeof(body);
-        si[0] = 0;   /* secver = 0 */
-        si[1] = 0;   /* secopt = 0: auth not forced */
-        si[2] = 0;   /* nProt  = 0: no protocols listed */
-        si[3] = 0;   /* rsvd   = 0 */
+        si[0] = 0;                           /* secver = 0             */
+        si[1] = want_gsi ? 0x01 : 0x00;     /* secopt: force or none  */
+        si[2] = want_gsi ? 1    : 0;        /* nProt                  */
+        si[3] = 0;                           /* rsvd                   */
+        if (want_gsi) {
+            u_char *pe = si + 4;             /* SecurityProtocol entry */
+            pe[0] = 'g'; pe[1] = 's'; pe[2] = 'i'; pe[3] = ' '; /* "gsi " */
+            pe[4] = 0;                       /* plvl = kXR_secNone     */
+            pe[5] = 0; pe[6] = 0; pe[7] = 0; /* pargs reserved        */
+        }
     }
 
-    ngx_log_debug2(NGX_LOG_DEBUG_STREAM, c->log, 0,
-                   "xrootd: kXR_protocol ok (client_flags=0x%02x bodylen=%uz)",
-                   (int) client_flags, bodylen);
+    ngx_log_debug3(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                   "xrootd: kXR_protocol ok (client_flags=0x%02x "
+                   "bodylen=%uz auth=%s)",
+                   (int) client_flags, bodylen,
+                   want_gsi ? "gsi" : "none");
 
     return xrootd_queue_response(ctx, c, buf, total);
 }
 
-/* kXR_login — accept any username; no authentication required */
+/*
+ * kXR_login — accept the username; set auth_done immediately when auth=none,
+ * or leave it clear for auth=gsi (client must follow up with kXR_auth).
+ */
 static ngx_int_t
-xrootd_handle_login(xrootd_ctx_t *ctx, ngx_connection_t *c)
+xrootd_handle_login(xrootd_ctx_t *ctx, ngx_connection_t *c,
+                    ngx_stream_xrootd_srv_conf_t *conf)
 {
     ClientLoginRequest *req;
     u_char             *buf;
@@ -896,28 +1224,1150 @@ xrootd_handle_login(xrootd_ctx_t *ctx, ngx_connection_t *c)
     ngx_memcpy(user, req->username, 8);
     user[8] = '\0';
 
-    ngx_log_debug2(NGX_LOG_DEBUG_STREAM, c->log, 0,
-                   "xrootd: login user=\"%s\" pid=%d",
-                   user, (int) ntohl(req->pid));
+    ngx_log_debug3(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                   "xrootd: login user=\"%s\" pid=%d auth=%s",
+                   user, (int) ntohl(req->pid),
+                   (conf->auth == XROOTD_AUTH_GSI) ? "gsi" : "none");
 
-    /* Mark session as authenticated */
     ctx->logged_in = 1;
 
-    /* Response: 8-byte header + 16-byte sessid; no auth handshake */
-    total = XRD_RESPONSE_HDR_LEN + XROOTD_SESSION_ID_LEN;
-    buf   = ngx_palloc(c->pool, total);
-    if (buf == NULL) {
+    if (conf->auth == XROOTD_AUTH_NONE) {
+        /*
+         * Anonymous: respond kXR_ok + 16-byte sessid.  auth_done immediately.
+         */
+        ctx->auth_done = 1;
+
+        total = XRD_RESPONSE_HDR_LEN + XROOTD_SESSION_ID_LEN;
+        buf   = ngx_palloc(c->pool, total);
+        if (buf == NULL) {
+            return NGX_ERROR;
+        }
+
+        xrootd_build_resp_hdr(ctx->cur_streamid, kXR_ok,
+                               XROOTD_SESSION_ID_LEN,
+                               (ServerResponseHdr *) buf);
+        ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN, ctx->sessid,
+                   XROOTD_SESSION_ID_LEN);
+
+        return xrootd_queue_response(ctx, c, buf, total);
+    }
+
+    /*
+     * GSI auth: respond kXR_ok with sessid + "&P=" text-format challenge.
+     *
+     * The XrdSecGSI client's ClientDoInit() parses the challenge via
+     * XrdSutBuffer(&P=...) and reads the options with GetOptions().  The
+     * challenge MUST use the "&P=gsi,v:<ver>,c:<crypto>,ca:<hash>" text
+     * format, NOT the binary XrdSutBuffer bucket format.
+     *
+     * We advertise v:10000 (old-protocol mode) so the subsequent kXGS_cert
+     * message only needs an unsigned kXRS_puk (RSA public key), rather than
+     * a DH public key signed with the server private key (which requires
+     * v >= 10400).
+     *
+     * Response is kXR_ok.  Per ServerLoginBody, dlen > 16 signals that the
+     * bytes after the sessid are a server security challenge; the client
+     * will answer with kXR_auth (kXGC_certreq, then kXGC_cert).
+     */
+    {
+        char   parms[128];
+        size_t parms_len;
+
+        conf = ngx_stream_get_module_srv_conf(ctx->session,
+                                              ngx_stream_xrootd_module);
+
+        /* "&P=gsi,v:10000,c:ssl,ca:XXXXXXXX\0" */
+        parms_len = (size_t) snprintf(parms, sizeof(parms),
+                        "&P=gsi,v:10000,c:ssl,ca:%08x",
+                        (unsigned) conf->gsi_ca_hash) + 1; /* include \0 */
+
+        total = XRD_RESPONSE_HDR_LEN + XROOTD_SESSION_ID_LEN + parms_len;
+        buf   = ngx_palloc(c->pool, total);
+        if (buf == NULL) {
+            return NGX_ERROR;
+        }
+
+        xrootd_build_resp_hdr(ctx->cur_streamid, kXR_ok,
+                               (uint32_t)(XROOTD_SESSION_ID_LEN + parms_len),
+                               (ServerResponseHdr *) buf);
+
+        ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN, ctx->sessid,
+                   XROOTD_SESSION_ID_LEN);
+        ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN + XROOTD_SESSION_ID_LEN,
+                   parms, parms_len);
+
+        ngx_log_debug2(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                       "xrootd: login→kXGS_init parms=\"%s\" ca_hash=%08xd",
+                       parms, (unsigned) conf->gsi_ca_hash);
+
+        return xrootd_queue_response(ctx, c, buf, total);
+    }
+}
+
+/*
+ * xrootd_gsi_parse_x509 — decrypt and extract the x509 chain from kXGC_cert.
+ *
+ * The client's proxy certificate arrives encrypted inside the kXRS_main bucket
+ * of the outer XrdSutBuffer.  We must:
+ *
+ *   1. Parse the client DH public key from kXRS_puk in the outer buffer.
+ *   2. Determine the session cipher from kXRS_cipher_alg (first name in the
+ *      colon-separated list the client chose from our offered ciphers).
+ *   3. Extract the ciphertext from kXRS_main in the outer buffer.
+ *   4. Derive the DH shared secret using ctx->gsi_dh_key (our ephemeral private
+ *      key saved from xrootd_gsi_send_cert) and the client's public BIGNUM.
+ *      Key = first EVP_CIPHER_key_length bytes of the raw shared secret.
+ *      IV  = all zeros (old protocol HasPad=0, useIV=false).
+ *   5. AES-CBC decrypt kXRS_main.
+ *   6. Parse the decrypted inner XrdSutBuffer for kXRS_x509 and PEM-decode
+ *      the certificate chain.
+ *
+ * Returns a STACK_OF(X509) on success (caller must free with sk_X509_pop_free),
+ * or NULL on any error (already logged).
+ *
+ * See the "GSI Authentication Protocol" block comment for full wire-format
+ * documentation and common gotchas.
+ */
+static STACK_OF(X509) *
+xrootd_gsi_parse_x509(xrootd_ctx_t *ctx, ngx_connection_t *c)
+{
+    const u_char      *payload = ctx->payload;
+    size_t             plen    = ctx->cur_dlen;
+    ngx_log_t         *log     = c->log;
+
+    const u_char      *cpub_data = NULL, *main_data = NULL, *calg_data = NULL;
+    size_t             cpub_len  = 0,    main_len   = 0,    calg_len   = 0;
+    char              *pb, *pe;
+    BIGNUM            *bnpub  = NULL;
+    EVP_PKEY          *peer   = NULL;
+    EVP_PKEY_CTX      *pkctx;
+    OSSL_PARAM_BLD    *bld;
+    OSSL_PARAM        *params1 = NULL, *params2 = NULL, *params = NULL;
+    unsigned char     *secret  = NULL;
+    size_t             secret_len = 0;
+    const EVP_CIPHER  *evp_cipher;
+    EVP_CIPHER_CTX    *dctx   = NULL;
+    unsigned char     *plain  = NULL;
+    int                olen   = 0, flen = 0;
+    const u_char      *x509_data = NULL;
+    size_t             x509_len  = 0;
+    STACK_OF(X509)    *chain  = NULL;
+    BIO               *bio;
+    X509              *cert;
+    char               cipher_name[64];
+
+    if (ctx->gsi_dh_key == NULL) {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "xrootd: GSI kXGC_cert: no server DH key (kXGC_certreq skipped?)");
+        return NULL;
+    }
+
+    /*
+     * Step 1: Parse the client DH public key from kXRS_puk in the outer buffer.
+     *
+     * The kXRS_puk blob format is:
+     *   <DH PARAMETERS PEM>---BPUB---<hex BIGNUM of pub key>---EPUB--
+     *
+     * The closing sentinel is "---EPUB--" (9 chars, no trailing dash).
+     * We extract the hex BIGNUM string between ---BPUB--- and ---EPUB--
+     * and convert it to an OpenSSL BIGNUM with BN_hex2bn().
+     *
+     * This BIGNUM is the client's DH public value g^a mod p, where p and g
+     * come from the ffdhe2048 group parameters we sent in kXGS_cert.
+     */
+    if (gsi_find_bucket(payload, plen, (uint32_t) kXRS_puk,
+                        &cpub_data, &cpub_len) != 0) {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "xrootd: GSI kXGC_cert: kXRS_puk not found in outer buffer");
+        return NULL;
+    }
+
+    pb = memmem((void *) cpub_data, cpub_len, "---BPUB---", 10);
+    pe = memmem((void *) cpub_data, cpub_len, "---EPUB--",   9);
+    if (!pb || !pe || pe <= pb + 10) {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "xrootd: GSI kXGC_cert: malformed client DH blob");
+        return NULL;
+    }
+    pb += 10;   /* skip past the "---BPUB---" sentinel to reach the hex string */
+    {
+        char saved = *pe;
+        *pe = '\0';
+        BN_hex2bn(&bnpub, pb);
+        *pe = saved;
+    }
+    if (!bnpub) {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "xrootd: GSI kXGC_cert: BN_hex2bn failed");
+        return NULL;
+    }
+
+    /*
+     * Step 2: Determine session cipher from kXRS_cipher_alg.
+     *
+     * The client chooses one cipher from the colon-separated list we sent in
+     * kXGS_cert ("aes-256-cbc:aes-128-cbc:bf-cbc").  It sends its choice as
+     * the first (and often only) name in its kXRS_cipher_alg bucket, or the
+     * full list if it doesn't narrow it down.  We read up to the first ':'.
+     *
+     * If kXRS_cipher_alg is absent we default to aes-256-cbc (what the
+     * XRootD C++ client typically picks first).
+     */
+    ngx_cpystrn((u_char *) cipher_name, (u_char *) "aes-256-cbc",
+                sizeof(cipher_name));
+    if (gsi_find_bucket(payload, plen, (uint32_t) kXRS_cipher_alg,
+                        &calg_data, &calg_len) == 0 && calg_len > 0) {
+        size_t i;
+        for (i = 0; i < calg_len && i < sizeof(cipher_name) - 1; i++) {
+            if (calg_data[i] == ':') break;
+            cipher_name[i] = calg_data[i];
+        }
+        cipher_name[i] = '\0';
+    }
+
+    /*
+     * Step 3: Locate the encrypted inner buffer (kXRS_main) in the outer buffer.
+     *
+     * GOTCHA: kXRS_x509 is NOT in the outer buffer — it is inside kXRS_main
+     * after decryption.  Searching the outer buffer for kXRS_x509 will always
+     * fail.  Only kXRS_puk, kXRS_cipher_alg, kXRS_md_alg, and kXRS_main are
+     * present in the outer buffer for kXGC_cert.
+     */
+    if (gsi_find_bucket(payload, plen, (uint32_t) kXRS_main,
+                        &main_data, &main_len) != 0) {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "xrootd: GSI kXGC_cert: kXRS_main not found in outer buffer");
+        BN_free(bnpub);
+        return NULL;
+    }
+
+    /*
+     * Step 4: Derive the DH shared secret.
+     *
+     * We need to reconstruct the client's DH public key as an EVP_PKEY so
+     * OpenSSL can do the modular exponentiation.  The approach:
+     *
+     *   a. Export our server DH key parameters (the ffdhe2048 group: p, g, q)
+     *      with EVP_PKEY_todata(..., EVP_PKEY_KEY_PARAMETERS).
+     *   b. Build a new OSSL_PARAM set that adds the client's public BIGNUM
+     *      (from step 1) as OSSL_PKEY_PARAM_PUB_KEY.
+     *   c. Merge parameters (a) and (b) — the merged set has the group
+     *      parameters plus the peer's public value.
+     *   d. Create the peer EVP_PKEY with EVP_PKEY_fromdata(..., PUBLIC_KEY).
+     *   e. EVP_PKEY_derive using our server DH private key and the peer key.
+     *
+     * EVP_PKEY_CTX_set_dh_pad(0) is REQUIRED: the old protocol (v:10000)
+     * uses HasPad=false, meaning the raw shared secret bytes are used without
+     * zero-padding to the DH prime length.  With the default (pad=1), OpenSSL
+     * left-pads the secret to match the 256-byte ffdhe2048 prime — the client
+     * does not, so the first N bytes would not match.
+     */
+    EVP_PKEY_todata(ctx->gsi_dh_key, EVP_PKEY_KEY_PARAMETERS, &params1);
+
+    bld     = OSSL_PARAM_BLD_new();
+    OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PUB_KEY, bnpub);
+    params2 = OSSL_PARAM_BLD_to_param(bld);
+    OSSL_PARAM_BLD_free(bld);
+    BN_free(bnpub);  bnpub = NULL;
+
+    params  = OSSL_PARAM_merge(params1, params2);
+    OSSL_PARAM_free(params1);
+    OSSL_PARAM_free(params2);
+
+    pkctx = EVP_PKEY_CTX_new_id(EVP_PKEY_DH, NULL);
+    EVP_PKEY_fromdata_init(pkctx);
+    EVP_PKEY_fromdata(pkctx, &peer, EVP_PKEY_PUBLIC_KEY, params);
+    OSSL_PARAM_free(params);
+    EVP_PKEY_CTX_free(pkctx);
+
+    if (!peer) {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "xrootd: GSI kXGC_cert: cannot build client DH peer key");
+        return NULL;
+    }
+
+    pkctx = EVP_PKEY_CTX_new(ctx->gsi_dh_key, NULL);
+    EVP_PKEY_derive_init(pkctx);
+    EVP_PKEY_CTX_set_dh_pad(pkctx, 0);       /* no padding — old protocol */
+    EVP_PKEY_derive_set_peer(pkctx, peer);
+    EVP_PKEY_derive(pkctx, NULL, &secret_len); /* query size */
+    secret = ngx_palloc(c->pool, secret_len);
+    if (!secret) {
+        EVP_PKEY_CTX_free(pkctx);
+        EVP_PKEY_free(peer);
+        return NULL;
+    }
+    EVP_PKEY_derive(pkctx, secret, &secret_len);
+    EVP_PKEY_CTX_free(pkctx);
+    EVP_PKEY_free(peer);
+
+    ngx_log_debug2(NGX_LOG_DEBUG_STREAM, log, 0,
+                   "xrootd: GSI DH shared secret %uz bytes, cipher='%s'",
+                   secret_len, cipher_name);
+
+    /*
+     * Step 5: Decrypt kXRS_main using the AES session key.
+     *
+     * Key length selection mirrors XrdCryptosslCipher::Finalize():
+     *
+     *   ltmp = min(secret_len, EVP_MAX_KEY_LENGTH)
+     *   ldef = EVP_CIPHER_key_length(cipher)   // e.g. 32 for aes-256-cbc
+     *
+     *   if (ltmp == ldef):
+     *       use first ldef bytes of shared secret as key   ← common case
+     *   else:
+     *       try EVP_CIPHER_CTX_set_key_length(ltmp)
+     *       if cipher accepted the new length (variable-length ciphers like bf-cbc):
+     *           use ltmp bytes
+     *       else:
+     *           use ldef bytes (cipher ignores variable-length request)
+     *
+     * For aes-256-cbc: ldef=32, ffdhe2048 secret_len is typically 256 bytes,
+     * so ltmp = min(256, EVP_MAX_KEY_LENGTH=64) = 64 ≠ 32.
+     * The variable-key attempt will fail (AES doesn't accept 64-byte keys),
+     * so we fall back to the first 32 bytes of the shared secret.
+     *
+     * IV = all zeros (useIV=false in the old protocol).  This was intentional
+     * in the original XRootD design: the session key is already unique per
+     * connection from the DH exchange, so a fixed IV does not reuse a key+IV
+     * pair across sessions.
+     */
+    evp_cipher = EVP_get_cipherbyname(cipher_name);
+    if (!evp_cipher) {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "xrootd: GSI kXGC_cert: unknown cipher '%s'", cipher_name);
+        return NULL;
+    }
+
+    {
+        size_t ltmp = (secret_len > (size_t) EVP_MAX_KEY_LENGTH)
+                      ? (size_t) EVP_MAX_KEY_LENGTH : secret_len;
+        int    ldef     = EVP_CIPHER_key_length(evp_cipher);
+        size_t use_len  = (size_t) ldef;   /* default */
+
+        /* Check if variable key length succeeds (e.g. bf-cbc accepts 64 bytes) */
+        if ((int) ltmp != ldef) {
+            EVP_CIPHER_CTX *tctx = EVP_CIPHER_CTX_new();
+            EVP_CipherInit_ex(tctx, evp_cipher, NULL, NULL, NULL, 0);
+            EVP_CIPHER_CTX_set_key_length(tctx, (int) ltmp);
+            if (EVP_CIPHER_CTX_key_length(tctx) == (int) ltmp) {
+                use_len = ltmp;   /* variable-length cipher: use ltmp bytes */
+            }
+            EVP_CIPHER_CTX_free(tctx);
+        }
+
+        unsigned char iv[EVP_MAX_IV_LENGTH];
+        ngx_memset(iv, 0, sizeof(iv));
+
+        dctx = EVP_CIPHER_CTX_new();
+        EVP_DecryptInit_ex(dctx, evp_cipher, NULL, NULL, NULL);
+        if (use_len != (size_t) ldef) {
+            EVP_CIPHER_CTX_set_key_length(dctx, (int) use_len);
+        }
+        EVP_DecryptInit_ex(dctx, NULL, NULL, secret, iv);
+    }
+
+    {
+        size_t plain_size = main_len + (size_t) EVP_CIPHER_CTX_block_size(dctx) + 1;
+        plain = ngx_palloc(c->pool, plain_size);
+        if (!plain) {
+            EVP_CIPHER_CTX_free(dctx);
+            return NULL;
+        }
+
+        if (EVP_DecryptUpdate(dctx, plain, &olen,
+                              main_data, (int) main_len) != 1) {
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                          "xrootd: GSI kXGC_cert: EVP_DecryptUpdate failed");
+            EVP_CIPHER_CTX_free(dctx);
+            return NULL;
+        }
+        if (EVP_DecryptFinal_ex(dctx, plain + olen, &flen) != 1) {
+            char errstr[128];
+            ERR_error_string_n(ERR_get_error(), errstr, sizeof(errstr));
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                          "xrootd: GSI kXGC_cert: EVP_DecryptFinal failed: %s",
+                          errstr);
+            EVP_CIPHER_CTX_free(dctx);
+            return NULL;
+        }
+        EVP_CIPHER_CTX_free(dctx);
+    }
+
+    int plain_len = olen + flen;
+    ngx_log_debug1(NGX_LOG_DEBUG_STREAM, log, 0,
+                   "xrootd: GSI decrypted kXRS_main: %d bytes", plain_len);
+
+    /*
+     * Step 6: Parse the decrypted inner XrdSutBuffer for kXRS_x509.
+     *
+     * The decrypted inner buffer is itself a well-formed XrdSutBuffer:
+     *   "gsi\0"  step=1001
+     *   kXRS_x509   <PEM-encoded proxy cert + issuing cert chain>
+     *   kXRS_rtag   <client's new random nonce>
+     *   kXRS_none   (terminator)
+     *
+     * The PEM block typically contains 2-3 concatenated certificates:
+     *   [0] proxy certificate (end-entity, issued by [1])
+     *   [1] user certificate  (end-entity, issued by the CA)
+     *   [2] ... (optional intermediate CAs)
+     *
+     * We read all PEM certificates out of kXRS_x509 and return them as a
+     * STACK_OF(X509).  The caller (xrootd_handle_auth) passes them to
+     * X509_verify_cert() with X509_V_FLAG_ALLOW_PROXY_CERTS set.
+     */
+    if (gsi_find_bucket(plain, (size_t) plain_len, (uint32_t) kXRS_x509,
+                        &x509_data, &x509_len) != 0) {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "xrootd: GSI kXGC_cert: kXRS_x509 not found "
+                      "in decrypted inner buffer");
+        return NULL;
+    }
+
+    bio   = BIO_new_mem_buf(x509_data, (int) x509_len);
+    chain = sk_X509_new_null();
+    if (!bio || !chain) {
+        BIO_free(bio);
+        sk_X509_free(chain);
+        return NULL;
+    }
+    while ((cert = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
+        sk_X509_push(chain, cert);
+    }
+    BIO_free(bio);
+
+    if (sk_X509_num(chain) == 0) {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "xrootd: GSI kXGC_cert: kXRS_x509 contained no certs");
+        sk_X509_pop_free(chain, X509_free);
+        return NULL;
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_STREAM, log, 0,
+                   "xrootd: GSI parsed %d cert(s) from kXRS_x509 after decrypt",
+                   sk_X509_num(chain));
+    return chain;
+}
+
+/*
+ * gsi_find_bucket — scan a binary XrdSutBuffer for a bucket of a given type.
+ *
+ * XrdSutBuffer binary wire layout (all multi-byte fields are big-endian):
+ *
+ *   [protocol_name\0]   null-terminated string, e.g. "gsi\0" (4 bytes)
+ *   [step : uint32 BE]  e.g. kXGC_certreq=1000, kXGS_cert=2001
+ *   zero or more buckets:
+ *     [type : uint32 BE]  bucket type constant (kXRS_puk, kXRS_x509, ...)
+ *     [len  : uint32 BE]  length of the data that follows, in bytes
+ *     [data : len bytes]
+ *   [kXRS_none : uint32 BE]  terminator (type=0, no len/data fields)
+ *
+ * This function skips the protocol name and step header, then does a linear
+ * scan of the bucket list looking for the first bucket of type target_type.
+ *
+ * On success: fills *data_out (pointer into payload) and *len_out, returns 0.
+ * On failure (not found, or malformed buffer): returns -1.
+ *
+ * Note: *data_out points into the caller's payload buffer; no copy is made.
+ * The caller must not free or modify the data at *data_out.
+ */
+static int
+gsi_find_bucket(const u_char *payload, size_t plen,
+                uint32_t target_type,
+                const u_char **data_out, size_t *len_out)
+{
+    const u_char *p   = payload;
+    const u_char *end = payload + plen;
+    size_t        proto_len;
+
+    if (plen < 8) return -1;
+
+    /* Skip null-terminated protocol name */
+    proto_len = ngx_strnlen((u_char *) p, plen) + 1;   /* include '\0' */
+    if (proto_len >= plen) return -1;
+    p += proto_len;
+
+    /* Skip step (4 bytes) */
+    if (p + 4 > end) return -1;
+    p += 4;
+
+    /* Scan buckets */
+    while (p + 8 <= end) {
+        uint32_t btype, blen;
+        ngx_memcpy(&btype, p,     4); btype = ntohl(btype);
+        ngx_memcpy(&blen,  p + 4, 4); blen  = ntohl(blen);
+        p += 8;
+
+        if (btype == (uint32_t) kXRS_none) break;
+        if (p + blen > end) return -1;
+
+        if (btype == target_type) {
+            *data_out = p;
+            *len_out  = blen;
+            return 0;
+        }
+        p += blen;
+    }
+    return -1;
+}
+
+/*
+ * xrootd_gsi_send_cert — respond to kXGC_certreq (step 1000) with kXGS_cert
+ * (step 2001) carried in a kXR_authmore response.
+ *
+ * Our response is an XrdSutBuffer with:
+ *
+ *   "gsi\0"             protocol name (null-terminated)
+ *   step = kXGS_cert    (2001, big-endian uint32)
+ *   kXRS_puk            our ephemeral DH public key blob (see format below)
+ *   kXRS_cipher_alg     offered ciphers: "aes-256-cbc:aes-128-cbc:bf-cbc"
+ *   kXRS_md_alg         offered hashes:  "sha256:sha1"
+ *   kXRS_x509           our host certificate PEM (for client to verify us)
+ *   kXRS_main           inner XrdSutBuffer (NOT encrypted at this step):
+ *     "gsi\0"           protocol name
+ *     step = kXGS_cert  (2001)
+ *     kXRS_signed_rtag  RSA_PKCS1_sign(server_private_key, client_rtag)
+ *     kXRS_none
+ *   kXRS_none           outer terminator
+ *
+ * kXRS_puk blob format (XrdCryptosslCipher convention):
+ *   <DH PARAMETERS PEM>---BPUB---<hex BIGNUM of pub key>---EPUB--
+ *
+ *   The closing sentinel is "---EPUB--" (9 characters, no trailing dash).
+ *   The DH PARAMETERS PEM is the standard OpenSSL parameters block for the
+ *   ffdhe2048 named group (RFC 7919 well-known MODP group, 2048-bit).
+ *
+ * DH key generation note: We use the ffdhe2048 named group because it is
+ * safe against small-subgroup attacks and is the group XRootD uses by
+ * default.  Key generation takes ~1ms and is done per-connection to provide
+ * forward secrecy.
+ *
+ * kXRS_signed_rtag: The client embedded a random challenge (kXRS_rtag) in
+ * its kXGC_certreq inner buffer.  We sign it with RSA PKCS1 padding using
+ * our server private key.  The client then calls DecryptPublic() (verify-
+ * recover) with our public key to confirm we hold the matching private key
+ * — i.e., that we are who the certificate says we are.
+ *
+ * The ephemeral DH key is stored in ctx->gsi_dh_key for later use when
+ * deriving the shared secret from the client's DH public key in kXGC_cert.
+ * It must NOT be freed here.
+ */
+static ngx_int_t
+xrootd_gsi_send_cert(xrootd_ctx_t *ctx, ngx_connection_t *c)
+{
+    ngx_stream_xrootd_srv_conf_t *conf;
+    EVP_PKEY_CTX *pctx;
+    EVP_PKEY     *dhkey = NULL;
+    BIGNUM       *pub_bn = NULL;
+    char         *pub_hex = NULL;
+    BIO          *bio;
+    BUF_MEM      *bptr;
+    u_char       *buf, *p;
+    u_char       *cert_pem, *puk_blob;
+    size_t        cert_len, puk_len, body_len, total;
+    char          puk_buf[4096];
+    int           puk_written;
+
+    conf = ngx_stream_get_module_srv_conf(ctx->session,
+                                          ngx_stream_xrootd_module);
+
+    /* Export server certificate as PEM */
+    bio = BIO_new(BIO_s_mem());
+    if (bio == NULL) return NGX_ERROR;
+    if (!PEM_write_bio_X509(bio, conf->gsi_cert)) {
+        BIO_free(bio);
+        return NGX_ERROR;
+    }
+    BIO_get_mem_ptr(bio, &bptr);
+    cert_len = bptr->length;
+    cert_pem = ngx_palloc(c->pool, cert_len);
+    if (cert_pem == NULL) { BIO_free(bio); return NGX_ERROR; }
+    ngx_memcpy(cert_pem, bptr->data, cert_len);
+    BIO_free(bio);
+
+    /*
+     * Generate ephemeral DH key pair using the ffdhe2048 well-known group.
+     * Key generation from a named group is fast (milliseconds).
+     */
+    {
+        OSSL_PARAM dh_params[] = {
+            OSSL_PARAM_utf8_string("group", "ffdhe2048", 0),
+            OSSL_PARAM_END
+        };
+        pctx = EVP_PKEY_CTX_new_from_name(NULL, "DH", NULL);
+        if (pctx == NULL) return NGX_ERROR;
+        EVP_PKEY_keygen_init(pctx);
+        EVP_PKEY_CTX_set_params(pctx, dh_params);
+        if (EVP_PKEY_keygen(pctx, &dhkey) <= 0) {
+            EVP_PKEY_CTX_free(pctx);
+            return NGX_ERROR;
+        }
+        EVP_PKEY_CTX_free(pctx);
+    }
+
+    /* Extract DH public key as hex BIGNUM */
+    if (!EVP_PKEY_get_bn_param(dhkey, "pub", &pub_bn)) {
+        EVP_PKEY_free(dhkey);
+        return NGX_ERROR;
+    }
+    pub_hex = BN_bn2hex(pub_bn);
+    BN_free(pub_bn);
+    if (pub_hex == NULL) {
+        EVP_PKEY_free(dhkey);
         return NGX_ERROR;
     }
 
-    xrootd_build_resp_hdr(ctx->cur_streamid, kXR_ok,
-                           XROOTD_SESSION_ID_LEN,
+    /* Write DH parameters as PEM */
+    bio = BIO_new(BIO_s_mem());
+    if (bio == NULL) {
+        OPENSSL_free(pub_hex);
+        EVP_PKEY_free(dhkey);
+        return NGX_ERROR;
+    }
+    PEM_write_bio_Parameters(bio, dhkey);
+    /* Keep dhkey alive for kXGC_cert DH shared-secret derivation */
+    ctx->gsi_dh_key = dhkey;
+    BIO_get_mem_ptr(bio, &bptr);
+
+    /*
+     * kXRS_puk blob = DH_params_PEM + "---BPUB---" + hex + "---EPUB--"
+     * Note: closing sentinel is "---EPUB--" (9 chars), not 10.
+     */
+    puk_written = snprintf(puk_buf, sizeof(puk_buf),
+                           "%.*s---BPUB---%s---EPUB--",
+                           (int) bptr->length, bptr->data, pub_hex);
+    BIO_free(bio);
+    OPENSSL_free(pub_hex);
+
+    if (puk_written <= 0 || (size_t) puk_written >= sizeof(puk_buf)) {
+        return NGX_ERROR;
+    }
+    puk_len = (size_t) puk_written;
+
+    puk_blob = ngx_palloc(c->pool, puk_len);
+    if (puk_blob == NULL) return NGX_ERROR;
+    ngx_memcpy(puk_blob, puk_buf, puk_len);
+
+    /*
+     * Sign the client's random challenge (kXRS_rtag) from kXGC_certreq.
+     *
+     * The client puts a random nonce inside the kXRS_main inner buffer of its
+     * kXGC_certreq message.  We must:
+     *   1. Find kXRS_main in the outer kXGC_certreq buffer.
+     *   2. Find kXRS_rtag inside that inner buffer.
+     *   3. Sign the rtag bytes with our RSA private key using PKCS1 padding.
+     *      This is identical to XrdCryptosslRSA::EncryptPrivate().
+     *   4. Return the signature as kXRS_signed_rtag in our kXGS_cert response.
+     *
+     * The client verifies the signature with DecryptPublic() (RSA verify_recover
+     * using the server public key from the kXRS_x509 cert we also send).  This
+     * proves server identity — the client knows we hold the private key matching
+     * the certificate we claimed.
+     *
+     * If we cannot sign (rtag absent or private key error) we proceed without
+     * kXRS_signed_rtag.  The client may reject us, but logging this lets the
+     * operator diagnose configuration issues.
+     */
+    const u_char *main_data  = NULL;
+    size_t        main_dlen  = 0;
+    const u_char *clnt_rtag  = NULL;
+    size_t        clnt_rtlen = 0;
+    u_char       *signed_rtag    = NULL;
+    size_t        signed_rtag_len = 0;
+
+    /* Locate kXRS_main in the outer (kXGC_certreq) XrdSutBuffer */
+    if (gsi_find_bucket(ctx->payload, ctx->cur_dlen,
+                        (uint32_t) kXRS_main, &main_data, &main_dlen) == 0) {
+        /* Locate kXRS_rtag in the inner (unencrypted) XrdSutBuffer */
+        gsi_find_bucket(main_data, main_dlen,
+                        (uint32_t) kXRS_rtag, &clnt_rtag, &clnt_rtlen);
+    }
+
+    if (clnt_rtag && clnt_rtlen > 0) {
+        /* Sign with server RSA private key — identical to EncryptPrivate() */
+        EVP_PKEY_CTX *sctx = EVP_PKEY_CTX_new(conf->gsi_key, NULL);
+        if (sctx) {
+            size_t slen = (size_t) EVP_PKEY_size(conf->gsi_key);
+            signed_rtag = ngx_palloc(c->pool, slen);
+            if (signed_rtag &&
+                EVP_PKEY_sign_init(sctx) > 0 &&
+                EVP_PKEY_CTX_set_rsa_padding(sctx, RSA_PKCS1_PADDING) > 0 &&
+                EVP_PKEY_sign(sctx, signed_rtag, &slen,
+                              clnt_rtag, clnt_rtlen) > 0)
+            {
+                signed_rtag_len = slen;
+            } else {
+                signed_rtag = NULL;  /* sign failed, skip */
+            }
+            EVP_PKEY_CTX_free(sctx);
+        }
+    }
+
+    /*
+     * Build the kXRS_main inner buffer.
+     *
+     * This is a nested XrdSutBuffer (same format as the outer one) containing
+     * only kXRS_signed_rtag.  It is NOT encrypted — we don't yet have a shared
+     * session key because the client's DH public key hasn't arrived yet.
+     * The client receives our kXRS_main, reads the kXRS_signed_rtag bucket,
+     * and uses RSA verify_recover to confirm we hold the server private key.
+     *
+     * Wire layout:
+     *   [4] "gsi\0"
+     *   [4] step = kXGS_cert (2001), big-endian
+     *   if signed_rtag available:
+     *     [4] kXRS_signed_rtag type
+     *     [4] signed_rtag_len
+     *     [N] signature bytes
+     *   [4] kXRS_none terminator
+     */
+    size_t main_len = 4 + 4    /* "gsi\0" + step */
+                    + 4;        /* kXRS_none      */
+    if (signed_rtag_len > 0) {
+        main_len += 4 + 4 + signed_rtag_len;   /* kXRS_signed_rtag bucket */
+    }
+
+    u_char *main_buf = ngx_palloc(c->pool, main_len);
+    if (main_buf == NULL) return NGX_ERROR;
+    {
+        u_char *mp = main_buf;
+        mp[0]='g'; mp[1]='s'; mp[2]='i'; mp[3]='\0'; mp += 4;
+        *(uint32_t *) mp = htonl(kXGS_cert); mp += 4;
+        if (signed_rtag_len > 0) {
+            *(uint32_t *) mp = htonl(kXRS_signed_rtag); mp += 4;
+            *(uint32_t *) mp = htonl((uint32_t) signed_rtag_len); mp += 4;
+            ngx_memcpy(mp, signed_rtag, signed_rtag_len); mp += signed_rtag_len;
+        }
+        *(uint32_t *) mp = htonl(kXRS_none); mp += 4;
+    }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                   "xrootd: kXGS_cert signed rtag=%uz bytes main_len=%uz",
+                   signed_rtag_len, main_len);
+
+    /* Cipher and MD algorithm strings */
+    const char *cipher_alg = "aes-256-cbc:aes-128-cbc:bf-cbc";
+    const char *md_alg     = "sha256:sha1";
+    size_t      calg_len   = strlen(cipher_alg);
+    size_t      malg_len   = strlen(md_alg);
+
+    body_len = 4 + 4                    /* "gsi\0" + step          */
+             + 4 + 4 + puk_len          /* kXRS_puk  bucket        */
+             + 4 + 4 + calg_len         /* kXRS_cipher_alg bucket  */
+             + 4 + 4 + malg_len         /* kXRS_md_alg bucket      */
+             + 4 + 4 + cert_len         /* kXRS_x509 bucket        */
+             + 4 + 4 + main_len         /* kXRS_main bucket        */
+             + 4;                       /* kXRS_none terminator    */
+
+    total = XRD_RESPONSE_HDR_LEN + body_len;
+    buf   = ngx_palloc(c->pool, total);
+    if (buf == NULL) return NGX_ERROR;
+
+    xrootd_build_resp_hdr(ctx->cur_streamid, kXR_authmore,
+                           (uint32_t) body_len,
                            (ServerResponseHdr *) buf);
 
-    ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN, ctx->sessid,
-               XROOTD_SESSION_ID_LEN);
+    p = buf + XRD_RESPONSE_HDR_LEN;
+
+    p[0]='g'; p[1]='s'; p[2]='i'; p[3]='\0'; p += 4;
+
+    *(uint32_t *) p = htonl(kXGS_cert); p += 4;
+
+    *(uint32_t *) p = htonl(kXRS_puk);           p += 4;
+    *(uint32_t *) p = htonl((uint32_t) puk_len);  p += 4;
+    ngx_memcpy(p, puk_blob, puk_len);            p += puk_len;
+
+    *(uint32_t *) p = htonl(kXRS_cipher_alg);           p += 4;
+    *(uint32_t *) p = htonl((uint32_t) calg_len);        p += 4;
+    ngx_memcpy(p, cipher_alg, calg_len);                p += calg_len;
+
+    *(uint32_t *) p = htonl(kXRS_md_alg);               p += 4;
+    *(uint32_t *) p = htonl((uint32_t) malg_len);        p += 4;
+    ngx_memcpy(p, md_alg, malg_len);                    p += malg_len;
+
+    *(uint32_t *) p = htonl(kXRS_x509);          p += 4;
+    *(uint32_t *) p = htonl((uint32_t) cert_len); p += 4;
+    ngx_memcpy(p, cert_pem, cert_len);            p += cert_len;
+
+    *(uint32_t *) p = htonl(kXRS_main);           p += 4;
+    *(uint32_t *) p = htonl((uint32_t) main_len);  p += 4;
+    ngx_memcpy(p, main_buf, main_len);            p += main_len;
+
+    *(uint32_t *) p = htonl(kXRS_none); p += 4;
+
+    ngx_log_debug3(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                   "xrootd: kXGS_cert sent cert_len=%uz puk_len=%uz main_len=%uz",
+                   cert_len, puk_len, main_len);
 
     return xrootd_queue_response(ctx, c, buf, total);
+}
+
+/* ================================================================== */
+/*                                                                    */
+/*  GSI / x509 AUTHENTICATION PROTOCOL                                */
+/*                                                                    */
+/*  This section implements GSI (Grid Security Infrastructure) auth,  */
+/*  the dominant authentication mechanism in High Energy Physics      */
+/*  computing grids (CERN, SLAC, Fermilab, etc.).  It is based on    */
+/*  RFC 3820 proxy certificates and a DH key exchange for session     */
+/*  cipher setup.                                                      */
+/*                                                                    */
+/* ------------------------------------------------------------------ */
+/*  KEY DATA STRUCTURE: XrdSutBuffer                                  */
+/* ------------------------------------------------------------------ */
+/*                                                                    */
+/*  All GSI messages (both client→server and server→client) carry     */
+/*  their payload as an XrdSutBuffer — a binary container format:     */
+/*                                                                    */
+/*    [protocol_name\0]  (null-terminated, e.g. "gsi\0")             */
+/*    [step : uint32 BE]                                              */
+/*    bucket...          (zero or more)                               */
+/*    [kXRS_none : uint32 BE]  (terminator)                          */
+/*                                                                    */
+/*  Each bucket:                                                      */
+/*    [type : uint32 BE]                                              */
+/*    [len  : uint32 BE]                                              */
+/*    [data : len bytes]                                              */
+/*                                                                    */
+/*  Bucket type constants (from XrdSecgsiTrace.hh / XrdSutBucket.hh):*/
+/*    kXRS_none        0  terminator                                  */
+/*    kXRS_main        2  inner payload buffer (may be encrypted)     */
+/*    kXRS_puk         4  DH public key blob (see format below)       */
+/*    kXRS_x509       22  PEM-encoded certificate chain               */
+/*    kXRS_cipher_alg 27  cipher name list ("aes-256-cbc:aes-128-cbc")*/
+/*    kXRS_md_alg     28  hash name list ("sha256:sha1")              */
+/*    kXRS_rtag       33  client random challenge (nonce)             */
+/*    kXRS_signed_rtag 34 server's signature of the client's rtag     */
+/*                                                                    */
+/*  See gsi_find_bucket() for the parsing implementation.             */
+/*                                                                    */
+/* ------------------------------------------------------------------ */
+/*  KEY DATA STRUCTURE: kXRS_puk DH blob                              */
+/* ------------------------------------------------------------------ */
+/*                                                                    */
+/*  The kXRS_puk bucket is NOT an RSA public key PEM.  It is a       */
+/*  custom text blob used by XrdCryptosslCipher to carry DH           */
+/*  parameters and the DH public key:                                 */
+/*                                                                    */
+/*    <DH PARAMETERS PEM>---BPUB---<hex BIGNUM>---EPUB--              */
+/*                                                                    */
+/*  The DH PARAMETERS PEM is a standard OpenSSL parameters block.    */
+/*  The hex BIGNUM is BN_bn2hex() of the public key value.           */
+/*  The closing sentinel is "---EPUB--" — 9 characters, NOT 10.      */
+/*                                                                    */
+/*  GOTCHA: Sending an RSA PEM in kXRS_puk causes the client to      */
+/*  print "could not instantiate session cipher" and disconnect.      */
+/*                                                                    */
+/* ------------------------------------------------------------------ */
+/*  STEP 1: kXR_login response — the GSI challenge string            */
+/* ------------------------------------------------------------------ */
+/*                                                                    */
+/*  When GSI auth is configured, the kXR_login response is:          */
+/*    kXR_ok + 16-byte sessid + "&P=gsi,v:10000,c:ssl,ca:<hash>\0"  */
+/*                                                                    */
+/*  GOTCHA: The challenge string MUST be plain text in "&P=..." form, */
+/*  not a binary XrdSutBuffer.  The XRootD client's ClientDoInit()   */
+/*  calls GetOptions() on the challenge, which only parses "&P=..."   */
+/*  text format.  Sending a binary buffer here causes the client to  */
+/*  print "No protocols left to try" and disconnect.                  */
+/*                                                                    */
+/*  We advertise v:10000 (the "old protocol").  Versions >= 10400    */
+/*  require the server to sign the kXRS_puk DH blob with its RSA     */
+/*  private key.  v:10000 skips that signature requirement.          */
+/*                                                                    */
+/*  The ca:<hash> field is the hex-encoded X509_subject_name_hash()  */
+/*  of the trusted CA certificate.  Clients use this to find the     */
+/*  matching CA certificate in their X509_CERT_DIR to verify our     */
+/*  host certificate later.                                           */
+/*                                                                    */
+/* ------------------------------------------------------------------ */
+/*  STEP 2: kXGC_certreq (step 1000) — client's first auth message   */
+/* ------------------------------------------------------------------ */
+/*                                                                    */
+/*  The client sends kXR_auth with this XrdSutBuffer:                */
+/*    "gsi\0"  step=kXGC_certreq(1000)                               */
+/*    kXRS_main{ "gsi\0", step=...,                                  */
+/*               kXRS_rtag(<32 random bytes>) }                       */
+/*                                                                    */
+/*  The kXRS_rtag inside kXRS_main is the client's random challenge.  */
+/*  We must sign it with our RSA private key (PKCS1 padding) and     */
+/*  return the signature as kXRS_signed_rtag in our response.         */
+/*                                                                    */
+/*  The client verifies the signature using DecryptPublic (i.e.,      */
+/*  RSA verify_recover with the server cert public key), so the      */
+/*  server proves it holds the private key matching the cert we send. */
+/*                                                                    */
+/* ------------------------------------------------------------------ */
+/*  STEP 3: kXGS_cert (step 2001) — server's auth response           */
+/* ------------------------------------------------------------------ */
+/*                                                                    */
+/*  We respond with kXR_authmore + XrdSutBuffer:                     */
+/*    "gsi\0"  step=kXGS_cert(2001)                                  */
+/*    kXRS_puk       <DH PARAMS PEM>---BPUB---<hex>---EPUB--         */
+/*    kXRS_cipher_alg  "aes-256-cbc:aes-128-cbc:bf-cbc"             */
+/*    kXRS_md_alg      "sha256:sha1"                                 */
+/*    kXRS_x509        <server host certificate PEM>                 */
+/*    kXRS_main{                                                      */
+/*        "gsi\0"  step=kXGS_cert(2001)                              */
+/*        kXRS_signed_rtag  <RSA_PKCS1_sign(server_key, client_rtag)>*/
+/*    }                                                               */
+/*                                                                    */
+/*  IMPORTANT: kXRS_main in our kXGS_cert response is NOT encrypted. */
+/*  Session cipher setup happens on the client side using its own DH  */
+/*  private key and our DH public key.  The client then encrypts its  */
+/*  kXRS_main in kXGC_cert.  We receive that and must decrypt it.    */
+/*                                                                    */
+/*  We store the ephemeral DH key (ctx->gsi_dh_key) across the two   */
+/*  kXR_auth messages so we can derive the shared secret later.       */
+/*                                                                    */
+/* ------------------------------------------------------------------ */
+/*  STEP 4: kXGC_cert (step 1001) — client's proxy certificate       */
+/* ------------------------------------------------------------------ */
+/*                                                                    */
+/*  Client sends kXR_auth + XrdSutBuffer (outer, unencrypted):        */
+/*    "gsi\0"  step=kXGC_cert(1001)                                  */
+/*    kXRS_puk       <client DH blob, same format as server's>        */
+/*    kXRS_cipher_alg  <chosen cipher from our offered list>          */
+/*    kXRS_md_alg      <chosen hash>                                 */
+/*    kXRS_main        <AES-CBC encrypted inner buffer>               */
+/*                                                                    */
+/*  GOTCHA: The proxy cert is NOT in the outer buffer.  It is inside  */
+/*  kXRS_main after decryption.  Scanning the outer buffer for        */
+/*  kXRS_x509 will always fail.                                        */
+/*                                                                    */
+/*  Decrypted kXRS_main (inner XrdSutBuffer):                        */
+/*    "gsi\0"  step=1001                                             */
+/*    kXRS_x509    <proxy cert + issuing chain PEM>                  */
+/*    kXRS_rtag    <client's new random tag>                         */
+/*                                                                    */
+/* ------------------------------------------------------------------ */
+/*  DH SESSION KEY DERIVATION (old protocol, v:10000, HasPad=0)       */
+/* ------------------------------------------------------------------ */
+/*                                                                    */
+/*  1. Server generates ephemeral DH key pair using ffdhe2048 group   */
+/*     (RFC 7919 well-known MODP group, safe against subgroup attacks)*/
+/*                                                                    */
+/*  2. Server sends DH public key in kXRS_puk (kXGS_cert step).      */
+/*                                                                    */
+/*  3. Client generates its own DH key pair, sends its public key in  */
+/*     kXRS_puk (kXGC_cert step).                                     */
+/*                                                                    */
+/*  4. Server derives shared secret:                                  */
+/*       EVP_PKEY_CTX_set_dh_pad(ctx, 0)   ← no padding, old protocol*/
+/*       EVP_PKEY_derive(ctx, secret, &secret_len)                   */
+/*                                                                    */
+/*  GOTCHA: HasPad=0 means no leading-zero padding.  The default      */
+/*  OpenSSL DH derive pads the secret to match the DH prime length.   */
+/*  We must disable padding to match the client's derivation.          */
+/*                                                                    */
+/*  5. Key length: mirrors XrdCryptosslCipher::Finalize():            */
+/*       ltmp = min(secret_len, EVP_MAX_KEY_LENGTH)                  */
+/*       if (ltmp == EVP_CIPHER_key_length):                          */
+/*           use ltmp bytes of secret as key                          */
+/*       else:                                                         */
+/*           try EVP_CIPHER_CTX_set_key_length(ltmp);                */
+/*           if that works (variable-length cipher like bf-cbc):      */
+/*               use ltmp bytes                                        */
+/*           else:                                                     */
+/*               use EVP_CIPHER_key_length bytes                      */
+/*     For aes-256-cbc: ldef=32, typically secret_len=256, ltmp=32,  */
+/*     so we use the first 32 bytes of the shared secret.             */
+/*                                                                    */
+/*  6. IV = all zeros (useIV=false for old protocol v:10000).         */
+/*                                                                    */
+/* ------------------------------------------------------------------ */
+/*  PROXY CERTIFICATE VERIFICATION                                    */
+/* ------------------------------------------------------------------ */
+/*                                                                    */
+/*  RFC 3820 proxy certificates have a proxyCertInfo extension with   */
+/*  OID 1.3.6.1.5.5.7.1.14.  Standard OpenSSL X509_verify_cert()     */
+/*  rejects them unless X509_V_FLAG_ALLOW_PROXY_CERTS is set on both  */
+/*  the X509_STORE and the X509_STORE_CTX.                           */
+/*                                                                    */
+/*  The kXRS_x509 bucket from kXGC_cert contains the full chain:     */
+/*    [0] proxy certificate (the leaf — presented to the server)      */
+/*    [1] user end-entity certificate (the proxy's issuer)            */
+/*    [2] ... (optional intermediate CA certificates)                 */
+/*                                                                    */
+/*  We pass the leaf (cert[0]) as the subject, and certs[1..N] as     */
+/*  the untrusted chain, letting X509_STORE_CTX walk up to the CA.   */
+/*                                                                    */
+/* ------------------------------------------------------------------ */
+/*  STAT WIRE FORMAT (easy to get wrong)                              */
+/* ------------------------------------------------------------------ */
+/*                                                                    */
+/*  kXR_stat response body:                                           */
+/*    "<id> <size> <flags> <mtime>\0"   (size BEFORE flags)          */
+/*                                                                    */
+/*  kXR_open retstat body (after ServerOpenBody):                     */
+/*    "<id> <size> <flags> <mtime>\0"   (same order)                 */
+/*                                                                    */
+/*  GOTCHA: Earlier versions of this code (and many online examples)  */
+/*  sent "<id> <flags> <size> <mtime>" (flags before size), which     */
+/*  causes the client to interpret flags=4096 (kXR_isDir) as file     */
+/*  size and size=24 as flags.  The correct order was verified in     */
+/*  XrdClXRootDResponses.cc ParseServerResponse() lines 148-155:     */
+/*    chunks[0]=id, chunks[1]=size, chunks[2]=flags, chunks[3]=mtime  */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * kXR_auth — handle GSI authentication sub-steps.
+ *
+ * Two sub-steps arrive as separate kXR_auth messages:
+ *
+ *   kXGC_certreq (step 1000) — client requests our host certificate.
+ *     We extract the client's random tag (kXRS_rtag) from the inner buffer,
+ *     generate an ephemeral DH key pair, sign the rtag with our RSA private
+ *     key, and respond with kXR_authmore carrying kXGS_cert.
+ *
+ *   kXGC_cert (step 1001) — client sends its proxy certificate chain
+ *     encrypted under the DH-derived session key.  We derive the shared
+ *     secret, decrypt kXRS_main, extract and verify the kXRS_x509 chain
+ *     against the trusted CA store, and send kXR_ok on success.
+ *
+ * The DH ephemeral key (ctx->gsi_dh_key) is stored between the two steps
+ * and freed immediately after kXGC_cert processing.
+ */
+static ngx_int_t
+xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c)
+{
+    ngx_stream_xrootd_srv_conf_t *conf;
+    STACK_OF(X509)               *chain;
+    X509                         *leaf;
+    X509_STORE_CTX               *vctx;
+    char                         *dn_str;
+    uint32_t                      gsi_step;
+    int                           ok;
+
+    if (!ctx->logged_in) {
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                 "login required before auth");
+    }
+
+    conf = ngx_stream_get_module_srv_conf(ctx->session,
+                                          ngx_stream_xrootd_module);
+
+    if (conf->auth != XROOTD_AUTH_GSI || conf->gsi_store == NULL) {
+        ctx->auth_done = 1;
+        return xrootd_send_ok(ctx, c, NULL, 0);
+    }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                   "xrootd: kXR_auth credtype=\"%.4s\" payloadlen=%d",
+                   ctx->cur_body, (int) ctx->cur_dlen);
+
+    if (ctx->payload == NULL || ctx->cur_dlen < 8) {
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                 "empty GSI credential");
+    }
+
+    /* Verify protocol name */
+    if (ctx->payload[0] != 'g' || ctx->payload[1] != 's' ||
+        ctx->payload[2] != 'i')
+    {
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                 "not a GSI credential");
+    }
+
+    /* Dispatch on GSI step */
+    ngx_memcpy(&gsi_step, ctx->payload + 4, 4);
+    gsi_step = ntohl(gsi_step);
+
+    ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                   "xrootd: GSI kXR_auth step=%ud", (unsigned) gsi_step);
+
+    if (gsi_step == (uint32_t) kXGC_certreq) {
+        return xrootd_gsi_send_cert(ctx, c);
+    }
+
+    if (gsi_step != (uint32_t) kXGC_cert) {
+        ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                      "xrootd: unexpected GSI step %ud", (unsigned) gsi_step);
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                 "unexpected GSI auth step");
+    }
+
+    /* kXGC_cert (1001): decrypt inner buffer and verify client proxy chain */
+
+    /* Derive DH session key, decrypt kXRS_main, extract kXRS_x509 */
+    chain = xrootd_gsi_parse_x509(ctx, c);
+
+    /* DH key no longer needed after this point */
+    if (ctx->gsi_dh_key) {
+        EVP_PKEY_free(ctx->gsi_dh_key);
+        ctx->gsi_dh_key = NULL;
+    }
+
+    if (chain == NULL) {
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                 "cannot parse GSI credential");
+    }
+
+    /* leaf cert = first cert in the chain (the proxy cert or user cert) */
+    leaf = sk_X509_value(chain, 0);
+
+    /* Verify the chain against the trusted CA store */
+    vctx = X509_STORE_CTX_new();
+    if (vctx == NULL) {
+        sk_X509_pop_free(chain, X509_free);
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                 "internal OpenSSL error");
+    }
+
+    /*
+     * For proxy certs, the "untrusted" chain contains the intermediate
+     * user cert(s); X509_STORE_CTX will walk from leaf to root.
+     * sk_X509_dup creates a shallow copy (pointers copied, not certs).
+     */
+    STACK_OF(X509) *untrusted = NULL;
+    if (sk_X509_num(chain) > 1) {
+        untrusted = sk_X509_dup(chain);
+        /* Remove the leaf from the untrusted set */
+        sk_X509_delete(untrusted, 0);
+    }
+
+    X509_STORE_CTX_init(vctx, conf->gsi_store, leaf, untrusted);
+
+    /* Allow proxy certificates in the verification path */
+    X509_STORE_CTX_set_flags(vctx, X509_V_FLAG_ALLOW_PROXY_CERTS);
+
+    ok = X509_verify_cert(vctx);
+
+    if (untrusted) {
+        sk_X509_free(untrusted);   /* shallow free — don't free the certs */
+    }
+
+    if (ok != 1) {
+        int verr = X509_STORE_CTX_get_error(vctx);
+        ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                      "xrootd: GSI cert verification failed: %s",
+                      X509_verify_cert_error_string(verr));
+        X509_STORE_CTX_free(vctx);
+        sk_X509_pop_free(chain, X509_free);
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                 "certificate verification failed");
+    }
+
+    X509_STORE_CTX_free(vctx);
+
+    /* Extract the subject DN for logging / policy */
+    dn_str = X509_NAME_oneline(X509_get_subject_name(leaf), NULL, 0);
+    if (dn_str) {
+        ngx_cpystrn((u_char *) ctx->dn,
+                    (u_char *) dn_str,
+                    sizeof(ctx->dn) - 1);
+        OPENSSL_free(dn_str);
+    }
+
+    sk_X509_pop_free(chain, X509_free);
+
+    ctx->auth_done = 1;
+
+    ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                  "xrootd: GSI auth OK dn=\"%s\"", ctx->dn);
+
+    return xrootd_send_ok(ctx, c, NULL, 0);
 }
 
 /* kXR_ping — liveness check */
@@ -1051,24 +2501,21 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
                 (u_char *) resolved,
                 sizeof(ctx->files[idx].path));
 
-    /* If kXR_retstat, fstat now so we can include it in the response.
+    /*
+     * If the client set kXR_retstat, include a stat string in the open
+     * response so the client doesn't need to issue a separate kXR_stat.
      *
-     * The stat string in a kXR_open response uses 3 fields (no inode id):
-     *   "<flags> <size> <mtime>\0"
-     * This differs from the standalone kXR_stat response which has 4 fields:
-     *   "<id> <flags> <size> <mtime>\0"
+     * Both kXR_open retstat and standalone kXR_stat use the same wire order:
+     *   "<id> <size> <flags> <mtime>\0"
+     *
+     * The client's ServerOpenBody handler reads the stat string starting
+     * immediately after the 12-byte ServerOpenBody, using the same parser
+     * as standalone kXR_stat responses (StatInfo chunks[1]=size, [2]=flags).
      */
     statbuf[0] = '\0';
     if (want_stat) {
         if (fstat(fd, &st) == 0) {
-            /*
-             * kXR_open retstat format is "<id> <size> <flags> <mtime>\0".
-             * NOTE: field order is (id, size, flags, mtime) — size before
-             * flags — which is the opposite of the standalone kXR_stat
-             * response format (id, flags, size, mtime).  The XRootD v5
-             * client's StatInfo parser for open responses reads field[1]
-             * as size and field[2] as flags.
-             */
+            /* Format: "<id> <size> <flags> <mtime>\0" — size before flags. */
             int stat_flags = 0;
             if (st.st_mode & (S_IRUSR | S_IRGRP | S_IROTH)) {
                 stat_flags |= kXR_readable;
@@ -1569,12 +3016,26 @@ xrootd_close_all_files(xrootd_ctx_t *ctx)
 /*
  * xrootd_make_stat_body — format a kXR_stat response body as ASCII.
  *
- * Format: "<id> <flags> <size> <modtime>\0"
- * where:
- *   id      = inode number (unique enough for our purposes)
- *   flags   = XStatRespFlags bitmask
- *   size    = file size in bytes
- *   modtime = Unix timestamp of last modification
+ * Format: "<id> <size> <flags> <mtime>\0"
+ *
+ *   id     = inode number (used by the client as a cache key)
+ *   size   = file size in bytes
+ *   flags  = XStatRespFlags bitmask (kXR_isDir, kXR_readable, kXR_other, ...)
+ *   mtime  = Unix timestamp of last modification
+ *
+ * GOTCHA: The field order is size-then-flags, NOT flags-then-size.
+ * This is verified in XrdClXRootDResponses.cc ParseServerResponse():
+ *   chunks[0] = id
+ *   chunks[1] = size   ← size is second
+ *   chunks[2] = flags  ← flags is third
+ *   chunks[3] = mtime
+ *
+ * Swapping size and flags causes the client to interpret directory flags
+ * (e.g. kXR_isDir=4096) as the file size and the actual file size (e.g. 24)
+ * as flags — producing wrong StatInfo values throughout the client.
+ *
+ * For VFS (filesystem-level) stat the format is the same but id=0 and
+ * size reports available space (st_blocks * 512).
  */
 static void
 xrootd_make_stat_body(const struct stat *st, ngx_flag_t is_vfs,
@@ -1583,10 +3044,14 @@ xrootd_make_stat_body(const struct stat *st, ngx_flag_t is_vfs,
     int flags = 0;
 
     if (is_vfs) {
-        /* VFS stat: just report readable with large size */
-        snprintf(out, outsz, "0 %d %lld %ld",
+        /*
+         * VFS stat: reports filesystem-level space rather than a file's size.
+         * id=0, size = st_blocks*512 (available space proxy), flags=readable.
+         * Same wire order: "<id> <size> <flags> <mtime>".
+         */
+        snprintf(out, outsz, "0 %lld %d %ld",
+                 (long long) st->st_blocks * 512,   /* "free" space proxy */
                  kXR_readable,
-                 (long long) st->st_blocks * 512,   /* "free" space */
                  (long) st->st_mtime);
         return;
     }
@@ -1601,11 +3066,12 @@ xrootd_make_stat_body(const struct stat *st, ngx_flag_t is_vfs,
         flags |= kXR_readable;
     }
 
-    /* We are a read-only server; never advertise writable */
-
-    snprintf(out, outsz, "%llu %d %lld %ld",
+    /* We are a read-only server; never advertise writable.
+     * Wire format: "<id> <size> <flags> <mtime>" — size comes BEFORE flags.
+     * (Verified against XRootD source: XrdClXRootDResponses.cc ParseServerResponse) */
+    snprintf(out, outsz, "%llu %lld %d %ld",
              (unsigned long long) st->st_ino,
-             flags,
              (long long) st->st_size,
+             flags,
              (long) st->st_mtime);
 }

@@ -1,10 +1,13 @@
 # nginx module config — XRootD stream module
 # Requires: --with-stream
+# Uses OpenSSL (via -lssl -lcrypto) for GSI x509 authentication
 
 ngx_addon_name=ngx_stream_xrootd_module
 
 ngx_module_type=STREAM
 ngx_module_name=ngx_stream_xrootd_module
 ngx_module_srcs="$ngx_addon_dir/src/ngx_stream_xrootd_module.c"
+ngx_module_libs="-lssl -lcrypto"
+CORE_LIBS="$CORE_LIBS -lssl -lcrypto"
 
 . auto/module
