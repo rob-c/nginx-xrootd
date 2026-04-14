@@ -1,0 +1,10 @@
+# nginx module config — XRootD stream module
+# Requires: --with-stream
+
+ngx_addon_name=ngx_stream_xrootd_module
+
+ngx_module_type=STREAM
+ngx_module_name=ngx_stream_xrootd_module
+ngx_module_srcs="$ngx_addon_dir/src/ngx_stream_xrootd_module.c"
+
+. auto/module

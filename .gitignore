@@ -1,0 +1,8 @@
+# nginx build artifacts (built out-of-tree, but just in case)
+objs/
+*.o
+*.a
+
+# editor
+*.swp
+.DS_Store
