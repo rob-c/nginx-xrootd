@@ -3,6 +3,11 @@ objs/
 *.o
 *.a
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
 # editor
 *.swp
 .DS_Store

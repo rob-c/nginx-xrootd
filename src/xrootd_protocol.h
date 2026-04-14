@@ -252,6 +252,41 @@ typedef struct {
     kXR_int32  dlen;         /* response body length */
 } ServerResponseHdr;         /* 8 bytes; body follows inline */
 
+/*
+ * kXR_status (4007) extended response — used for kXR_pgwrite and kXR_pgread.
+ * The server sends kXR_status instead of kXR_ok; the body carries a
+ * ServerResponseBody_Status (16 bytes) with a CRC32c integrity field,
+ * followed by the request-specific body (ServerResponseBody_pgWrite, 8 bytes).
+ *
+ * Wire layout for kXR_pgwrite success (no bad pages), 32 bytes total:
+ *   [ServerResponseHdr 8B] status=kXR_status, dlen=24
+ *   [ServerResponseBody_Status 16B] crc32c, streamID, requestid, resptype,
+ *                                   reserved, dlen=0 (no bad pages)
+ *   [ServerResponseBody_pgWrite 8B] offset (last written)
+ */
+
+#define kXR_1stRequest  3000  /* base for requestid encoding in Status body */
+
+typedef struct {
+    kXR_unt32  crc32c;     /* CRC32c of everything from &streamID to end */
+    kXR_char   streamID[2];/* echo of request streamid                   */
+    kXR_char   requestid;  /* requestcode - kXR_1stRequest               */
+    kXR_char   resptype;   /* 0=kXR_FinalResult, 1=kXR_PartialResult     */
+    kXR_char   reserved[4];
+    kXR_int32  dlen;       /* size of bad-page list (0 = no bad pages)   */
+} ServerResponseBody_Status;   /* 16 bytes */
+
+typedef struct {
+    kXR_int64  offset;     /* file offset of written data                */
+} ServerResponseBody_pgWrite;  /* 8 bytes */
+
+/* Full kXR_status response for pgwrite (sent as one contiguous buffer) */
+typedef struct {
+    ServerResponseHdr          hdr; /* status=kXR_status, dlen=24       */
+    ServerResponseBody_Status  bdy;
+    ServerResponseBody_pgWrite pgw;
+} ServerStatusResponse_pgWrite; /* 32 bytes */
+
 /* ------------------------------------------------------------------ */
 /* kXR_protocol (3006)                                                  */
 /* ------------------------------------------------------------------ */
@@ -389,6 +424,104 @@ typedef struct {
  *   "name\n[id flags size mtime\n]..."
  * Last chunk uses kXR_ok; intermediate chunks use kXR_oksofar.
  */
+
+/* ------------------------------------------------------------------ */
+/* kXR_pgwrite (3026) — paged write with per-page CRC32 checksums      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Payload format: pages of kXR_pgPageSZ (4096) bytes each followed by a
+ * 4-byte big-endian CRC32 checksum.  The last page may be shorter than
+ * 4096 bytes but still has a 4-byte checksum appended.
+ *
+ * Layout per page: [ data[0..N-1] ][ crc32_be[4] ]
+ * where N = 4096 for full pages, or (total_file_data % 4096) for the last.
+ */
+#define XRD_PGWRITE_PAGESZ  4096
+#define XRD_PGWRITE_CKSZ    4    /* sizeof(uint32_t) CRC32 */
+#define XRD_PGWRITE_UNITSZ  (XRD_PGWRITE_PAGESZ + XRD_PGWRITE_CKSZ)
+
+typedef struct {
+    kXR_char  streamid[2];
+    kXR_unt16 requestid;    /* kXR_pgwrite */
+    kXR_char  fhandle[4];   /* file handle from open */
+    kXR_int64 offset;       /* file byte offset for first page */
+    kXR_char  pathid;       /* path ID (0 = primary) */
+    kXR_char  reqflags;     /* kXR_pgRetry (0x01) or 0 */
+    kXR_char  reserved[2];
+    kXR_int32 dlen;         /* total payload length (pages + checksums) */
+    /* payload: interleaved page data and 4-byte CRC32 checksums */
+} ClientPgWriteRequest;     /* 24 bytes */
+
+/* ------------------------------------------------------------------ */
+/* kXR_write (3019)                                                     */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    kXR_char   streamid[2];
+    kXR_unt16  requestid;    /* kXR_write */
+    kXR_char   fhandle[4];   /* file handle from open */
+    kXR_int64  offset;       /* byte offset to write at */
+    kXR_char   pathid;       /* path ID (0 for primary) */
+    kXR_char   reserved[3];
+    kXR_int32  dlen;         /* number of data bytes in payload */
+    /* payload: raw file data, dlen bytes */
+} ClientWriteRequest;        /* 24 bytes */
+
+/* ------------------------------------------------------------------ */
+/* kXR_sync (3016)                                                      */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    kXR_char   streamid[2];
+    kXR_unt16  requestid;    /* kXR_sync */
+    kXR_char   fhandle[4];   /* file handle to sync */
+    kXR_char   reserved[12];
+    kXR_int32  dlen;         /* 0 */
+} ClientSyncRequest;         /* 24 bytes */
+
+/* ------------------------------------------------------------------ */
+/* kXR_truncate (3028)                                                  */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    kXR_char   streamid[2];
+    kXR_unt16  requestid;    /* kXR_truncate */
+    kXR_char   fhandle[4];   /* file handle (if dlen==0) */
+    kXR_int64  offset;       /* target file length */
+    kXR_char   reserved[4];
+    kXR_int32  dlen;         /* path length (if path-based), or 0 for handle-based */
+    /* null-terminated path follows as payload when dlen > 0 */
+} ClientTruncateRequest;     /* 24 bytes */
+
+/* ------------------------------------------------------------------ */
+/* kXR_mkdir (3008)                                                     */
+/* ------------------------------------------------------------------ */
+
+/* kXR_mkdirpath option flag: create parent directories */
+#define kXR_mkdirpath  0x01
+
+typedef struct {
+    kXR_char   streamid[2];
+    kXR_unt16  requestid;    /* kXR_mkdir */
+    kXR_char   options[1];   /* kXR_mkdirpath (0x01) to create parents */
+    kXR_char   reserved[13];
+    kXR_unt16  mode;         /* POSIX permission bits */
+    kXR_int32  dlen;         /* path length */
+    /* null-terminated path follows as payload */
+} ClientMkdirRequest;        /* 24 bytes */
+
+/* ------------------------------------------------------------------ */
+/* kXR_rm (3014)                                                        */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    kXR_char   streamid[2];
+    kXR_unt16  requestid;    /* kXR_rm */
+    kXR_char   reserved[16];
+    kXR_int32  dlen;         /* path length */
+    /* null-terminated path follows as payload */
+} ClientRmRequest;           /* 24 bytes */
 
 /* ------------------------------------------------------------------ */
 /* kXR_endsess (3023)                                                   */
