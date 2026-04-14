@@ -661,16 +661,33 @@ xrootd_flush_pending(xrootd_ctx_t *ctx, ngx_connection_t *c)
 /*
  * xrootd_process_handshake
  *
- * Validates the 20-byte client handshake and sends the 12-byte server
- * response.  The response is intentionally NOT in standard response-
- * header format; it is the special ServerInitHandShake framing.
+ * Validates the 20-byte client handshake and sends the server reply.
+ *
+ * In XRootD v5 the client sends handshake + kXR_protocol together in a
+ * single 44-byte TCP segment.  The client then reads EACH server reply as a
+ * standard 8-byte ServerResponseHdr + body:
+ *
+ *   1. Handshake response  (16 bytes): header(8) + {protover,msgval}(8)
+ *   2. kXR_protocol response (8+N bytes): header(8) + body(N)
+ *
+ * The old 12-byte ServerInitHandShake framing (msglen+protover+msgval) is
+ * NOT compatible with this because its first 8 bytes parse as
+ * status=0x0008 / dlen=0x00000520=1312, causing the client to stall.
+ *
+ * We therefore send a proper ServerResponseHdr (streamid={0,0}, status=ok,
+ * dlen=8) followed by 8 bytes of protover+msgval.  The kXR_protocol handler
+ * sends its own response immediately after.
  */
 static ngx_int_t
 xrootd_process_handshake(xrootd_ctx_t *ctx, ngx_connection_t *c)
 {
     ClientInitHandShake  *hs;
-    ServerInitHandShake  *rsp;
+    ServerResponseHdr    *hdr;
     u_char               *buf;
+    size_t                total;
+
+    /* protover(4) + msgval(4) */
+    static const size_t BODY_LEN = 8;
 
     hs = (ClientInitHandShake *) ctx->hdr_buf;
 
@@ -683,21 +700,29 @@ xrootd_process_handshake(xrootd_ctx_t *ctx, ngx_connection_t *c)
         return NGX_ERROR;
     }
 
-    ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
-                   "xrootd: handshake ok");
-
-    /* Build the 12-byte server handshake response */
-    buf = ngx_palloc(c->pool, XRD_HANDSHAKE_RSP_LEN);
+    total = XRD_RESPONSE_HDR_LEN + BODY_LEN;
+    buf   = ngx_palloc(c->pool, total);
     if (buf == NULL) {
         return NGX_ERROR;
     }
 
-    rsp = (ServerInitHandShake *) buf;
-    rsp->msglen  = htonl(8);
-    rsp->protover = htonl(kXR_PROTOCOLVERSION);
-    rsp->msgval  = htonl(kXR_DataServer);
+    /* Standard response header: streamid={0,0} (no client streamid in
+     * the handshake), status=kXR_ok, dlen=8. */
+    hdr             = (ServerResponseHdr *) buf;
+    hdr->streamid[0] = 0;
+    hdr->streamid[1] = 0;
+    hdr->status      = htons(kXR_ok);
+    hdr->dlen        = htonl((kXR_unt32) BODY_LEN);
 
-    return xrootd_queue_response(ctx, c, buf, XRD_HANDSHAKE_RSP_LEN);
+    /* Body: protocol version + server type */
+    u_char *body = buf + XRD_RESPONSE_HDR_LEN;
+    *(kXR_unt32 *)(body + 0) = htonl(kXR_PROTOCOLVERSION);
+    *(kXR_unt32 *)(body + 4) = htonl(kXR_DataServer);
+
+    ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                   "xrootd: handshake ok, sending standard-format response");
+
+    return xrootd_queue_response(ctx, c, buf, total);
 }
 
 /* ================================================================== */
@@ -792,31 +817,68 @@ xrootd_dispatch(xrootd_ctx_t *ctx, ngx_connection_t *c,
 /*  Request handlers                                                    */
 /* ================================================================== */
 
-/* kXR_protocol — negotiate protocol capabilities */
+/*
+ * kXR_protocol — negotiate protocol capabilities.
+ *
+ * Client flags byte (cur_body[4]):
+ *   kXR_secreqs  0x01 — client wants the server's security requirements
+ *   kXR_ableTLS  0x02 — client supports TLS
+ *   kXR_bifreqs  0x08 — client wants back-information frames
+ *
+ * When kXR_secreqs is set we must append a 4-byte SecurityInfo structure
+ * immediately after pval+flags.  Sending it with secopt=0 and nProt=0
+ * signals "no authentication required" so the client proceeds straight
+ * to kXR_login.  Omitting it causes v5 clients to stall waiting for data
+ * that never arrives.
+ *
+ * SecurityInfo layout (4 bytes, big-endian):
+ *   secver  [1]  version, always 0
+ *   secopt  [1]  options: 0x01=kXR_secOFrce (force auth), 0=no auth forced
+ *   nProt   [1]  number of protocol entries that follow (0 = none)
+ *   rsvd    [1]  reserved, 0
+ */
 static ngx_int_t
 xrootd_handle_protocol(xrootd_ctx_t *ctx, ngx_connection_t *c)
 {
     ServerProtocolBody  body;
     u_char             *buf;
-    size_t              total;
+    size_t              bodylen, total;
+    u_char              client_flags;
 
-    total = XRD_RESPONSE_HDR_LEN + sizeof(body);
+    /* flags byte is at offset 4 of the 16-byte body section */
+    client_flags = ctx->cur_body[4];
+
+    /* Body = pval(4) + flags(4) + optional SecurityInfo(4) */
+    bodylen = sizeof(body);
+    if (client_flags & 0x01) {   /* kXR_secreqs */
+        bodylen += 4;            /* SecurityInfo */
+    }
+
+    total = XRD_RESPONSE_HDR_LEN + bodylen;
     buf   = ngx_palloc(c->pool, total);
     if (buf == NULL) {
         return NGX_ERROR;
     }
 
     xrootd_build_resp_hdr(ctx->cur_streamid, kXR_ok,
-                           (uint32_t) sizeof(body),
+                           (uint32_t) bodylen,
                            (ServerResponseHdr *) buf);
 
     body.pval  = htonl(kXR_PROTOCOLVERSION);
-    body.flags = htonl(kXR_isServer);          /* read-only data server */
-
+    body.flags = htonl(kXR_isServer);   /* read-only data server */
     ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN, &body, sizeof(body));
 
-    ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
-                   "xrootd: kXR_protocol ok");
+    if (client_flags & 0x01) {   /* kXR_secreqs: append SecurityInfo */
+        u_char *si = buf + XRD_RESPONSE_HDR_LEN + sizeof(body);
+        si[0] = 0;   /* secver = 0 */
+        si[1] = 0;   /* secopt = 0: auth not forced */
+        si[2] = 0;   /* nProt  = 0: no protocols listed */
+        si[3] = 0;   /* rsvd   = 0 */
+    }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                   "xrootd: kXR_protocol ok (client_flags=0x%02x bodylen=%uz)",
+                   (int) client_flags, bodylen);
 
     return xrootd_queue_response(ctx, c, buf, total);
 }
@@ -937,10 +999,14 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
     char               resolved[PATH_MAX];
     int                idx, fd;
     ServerOpenBody     body;
+    struct stat        st;
+    char               statbuf[256];
     u_char            *buf;
-    size_t             total;
+    size_t             bodylen, total;
+    ngx_flag_t         want_stat;
 
-    options = ntohs(req->options);
+    options   = ntohs(req->options);
+    want_stat = (options & kXR_retstat) ? 1 : 0;
 
     /* Reject write-mode opens — we are a read-only server */
     if (options & (kXR_delete | kXR_new | kXR_open_updt |
@@ -985,11 +1051,52 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
                 (u_char *) resolved,
                 sizeof(ctx->files[idx].path));
 
-    ngx_log_debug2(NGX_LOG_DEBUG_STREAM, c->log, 0,
-                   "xrootd: kXR_open handle=%d path=%s", idx, resolved);
+    /* If kXR_retstat, fstat now so we can include it in the response.
+     *
+     * The stat string in a kXR_open response uses 3 fields (no inode id):
+     *   "<flags> <size> <mtime>\0"
+     * This differs from the standalone kXR_stat response which has 4 fields:
+     *   "<id> <flags> <size> <mtime>\0"
+     */
+    statbuf[0] = '\0';
+    if (want_stat) {
+        if (fstat(fd, &st) == 0) {
+            /*
+             * kXR_open retstat format is "<id> <size> <flags> <mtime>\0".
+             * NOTE: field order is (id, size, flags, mtime) — size before
+             * flags — which is the opposite of the standalone kXR_stat
+             * response format (id, flags, size, mtime).  The XRootD v5
+             * client's StatInfo parser for open responses reads field[1]
+             * as size and field[2] as flags.
+             */
+            int stat_flags = 0;
+            if (st.st_mode & (S_IRUSR | S_IRGRP | S_IROTH)) {
+                stat_flags |= kXR_readable;
+            }
+            snprintf(statbuf, sizeof(statbuf), "%llu %lld %d %ld",
+                     (unsigned long long) st.st_ino,
+                     (long long) st.st_size,
+                     stat_flags,
+                     (long) st.st_mtime);
+        } else {
+            want_stat = 0;   /* couldn't stat; skip gracefully */
+        }
+    }
 
-    /* Build response: 8-byte header + 12-byte ServerOpenBody */
-    total = XRD_RESPONSE_HDR_LEN + sizeof(ServerOpenBody);
+    ngx_log_debug3(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                   "xrootd: kXR_open handle=%d path=%s retstat=%d",
+                   idx, resolved, (int) want_stat);
+
+    /*
+     * Build response: 8-byte header + 12-byte ServerOpenBody
+     * + optional NUL-terminated stat string (when kXR_retstat set).
+     */
+    bodylen = sizeof(ServerOpenBody);
+    if (want_stat) {
+        bodylen += strlen(statbuf) + 1;   /* include the NUL */
+    }
+
+    total = XRD_RESPONSE_HDR_LEN + bodylen;
     buf   = ngx_palloc(c->pool, total);
     if (buf == NULL) {
         close(fd);
@@ -998,7 +1105,7 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
     }
 
     xrootd_build_resp_hdr(ctx->cur_streamid, kXR_ok,
-                           (uint32_t) sizeof(ServerOpenBody),
+                           (uint32_t) bodylen,
                            (ServerResponseHdr *) buf);
 
     /*
@@ -1008,42 +1115,59 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
     ngx_memzero(&body, sizeof(body));
     body.fhandle[0] = (u_char) idx;
     body.cpsize     = 0;    /* no compression */
-
     ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN, &body, sizeof(body));
+
+    if (want_stat) {
+        size_t slen = strlen(statbuf) + 1;
+        ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN + sizeof(ServerOpenBody),
+                   statbuf, slen);
+    }
 
     return xrootd_queue_response(ctx, c, buf, total);
 }
 
-/* kXR_read — read file data */
+/* kXR_read — read file data
+ *
+ * Protocol semantics: a kXR_ok response with fewer bytes than rlen means
+ * EOF — the client will NOT re-request the remainder.  kXR_oksofar means
+ * "this chunk is part of the answer; more follows".
+ *
+ * When the requested rlen > XROOTD_READ_MAX we must chunk the response:
+ * all but the final 8B+data chunk carry kXR_oksofar; the last carries
+ * kXR_ok.  We build the entire interleaved response in one pool buffer and
+ * issue a single xrootd_queue_response, avoiding state-machine re-entrancy.
+ */
 static ngx_int_t
 xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
 {
     ClientReadRequest *req = (ClientReadRequest *) ctx->hdr_buf;
     int                idx;
     int64_t            offset;
-    int32_t            rlen;
-    ssize_t            nread;
-    size_t             toread;
+    size_t             rlen;
     off_t              seekpos;
     u_char            *databuf, *rspbuf;
-    ngx_int_t          rc;
+    ssize_t            nread;
+    size_t             data_total;     /* actual bytes read */
+    size_t             n_chunks, last_size;
+    size_t             rsp_total;      /* total response bytes */
+    size_t             di, ri;         /* data / response cursor */
 
     idx    = (int)(unsigned char) req->fhandle[0];
     offset = (int64_t) be64toh((uint64_t) req->offset);
-    rlen   = (int32_t) ntohl((uint32_t) req->rlen);
+    rlen   = (size_t)(uint32_t) ntohl((uint32_t) req->rlen);
 
     if (idx < 0 || idx >= XROOTD_MAX_FILES || ctx->files[idx].fd < 0) {
         return xrootd_send_error(ctx, c, kXR_FileNotOpen,
                                  "invalid file handle");
     }
 
-    if (rlen <= 0) {
+    if (rlen == 0) {
         return xrootd_send_ok(ctx, c, NULL, 0);
     }
 
-    toread = (size_t) rlen;
-    if (toread > XROOTD_READ_MAX) {
-        toread = XROOTD_READ_MAX;
+    /* Cap to something large but bounded; nginx pool handles the alloc */
+    if (rlen > XROOTD_READ_MAX * 16) {
+        rlen = XROOTD_READ_MAX * 16;   /* 64 MB hard cap */
     }
 
     /* Seek to the requested offset */
@@ -1052,41 +1176,63 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
         return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
     }
 
-    /* Allocate buffer for the data */
-    databuf = ngx_palloc(c->pool, toread);
+    /* Read all available data up to rlen in a single OS call.
+     * A short read (nread < rlen) means we hit EOF. */
+    databuf = ngx_palloc(c->pool, rlen);
     if (databuf == NULL) {
         return NGX_ERROR;
     }
 
-    nread = read(ctx->files[idx].fd, databuf, toread);
+    nread = read(ctx->files[idx].fd, databuf, rlen);
     if (nread < 0) {
         return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
     }
 
-    ngx_log_debug4(NGX_LOG_DEBUG_STREAM, c->log, 0,
-                   "xrootd: kXR_read handle=%d offset=%L req=%z got=%z",
-                   idx, offset, toread, (size_t) nread);
+    data_total = (size_t) nread;
 
-    /*
-     * Send the response header and the data.
-     * We allocate them as a single contiguous buffer so they travel in
-     * one system call.  For very large reads the kernel may split them,
-     * but that is handled by xrootd_queue_response.
-     */
-    rspbuf = ngx_palloc(c->pool, XRD_RESPONSE_HDR_LEN + (size_t) nread);
+    ngx_log_debug4(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                   "xrootd: kXR_read handle=%d offset=%L req=%uz got=%uz",
+                   idx, offset, rlen, data_total);
+
+    /* Calculate chunking.
+     * If data_total fits in one chunk (or it's a short read = EOF), send
+     * a single kXR_ok response.  Otherwise send N-1 kXR_oksofar chunks
+     * followed by one kXR_ok chunk. */
+    n_chunks  = (data_total + XROOTD_READ_MAX - 1) / XROOTD_READ_MAX;
+    if (n_chunks == 0) {
+        n_chunks = 1;   /* zero-byte response still needs one header */
+    }
+    last_size = data_total % XROOTD_READ_MAX;
+    if (last_size == 0 && data_total > 0) {
+        last_size = XROOTD_READ_MAX;   /* exactly divisible */
+    }
+
+    /* Allocate single response buffer:
+     *   n_chunks response headers  +  data_total bytes of payload */
+    rsp_total = n_chunks * XRD_RESPONSE_HDR_LEN + data_total;
+    rspbuf = ngx_palloc(c->pool, rsp_total);
     if (rspbuf == NULL) {
         return NGX_ERROR;
     }
 
-    xrootd_build_resp_hdr(ctx->cur_streamid, kXR_ok,
-                           (uint32_t) nread,
-                           (ServerResponseHdr *) rspbuf);
+    ri = 0;
+    di = 0;
+    for (size_t chunk = 0; chunk < n_chunks; chunk++) {
+        size_t   chunk_data = (chunk < n_chunks - 1)
+                              ? XROOTD_READ_MAX : last_size;
+        uint16_t status     = (chunk == n_chunks - 1) ? kXR_ok : kXR_oksofar;
 
-    ngx_memcpy(rspbuf + XRD_RESPONSE_HDR_LEN, databuf, (size_t) nread);
+        xrootd_build_resp_hdr(ctx->cur_streamid, status,
+                               (uint32_t) chunk_data,
+                               (ServerResponseHdr *)(rspbuf + ri));
+        ri += XRD_RESPONSE_HDR_LEN;
 
-    rc = xrootd_queue_response(ctx, c, rspbuf,
-                               XRD_RESPONSE_HDR_LEN + (size_t) nread);
-    return rc;
+        ngx_memcpy(rspbuf + ri, databuf + di, chunk_data);
+        ri += chunk_data;
+        di += chunk_data;
+    }
+
+    return xrootd_queue_response(ctx, c, rspbuf, rsp_total);
 }
 
 /* kXR_close — close an open file handle */
