@@ -232,6 +232,10 @@ typedef struct {
     /* GSI handshake state: ephemeral DH key kept from kXGS_cert until kXGC_cert */
     EVP_PKEY  *gsi_dh_key;   /* freed after kXGC_cert processing */
 
+    /* Per-request timing: set at the top of xrootd_dispatch() so every
+     * handler can report how long its request took in the access log. */
+    ngx_msec_t  req_start;
+
 } xrootd_ctx_t;
 
 /* ------------------------------------------------------------------ */
@@ -257,6 +261,11 @@ typedef struct {
     EVP_PKEY    *gsi_key;          /* server private key                 */
     X509_STORE  *gsi_store;        /* trusted CA verification store      */
     uint32_t     gsi_ca_hash;      /* CA subject hash for kXRS_issuer_hash */
+
+    /* Access logging                                                     */
+    ngx_str_t    access_log;       /* path from xrootd_access_log directive */
+    ngx_fd_t     access_log_fd;    /* opened O_WRONLY|O_APPEND file, or
+                                    * NGX_INVALID_FILE when not configured  */
 } ngx_stream_xrootd_srv_conf_t;
 
 /* ------------------------------------------------------------------ */
@@ -329,6 +338,11 @@ static void xrootd_close_all_files(xrootd_ctx_t *ctx);
 static void xrootd_make_stat_body(const struct stat *st, ngx_flag_t is_vfs,
     char *out, size_t outsz);
 
+/* Access logging */
+static void xrootd_log_access(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    const char *verb, const char *path, const char *detail,
+    ngx_uint_t xrd_ok, uint16_t errcode, const char *errmsg, size_t bytes);
+
 /* ------------------------------------------------------------------ */
 /* Module directives                                                    */
 /* ------------------------------------------------------------------ */
@@ -383,6 +397,50 @@ static ngx_command_t ngx_stream_xrootd_commands[] = {
       offsetof(ngx_stream_xrootd_srv_conf_t, trusted_ca),
       NULL },
 
+    /*
+     * xrootd_access_log /path/to/access.log;
+     *
+     * Write one log line per XRootD operation (OPEN, READ, STAT, DIRLIST,
+     * CLOSE, LOGIN, AUTH, PING) to the specified file.  The file is opened
+     * O_WRONLY|O_APPEND|O_CREAT at configuration time and is safe for use
+     * by multiple worker processes.  Log rotation: send SIGUSR1 to the
+     * nginx master to reopen all log files.
+     *
+     * Log line format:
+     *   <ip> <auth> "<identity>" [<timestamp>] "<verb> <path> <detail>" \
+     *   <status> <bytes> <ms>ms ["<errmsg>"]
+     *
+     * Fields:
+     *   ip        — client IP address
+     *   auth      — "anon" or "gsi"
+     *   identity  — authenticated DN (GSI) or "-"
+     *   timestamp — DD/Mon/YYYY:HH:MM:SS +ZZZZ (nginx access-log format)
+     *   verb      — OPEN READ STAT DIRLIST CLOSE LOGIN AUTH PING
+     *   path      — filesystem path or "-"
+     *   detail    — OPEN: mode ("rd"); READ: "offset+len"; LOGIN: username;
+     *               AUTH: protocol ("gsi"); others: "-"
+     *   status    — "OK" or "ERR"
+     *   bytes     — data bytes transferred (0 for non-data operations)
+     *   ms        — server-side processing time in milliseconds
+     *   errmsg    — error description, omitted on success
+     *
+     * Example lines:
+     *   192.168.1.1 gsi "/DC=org/CN=A.Einstein" [15/Jan/2024:10:23:45 +0000] \
+     *     "OPEN /store/mc/data.root rd" OK 0 3ms
+     *   192.168.1.1 gsi "/DC=org/CN=A.Einstein" [15/Jan/2024:10:23:45 +0000] \
+     *     "READ /store/mc/data.root 0+4194304" OK 4194304 21ms
+     *   10.0.0.5 anon "-" [15/Jan/2024:10:23:45 +0000] \
+     *     "STAT /" OK 0 1ms
+     *   192.168.1.2 gsi "-" [15/Jan/2024:10:23:45 +0000] \
+     *     "AUTH gsi -" ERR 0 2ms "certificate verification failed"
+     */
+    { ngx_string("xrootd_access_log"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_xrootd_srv_conf_t, access_log),
+      NULL },
+
     ngx_null_command
 };
 
@@ -426,12 +484,13 @@ ngx_stream_xrootd_create_srv_conf(ngx_conf_t *cf)
         return NULL;
     }
 
-    conf->enable    = NGX_CONF_UNSET;
-    conf->auth      = NGX_CONF_UNSET_UINT;
-    conf->gsi_cert  = NULL;
-    conf->gsi_key   = NULL;
-    conf->gsi_store = NULL;
-    conf->gsi_ca_hash = 0;
+    conf->enable       = NGX_CONF_UNSET;
+    conf->auth         = NGX_CONF_UNSET_UINT;
+    conf->gsi_cert     = NULL;
+    conf->gsi_key      = NULL;
+    conf->gsi_store    = NULL;
+    conf->gsi_ca_hash  = 0;
+    conf->access_log_fd = NGX_INVALID_FILE;
 
     return conf;
 }
@@ -448,6 +507,7 @@ ngx_stream_xrootd_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_str_value(conf->certificate,     prev->certificate,     "");
     ngx_conf_merge_str_value(conf->certificate_key, prev->certificate_key, "");
     ngx_conf_merge_str_value(conf->trusted_ca,      prev->trusted_ca,      "");
+    ngx_conf_merge_str_value(conf->access_log,      prev->access_log,      "");
 
     return NGX_CONF_OK;
 }
@@ -507,7 +567,32 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
     for (i = 0; i < cmcf->servers.nelts; i++) {
         xcf = ngx_stream_conf_get_module_srv_conf(cscfp[i], ngx_stream_xrootd_module);
 
-        if (!xcf->enable || xcf->auth != XROOTD_AUTH_GSI) {
+        if (!xcf->enable) {
+            continue;
+        }
+
+        /* Open the access log for this server block (anonymous or GSI alike) */
+        if (xcf->access_log.len > 0
+            && ngx_strcmp(xcf->access_log.data, (u_char *) "off") != 0)
+        {
+            xcf->access_log_fd = ngx_open_file(xcf->access_log.data,
+                NGX_FILE_WRONLY,
+                NGX_FILE_CREATE_OR_OPEN | NGX_FILE_APPEND,
+                NGX_FILE_DEFAULT_ACCESS);
+
+            if (xcf->access_log_fd == NGX_INVALID_FILE) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                    "xrootd: cannot open access log \"%s\"",
+                    xcf->access_log.data);
+                return NGX_ERROR;
+            }
+
+            ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
+                "xrootd: access log \"%s\" opened",
+                xcf->access_log.data);
+        }
+
+        if (xcf->auth != XROOTD_AUTH_GSI) {
             continue;
         }
 
@@ -1033,6 +1118,9 @@ static ngx_int_t
 xrootd_dispatch(xrootd_ctx_t *ctx, ngx_connection_t *c,
                 ngx_stream_xrootd_srv_conf_t *conf)
 {
+    /* Capture the start time so handlers can report processing duration. */
+    ctx->req_start = ngx_current_msec;
+
     ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
                    "xrootd: dispatch reqid=%d", (int) ctx->cur_reqid);
 
@@ -1249,6 +1337,8 @@ xrootd_handle_login(xrootd_ctx_t *ctx, ngx_connection_t *c,
         ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN, ctx->sessid,
                    XROOTD_SESSION_ID_LEN);
 
+        xrootd_log_access(ctx, c, "LOGIN", "-", user, 1, 0, NULL, 0);
+
         return xrootd_queue_response(ctx, c, buf, total);
     }
 
@@ -1299,6 +1389,9 @@ xrootd_handle_login(xrootd_ctx_t *ctx, ngx_connection_t *c,
         ngx_log_debug2(NGX_LOG_DEBUG_STREAM, c->log, 0,
                        "xrootd: login→kXGS_init parms=\"%s\" ca_hash=%08xd",
                        parms, (unsigned) conf->gsi_ca_hash);
+
+        /* Log the login event; identity will be filled in after kXGC_cert */
+        xrootd_log_access(ctx, c, "LOGIN", "-", user, 1, 0, NULL, 0);
 
         return xrootd_queue_response(ctx, c, buf, total);
     }
@@ -2300,6 +2393,8 @@ xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c)
     }
 
     if (chain == NULL) {
+        xrootd_log_access(ctx, c, "AUTH", "-", "gsi",
+                          0, kXR_NotAuthorized, "cannot parse GSI credential", 0);
         return xrootd_send_error(ctx, c, kXR_NotAuthorized,
                                  "cannot parse GSI credential");
     }
@@ -2340,9 +2435,11 @@ xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c)
 
     if (ok != 1) {
         int verr = X509_STORE_CTX_get_error(vctx);
+        const char *verr_str = X509_verify_cert_error_string(verr);
         ngx_log_error(NGX_LOG_WARN, c->log, 0,
-                      "xrootd: GSI cert verification failed: %s",
-                      X509_verify_cert_error_string(verr));
+                      "xrootd: GSI cert verification failed: %s", verr_str);
+        xrootd_log_access(ctx, c, "AUTH", "-", "gsi",
+                          0, kXR_NotAuthorized, verr_str, 0);
         X509_STORE_CTX_free(vctx);
         sk_X509_pop_free(chain, X509_free);
         return xrootd_send_error(ctx, c, kXR_NotAuthorized,
@@ -2367,6 +2464,9 @@ xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c)
     ngx_log_error(NGX_LOG_INFO, c->log, 0,
                   "xrootd: GSI auth OK dn=\"%s\"", ctx->dn);
 
+    /* Log the completed auth — identity (DN) is now populated in ctx->dn */
+    xrootd_log_access(ctx, c, "AUTH", "-", "gsi", 1, 0, NULL, 0);
+
     return xrootd_send_ok(ctx, c, NULL, 0);
 }
 
@@ -2374,6 +2474,7 @@ xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c)
 static ngx_int_t
 xrootd_handle_ping(xrootd_ctx_t *ctx, ngx_connection_t *c)
 {
+    xrootd_log_access(ctx, c, "PING", "-", "-", 1, 0, NULL, 0);
     return xrootd_send_ok(ctx, c, NULL, 0);
 }
 
@@ -2398,7 +2499,7 @@ xrootd_handle_stat(xrootd_ctx_t *ctx, ngx_connection_t *c,
     char               resolved[PATH_MAX];
     char               body[256];
     ngx_flag_t         is_vfs;
-    const char        *reqpath;
+    const char        *reqpath = NULL;
 
     is_vfs = (req->options & kXR_vfs) ? 1 : 0;
 
@@ -2408,11 +2509,15 @@ xrootd_handle_stat(xrootd_ctx_t *ctx, ngx_connection_t *c,
 
         if (!xrootd_resolve_path(c->log, &conf->root,
                                  reqpath, resolved, sizeof(resolved))) {
+            xrootd_log_access(ctx, c, "STAT", reqpath, "-",
+                              0, kXR_NotFound, "file not found", 0);
             return xrootd_send_error(ctx, c, kXR_NotFound,
                                      "file not found");
         }
 
         if (stat(resolved, &st) != 0) {
+            xrootd_log_access(ctx, c, "STAT", reqpath, "-",
+                              0, kXR_NotFound, strerror(errno), 0);
             return xrootd_send_error(ctx, c, kXR_NotFound,
                                      "file not found");
         }
@@ -2422,11 +2527,20 @@ xrootd_handle_stat(xrootd_ctx_t *ctx, ngx_connection_t *c,
 
         if (idx < 0 || idx >= XROOTD_MAX_FILES
                 || ctx->files[idx].fd < 0) {
+            xrootd_log_access(ctx, c, "STAT", "-", "-",
+                              0, kXR_FileNotOpen, "invalid file handle", 0);
             return xrootd_send_error(ctx, c, kXR_FileNotOpen,
                                      "invalid file handle");
         }
 
+        resolved[0] = '\0';
+        ngx_cpystrn((u_char *) resolved,
+                    (u_char *) ctx->files[idx].path,
+                    sizeof(resolved));
+
         if (fstat(ctx->files[idx].fd, &st) != 0) {
+            xrootd_log_access(ctx, c, "STAT", resolved, "-",
+                              0, kXR_IOError, strerror(errno), 0);
             return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
         }
     }
@@ -2435,6 +2549,12 @@ xrootd_handle_stat(xrootd_ctx_t *ctx, ngx_connection_t *c,
 
     ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
                    "xrootd: kXR_stat ok: %s", body);
+
+    /* Log the stat — use resolved path for handle-based stats */
+    xrootd_log_access(ctx, c, "STAT",
+                      (reqpath && reqpath[0]) ? reqpath : resolved,
+                      is_vfs ? "vfs" : "-",
+                      1, 0, NULL, 0);
 
     return xrootd_send_ok(ctx, c, body, (uint32_t)(strlen(body) + 1));
 }
@@ -2461,23 +2581,32 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
     /* Reject write-mode opens — we are a read-only server */
     if (options & (kXR_delete | kXR_new | kXR_open_updt |
                    kXR_open_wrto | kXR_open_apnd)) {
+        xrootd_log_access(ctx, c, "OPEN",
+                          ctx->payload ? (char *) ctx->payload : "-", "wr",
+                          0, kXR_fsReadOnly, "read-only server", 0);
         return xrootd_send_error(ctx, c, kXR_fsReadOnly,
                                  "this is a read-only server");
     }
 
     if (ctx->payload == NULL || ctx->cur_dlen == 0) {
+        xrootd_log_access(ctx, c, "OPEN", "-", "rd",
+                          0, kXR_ArgMissing, "no path given", 0);
         return xrootd_send_error(ctx, c, kXR_ArgMissing, "no path given");
     }
 
     if (!xrootd_resolve_path(c->log, &conf->root,
                              (const char *) ctx->payload,
                              resolved, sizeof(resolved))) {
+        xrootd_log_access(ctx, c, "OPEN", (char *) ctx->payload, "rd",
+                          0, kXR_NotFound, "file not found", 0);
         return xrootd_send_error(ctx, c, kXR_NotFound, "file not found");
     }
 
     /* Allocate a file handle slot */
     idx = xrootd_alloc_fhandle(ctx);
     if (idx < 0) {
+        xrootd_log_access(ctx, c, "OPEN", resolved, "rd",
+                          0, kXR_ServerError, "too many open files", 0);
         return xrootd_send_error(ctx, c, kXR_ServerError,
                                  "too many open files");
     }
@@ -2486,13 +2615,19 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
     if (fd < 0) {
         int err = errno;
         if (err == ENOENT || err == ENOTDIR) {
+            xrootd_log_access(ctx, c, "OPEN", resolved, "rd",
+                              0, kXR_NotFound, "file not found", 0);
             return xrootd_send_error(ctx, c, kXR_NotFound,
                                      "file not found");
         }
         if (err == EACCES) {
+            xrootd_log_access(ctx, c, "OPEN", resolved, "rd",
+                              0, kXR_NotAuthorized, "permission denied", 0);
             return xrootd_send_error(ctx, c, kXR_NotAuthorized,
                                      "permission denied");
         }
+        xrootd_log_access(ctx, c, "OPEN", resolved, "rd",
+                          0, kXR_IOError, strerror(err), 0);
         return xrootd_send_error(ctx, c, kXR_IOError, strerror(err));
     }
 
@@ -2570,6 +2705,8 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
                    statbuf, slen);
     }
 
+    xrootd_log_access(ctx, c, "OPEN", resolved, "rd", 1, 0, NULL, 0);
+
     return xrootd_queue_response(ctx, c, buf, total);
 }
 
@@ -2604,6 +2741,8 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
     rlen   = (size_t)(uint32_t) ntohl((uint32_t) req->rlen);
 
     if (idx < 0 || idx >= XROOTD_MAX_FILES || ctx->files[idx].fd < 0) {
+        xrootd_log_access(ctx, c, "READ", "-", "-",
+                          0, kXR_FileNotOpen, "invalid file handle", 0);
         return xrootd_send_error(ctx, c, kXR_FileNotOpen,
                                  "invalid file handle");
     }
@@ -2620,6 +2759,8 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
     /* Seek to the requested offset */
     seekpos = lseek(ctx->files[idx].fd, (off_t) offset, SEEK_SET);
     if (seekpos == (off_t) -1) {
+        xrootd_log_access(ctx, c, "READ", ctx->files[idx].path, "-",
+                          0, kXR_IOError, strerror(errno), 0);
         return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
     }
 
@@ -2632,6 +2773,8 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
 
     nread = read(ctx->files[idx].fd, databuf, rlen);
     if (nread < 0) {
+        xrootd_log_access(ctx, c, "READ", ctx->files[idx].path, "-",
+                          0, kXR_IOError, strerror(errno), 0);
         return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
     }
 
@@ -2640,6 +2783,21 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
     ngx_log_debug4(NGX_LOG_DEBUG_STREAM, c->log, 0,
                    "xrootd: kXR_read handle=%d offset=%L req=%uz got=%uz",
                    idx, offset, rlen, data_total);
+
+    /*
+     * Log the read operation.  detail = "offset+requested_len" so that log
+     * consumers can reconstruct exactly what was asked for and compare it to
+     * the actual bytes returned in the <bytes> field.  This makes it easy to
+     * identify short reads (EOF hits) and see the full access pattern for a
+     * file.
+     */
+    {
+        char read_detail[64];
+        snprintf(read_detail, sizeof(read_detail), "%lld+%zu",
+                 (long long) offset, rlen);
+        xrootd_log_access(ctx, c, "READ", ctx->files[idx].path,
+                          read_detail, 1, 0, NULL, data_total);
+    }
 
     /* Calculate chunking.
      * If data_total fits in one chunk (or it's a short read = EOF), send
@@ -2690,12 +2848,18 @@ xrootd_handle_close(xrootd_ctx_t *ctx, ngx_connection_t *c)
     int idx = (int)(unsigned char) req->fhandle[0];
 
     if (idx < 0 || idx >= XROOTD_MAX_FILES || ctx->files[idx].fd < 0) {
+        xrootd_log_access(ctx, c, "CLOSE", "-", "-",
+                          0, kXR_FileNotOpen, "invalid file handle", 0);
         return xrootd_send_error(ctx, c, kXR_FileNotOpen,
                                  "invalid file handle");
     }
 
     ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
                    "xrootd: kXR_close handle=%d", idx);
+
+    /* Log before freeing so we still have the path */
+    xrootd_log_access(ctx, c, "CLOSE", ctx->files[idx].path, "-",
+                      1, 0, NULL, 0);
 
     xrootd_free_fhandle(ctx, idx);
 
@@ -2733,12 +2897,16 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
     want_stat = (options & kXR_dstat) ? 1 : 0;
 
     if (ctx->payload == NULL || ctx->cur_dlen == 0) {
+        xrootd_log_access(ctx, c, "DIRLIST", "-", "-",
+                          0, kXR_ArgMissing, "no path given", 0);
         return xrootd_send_error(ctx, c, kXR_ArgMissing, "no path given");
     }
 
     if (!xrootd_resolve_path(c->log, &conf->root,
                              (const char *) ctx->payload,
                              resolved, sizeof(resolved))) {
+        xrootd_log_access(ctx, c, "DIRLIST", (char *) ctx->payload, "-",
+                          0, kXR_NotFound, "directory not found", 0);
         return xrootd_send_error(ctx, c, kXR_NotFound, "directory not found");
     }
 
@@ -2746,13 +2914,19 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
     if (dp == NULL) {
         int err = errno;
         if (err == ENOTDIR) {
+            xrootd_log_access(ctx, c, "DIRLIST", resolved, "-",
+                              0, kXR_NotFile, "path is not a directory", 0);
             return xrootd_send_error(ctx, c, kXR_NotFile,
                                      "path is not a directory");
         }
         if (err == ENOENT) {
+            xrootd_log_access(ctx, c, "DIRLIST", resolved, "-",
+                              0, kXR_NotFound, "directory not found", 0);
             return xrootd_send_error(ctx, c, kXR_NotFound,
                                      "directory not found");
         }
+        xrootd_log_access(ctx, c, "DIRLIST", resolved, "-",
+                          0, kXR_IOError, strerror(err), 0);
         return xrootd_send_error(ctx, c, kXR_IOError, strerror(err));
     }
 
@@ -2834,6 +3008,9 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
     ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
                    "xrootd: kXR_dirlist final chunk %uz bytes", chunk_pos);
 
+    xrootd_log_access(ctx, c, "DIRLIST", resolved,
+                      want_stat ? "stat" : "-", 1, 0, NULL, 0);
+
     return xrootd_queue_response(ctx, c, chunk,
                                  XRD_RESPONSE_HDR_LEN + chunk_pos + 1);
 }
@@ -2913,6 +3090,142 @@ xrootd_send_error(xrootd_ctx_t *ctx, ngx_connection_t *c,
                    "xrootd: sending error %d: %s", (int) errcode, msg);
 
     return xrootd_queue_response(ctx, c, buf, total);
+}
+
+/* ================================================================== */
+/*  Access logging                                                      */
+/* ================================================================== */
+
+/*
+ * xrootd_log_access — write one line to the XRootD access log.
+ *
+ * Called from each request handler immediately before returning so every
+ * client-visible operation — successful or failed — appears in the log.
+ *
+ * Log line format (modelled on nginx's HTTP combined log):
+ *
+ *   <ip> <auth> "<identity>" [<timestamp>] "<verb> <path> <detail>" \
+ *   <status> <bytes> <ms>ms ["<errmsg>"]
+ *
+ * Parameters:
+ *   verb     — operation name in UPPER CASE: OPEN READ STAT DIRLIST
+ *              CLOSE LOGIN AUTH PING
+ *   path     — resolved filesystem path, or "-" for operations with no path
+ *   detail   — operation-specific context:
+ *                OPEN    "rd" (read-only; write ops are rejected before here)
+ *                READ    "offset+len" (e.g. "0+4194304"), requested values
+ *                LOGIN   the username from ClientLoginRequest
+ *                AUTH    auth protocol ("gsi")
+ *                others  "-"
+ *   xrd_ok   — non-zero on success, zero on error
+ *   errcode  — XRootD error code (kXR_NotFound etc.) when xrd_ok==0, else 0
+ *   errmsg   — human-readable error description when xrd_ok==0, else NULL
+ *   bytes    — file data bytes transferred in the response (0 for non-data ops)
+ *
+ * The function is a no-op when access_log_fd == NGX_INVALID_FILE (i.e. the
+ * xrootd_access_log directive was not set for this server block).
+ *
+ * Thread / worker safety: the file is opened O_APPEND so each write(2) up
+ * to PIPE_BUF (4096 bytes on Linux) is atomic.  All log lines fit well
+ * within that limit.
+ */
+static void
+xrootd_log_access(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    const char *verb, const char *path, const char *detail,
+    ngx_uint_t xrd_ok, uint16_t errcode, const char *errmsg, size_t bytes)
+{
+    ngx_stream_xrootd_srv_conf_t  *conf;
+    ngx_msec_int_t                 duration_ms;
+    char                           line[2048];
+    int                            n;
+    const char                    *authmethod, *identity, *client_ip;
+    ngx_time_t                    *tp;
+    struct tm                      tm;
+    char                           timebuf[64];
+    char                           errbuf[64];   /* "ERR:NNNN" when no message */
+
+    conf = ngx_stream_get_module_srv_conf(ctx->session, ngx_stream_xrootd_module);
+
+    if (conf->access_log_fd == NGX_INVALID_FILE) {
+        return;
+    }
+
+    /* ---- Who -------------------------------------------------------- */
+
+    /* Client IP (set by nginx before we run; falls back to "-") */
+    client_ip = (c->addr_text.len > 0) ? (char *) c->addr_text.data : "-";
+
+    /* Auth method and identity */
+    if (conf->auth == XROOTD_AUTH_GSI) {
+        authmethod = "gsi";
+        identity   = (ctx->dn[0] != '\0') ? ctx->dn : "-";
+    } else {
+        authmethod = "anon";
+        identity   = "-";
+    }
+
+    /* ---- When ------------------------------------------------------- */
+
+    /*
+     * Use ngx_timeofday() (already cached by nginx's event loop) for the
+     * current second, formatted exactly like nginx's HTTP access log.
+     */
+    tp = ngx_timeofday();
+    ngx_libc_localtime(tp->sec, &tm);
+    strftime(timebuf, sizeof(timebuf), "%d/%b/%Y:%H:%M:%S %z", &tm);
+
+    /* ---- How long --------------------------------------------------- */
+
+    duration_ms = (ngx_msec_int_t)(ngx_current_msec - ctx->req_start);
+    if (duration_ms < 0) {
+        duration_ms = 0;
+    }
+
+    /* ---- Status ----------------------------------------------------- */
+
+    /*
+     * On error, build a short status token.  If the caller provided a
+     * human-readable message, that appears in the final quoted field.
+     * If not, include the numeric XRootD error code so the log is still
+     * actionable without the message.
+     */
+    if (!xrd_ok && errmsg == NULL) {
+        snprintf(errbuf, sizeof(errbuf), "code:%u", (unsigned) errcode);
+        errmsg = errbuf;
+    }
+
+    /* ---- Assemble --------------------------------------------------- */
+
+    if (xrd_ok) {
+        n = snprintf(line, sizeof(line),
+            "%s %s \"%s\" [%s] \"%s %s %s\" OK %zu %dms\n",
+            client_ip,
+            authmethod,
+            identity,
+            timebuf,
+            verb,
+            path   ? path   : "-",
+            detail ? detail : "-",
+            bytes,
+            (int) duration_ms);
+    } else {
+        n = snprintf(line, sizeof(line),
+            "%s %s \"%s\" [%s] \"%s %s %s\" ERR %zu %dms \"%s\"\n",
+            client_ip,
+            authmethod,
+            identity,
+            timebuf,
+            verb,
+            path   ? path   : "-",
+            detail ? detail : "-",
+            bytes,
+            (int) duration_ms,
+            errmsg);
+    }
+
+    if (n > 0 && (size_t) n < sizeof(line)) {
+        (void) ngx_write_fd(conf->access_log_fd, line, (size_t) n);
+    }
 }
 
 /* ================================================================== */

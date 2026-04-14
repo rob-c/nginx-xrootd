@@ -141,6 +141,124 @@ stream {
 
 ---
 
+## Access Logging
+
+Every client-visible operation is written to a per-server access log — one line per request, covering anonymous and GSI connections identically.
+
+### Configuration
+
+```nginx
+stream {
+    server {
+        listen 1094;
+        xrootd on;
+        xrootd_root /data;
+        xrootd_access_log /var/log/nginx/xrootd_access.log;
+    }
+
+    server {
+        listen 1095;
+        xrootd on;
+        xrootd_auth gsi;
+        xrootd_root /data;
+        xrootd_certificate     /etc/grid-security/hostcert.pem;
+        xrootd_certificate_key /etc/grid-security/hostkey.pem;
+        xrootd_trusted_ca      /etc/grid-security/ca.pem;
+        xrootd_access_log /var/log/nginx/xrootd_gsi_access.log;
+    }
+}
+```
+
+Omit `xrootd_access_log` (or set it to `off`) to disable logging for a server block.
+
+### Log format
+
+```
+<ip> <auth> "<identity>" [<timestamp>] "<verb> <path> <detail>" <status> <bytes> <ms>ms ["<errmsg>"]
+```
+
+| Field | Meaning |
+|---|---|
+| `ip` | Client IP address |
+| `auth` | `anon` (no authentication) or `gsi` (x509 proxy certificate) |
+| `identity` | Authenticated X.509 subject DN for GSI; `-` for anonymous or pre-auth |
+| `timestamp` | Local time in nginx access-log format: `DD/Mon/YYYY:HH:MM:SS +ZZZZ` |
+| `verb` | `LOGIN` `AUTH` `OPEN` `READ` `STAT` `DIRLIST` `CLOSE` `PING` |
+| `path` | Resolved filesystem path, or `-` for non-path operations |
+| `detail` | Operation-specific context (see below) |
+| `status` | `OK` or `ERR` |
+| `bytes` | File data bytes transferred; `0` for non-data operations |
+| `ms` | Server-side processing time in milliseconds |
+| `errmsg` | Error description (only present on `ERR` lines) |
+
+**Detail field by operation:**
+
+| Verb | Detail |
+|---|---|
+| `LOGIN` | Username from the client |
+| `AUTH` | Authentication protocol (`gsi`) |
+| `OPEN` | Access mode (`rd`) |
+| `READ` | `offset+requested_length` (e.g. `0+4194304`) |
+| `DIRLIST` | `stat` if per-entry stat was requested, else `-` |
+| `STAT` | `vfs` for filesystem-level stat, else `-` |
+| `CLOSE` / `PING` | `-` |
+
+### Example log lines
+
+**Anonymous endpoint:**
+```
+127.0.0.1 anon "-" [14/Apr/2026:10:23:45 +0000] "LOGIN - alice" OK 0 0ms
+127.0.0.1 anon "-" [14/Apr/2026:10:23:45 +0000] "STAT / -" OK 0 0ms
+127.0.0.1 anon "-" [14/Apr/2026:10:23:45 +0000] "OPEN /store/mc/data.root rd" OK 0 2ms
+127.0.0.1 anon "-" [14/Apr/2026:10:23:45 +0000] "READ /store/mc/data.root 0+4194304" OK 4194304 18ms
+127.0.0.1 anon "-" [14/Apr/2026:10:23:45 +0000] "READ /store/mc/data.root 4194304+4194304" OK 4194304 16ms
+127.0.0.1 anon "-" [14/Apr/2026:10:23:45 +0000] "CLOSE /store/mc/data.root -" OK 0 0ms
+127.0.0.1 anon "-" [14/Apr/2026:10:23:45 +0000] "OPEN /store/secret.root rd" ERR 0 0ms "file not found"
+```
+
+**GSI/x509 endpoint:**
+```
+192.168.1.1 gsi "-" [14/Apr/2026:10:23:44 +0000] "LOGIN - rcurrie" OK 0 0ms
+192.168.1.1 gsi "/DC=test/DC=xrootd/CN=Test User/CN=12345" [14/Apr/2026:10:23:44 +0000] "AUTH - gsi" OK 0 48ms
+192.168.1.1 gsi "/DC=test/DC=xrootd/CN=Test User/CN=12345" [14/Apr/2026:10:23:45 +0000] "OPEN /store/mc/data.root rd" OK 0 2ms
+192.168.1.1 gsi "/DC=test/DC=xrootd/CN=Test User/CN=12345" [14/Apr/2026:10:23:45 +0000] "READ /store/mc/data.root 0+4194304" OK 4194304 18ms
+192.168.1.1 gsi "-" [14/Apr/2026:10:23:46 +0000] "AUTH - gsi" ERR 0 1ms "certificate has expired"
+```
+
+Key observations:
+- Before `AUTH` completes, `identity` is `-` even for GSI connections — a failed auth attempt shows who tried but was rejected
+- `READ` detail shows `offset+requested_length`; the `bytes` field shows actual bytes returned, so a short `bytes < requested_length` value indicates an EOF hit
+- Every `OPEN`/`CLOSE` pair brackets a file transfer; `READ` lines between them show the exact access pattern
+
+### Log rotation
+
+The access log file is opened with `O_APPEND` and kept open for the lifetime of the worker process. To rotate logs:
+
+```bash
+mv /var/log/nginx/xrootd_access.log /var/log/nginx/xrootd_access.log.1
+kill -USR1 $(cat /var/run/nginx.pid)   # nginx master reopens all log files
+```
+
+### Parsing with standard tools
+
+```bash
+# Count transfers per user (GSI endpoint)
+awk '{print $3}' xrootd_gsi_access.log | sort | uniq -c | sort -rn
+
+# Total bytes read per file
+awk '$8 == "READ" {gsub(/"/, "", $8); print $9, $11}' xrootd_access.log | \
+    awk '{bytes[$1]+=$2} END {for(f in bytes) print bytes[f], f}' | sort -rn
+
+# All failed authentication attempts
+grep '"AUTH' xrootd_gsi_access.log | grep ERR
+
+# Reads by user in the last hour
+awk '/READ/ && /OK/' xrootd_gsi_access.log | \
+    awk '{print $3, $11}' | sort
+```
+
+---
+
 ## Security
 
 **Path traversal** is prevented by calling `realpath(3)` on every client-supplied path and verifying the result is rooted under `xrootd_root`. Symlinks that escape the root are rejected.
