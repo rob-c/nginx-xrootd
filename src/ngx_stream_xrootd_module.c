@@ -189,8 +189,10 @@ typedef enum {
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    int   fd;                 /* OS file descriptor; -1 = slot unused */
-    char  path[PATH_MAX];     /* resolved absolute path (for fhandle stat) */
+    int        fd;                 /* OS file descriptor; -1 = slot unused */
+    char       path[PATH_MAX];     /* resolved absolute path (for fhandle stat) */
+    size_t     bytes_read;         /* bytes successfully read from this handle */
+    ngx_msec_t open_time;          /* ngx_current_msec when file was opened */
 } xrootd_file_t;
 
 /* ------------------------------------------------------------------ */
@@ -235,6 +237,10 @@ typedef struct {
     /* Per-request timing: set at the top of xrootd_dispatch() so every
      * handler can report how long its request took in the access log. */
     ngx_msec_t  req_start;
+
+    /* Session-level transfer accounting (for DISCONNECT summary line) */
+    size_t      session_bytes;     /* cumulative bytes transferred this session */
+    ngx_msec_t  session_start;     /* ngx_current_msec at LOGIN                 */
 
 } xrootd_ctx_t;
 
@@ -335,6 +341,7 @@ static int  xrootd_resolve_path(ngx_log_t *log,
 static int  xrootd_alloc_fhandle(xrootd_ctx_t *ctx);
 static void xrootd_free_fhandle(xrootd_ctx_t *ctx, int idx);
 static void xrootd_close_all_files(xrootd_ctx_t *ctx);
+static void xrootd_on_disconnect(xrootd_ctx_t *ctx, ngx_connection_t *c);
 static void xrootd_make_stat_body(const struct stat *st, ngx_flag_t is_vfs,
     char *out, size_t outsz);
 
@@ -769,6 +776,7 @@ ngx_stream_xrootd_recv(ngx_event_t *rev)
     if (rev->timedout) {
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
                       "xrootd: client connection timed out");
+        xrootd_on_disconnect(ctx, c);
         xrootd_close_all_files(ctx);
         ngx_stream_finalize_session(s, NGX_STREAM_OK);
         return;
@@ -826,6 +834,7 @@ ngx_stream_xrootd_recv(ngx_event_t *rev)
             /* Connection closed or error */
             ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
                            "xrootd: client disconnected");
+            xrootd_on_disconnect(ctx, c);
             xrootd_close_all_files(ctx);
             ngx_stream_finalize_session(s, NGX_STREAM_OK);
             return;
@@ -920,6 +929,7 @@ process:
     }
 
 fatal:
+    xrootd_on_disconnect(ctx, c);
     xrootd_close_all_files(ctx);
     ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
 }
@@ -943,6 +953,7 @@ ngx_stream_xrootd_send(ngx_event_t *wev)
     if (wev->timedout) {
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
                       "xrootd: write timed out");
+        xrootd_on_disconnect(ctx, c);
         xrootd_close_all_files(ctx);
         ngx_stream_finalize_session(s, NGX_STREAM_OK);
         return;
@@ -950,6 +961,7 @@ ngx_stream_xrootd_send(ngx_event_t *wev)
 
     rc = xrootd_flush_pending(ctx, c);
     if (rc == NGX_ERROR) {
+        xrootd_on_disconnect(ctx, c);
         xrootd_close_all_files(ctx);
         ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
         return;
@@ -1337,6 +1349,7 @@ xrootd_handle_login(xrootd_ctx_t *ctx, ngx_connection_t *c,
         ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN, ctx->sessid,
                    XROOTD_SESSION_ID_LEN);
 
+        ctx->session_start = ngx_current_msec;
         xrootd_log_access(ctx, c, "LOGIN", "-", user, 1, 0, NULL, 0);
 
         return xrootd_queue_response(ctx, c, buf, total);
@@ -1390,6 +1403,7 @@ xrootd_handle_login(xrootd_ctx_t *ctx, ngx_connection_t *c,
                        "xrootd: login→kXGS_init parms=\"%s\" ca_hash=%08xd",
                        parms, (unsigned) conf->gsi_ca_hash);
 
+        ctx->session_start = ngx_current_msec;
         /* Log the login event; identity will be filled in after kXGC_cert */
         xrootd_log_access(ctx, c, "LOGIN", "-", user, 1, 0, NULL, 0);
 
@@ -2484,6 +2498,7 @@ xrootd_handle_endsess(xrootd_ctx_t *ctx, ngx_connection_t *c)
 {
     ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
                    "xrootd: kXR_endsess received");
+    xrootd_on_disconnect(ctx, c);
     xrootd_close_all_files(ctx);
     /* Acknowledge, then the client will close the TCP connection */
     return xrootd_send_ok(ctx, c, NULL, 0);
@@ -2705,6 +2720,9 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
                    statbuf, slen);
     }
 
+    ctx->files[idx].bytes_read = 0;
+    ctx->files[idx].open_time  = ngx_current_msec;
+
     xrootd_log_access(ctx, c, "OPEN", resolved, "rd", 1, 0, NULL, 0);
 
     return xrootd_queue_response(ctx, c, buf, total);
@@ -2779,6 +2797,10 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
     }
 
     data_total = (size_t) nread;
+
+    /* Accumulate per-file and per-session byte counters */
+    ctx->files[idx].bytes_read += data_total;
+    ctx->session_bytes         += data_total;
 
     ngx_log_debug4(NGX_LOG_DEBUG_STREAM, c->log, 0,
                    "xrootd: kXR_read handle=%d offset=%L req=%uz got=%uz",
@@ -2857,9 +2879,26 @@ xrootd_handle_close(xrootd_ctx_t *ctx, ngx_connection_t *c)
     ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
                    "xrootd: kXR_close handle=%d", idx);
 
-    /* Log before freeing so we still have the path */
-    xrootd_log_access(ctx, c, "CLOSE", ctx->files[idx].path, "-",
-                      1, 0, NULL, 0);
+    /* Log before freeing so we still have the path and byte counters.
+     * detail = throughput for the file transfer: "NNb @ M.MMB/s".
+     * bytes  = total bytes read from this handle (0 if only opened, not read). */
+    {
+        char       close_detail[64];
+        size_t     br  = ctx->files[idx].bytes_read;
+        ngx_msec_t dur = ngx_current_msec - ctx->files[idx].open_time;
+
+        if (br > 0 && dur > 0) {
+            /* throughput in MB/s: bytes / ms / 1000 = MB/s */
+            double mbps = (double) br / (double) dur / 1000.0;
+            snprintf(close_detail, sizeof(close_detail),
+                     "%.2fMB/s", mbps);
+        } else {
+            snprintf(close_detail, sizeof(close_detail), "-");
+        }
+
+        xrootd_log_access(ctx, c, "CLOSE", ctx->files[idx].path, close_detail,
+                          1, 0, NULL, br);
+    }
 
     xrootd_free_fhandle(ctx, idx);
 
@@ -3138,7 +3177,8 @@ xrootd_log_access(xrootd_ctx_t *ctx, ngx_connection_t *c,
     ngx_msec_int_t                 duration_ms;
     char                           line[2048];
     int                            n;
-    const char                    *authmethod, *identity, *client_ip;
+    const char                    *authmethod, *identity;
+    char                           client_ip[INET6_ADDRSTRLEN + 8]; /* "[addr]:port" */
     ngx_time_t                    *tp;
     struct tm                      tm;
     char                           timebuf[64];
@@ -3152,8 +3192,15 @@ xrootd_log_access(xrootd_ctx_t *ctx, ngx_connection_t *c,
 
     /* ---- Who -------------------------------------------------------- */
 
-    /* Client IP (set by nginx before we run; falls back to "-") */
-    client_ip = (c->addr_text.len > 0) ? (char *) c->addr_text.data : "-";
+    /* Client IP: addr_text is an ngx_str_t (length + pointer, not NUL-terminated).
+     * Copy into a local buffer so we can safely pass it to snprintf as "%s". */
+    if (c->addr_text.len > 0 && c->addr_text.len < sizeof(client_ip)) {
+        ngx_memcpy(client_ip, c->addr_text.data, c->addr_text.len);
+        client_ip[c->addr_text.len] = '\0';
+    } else {
+        client_ip[0] = '-';
+        client_ip[1] = '\0';
+    }
 
     /* Auth method and identity */
     if (conf->auth == XROOTD_AUTH_GSI) {
@@ -3323,6 +3370,76 @@ xrootd_close_all_files(xrootd_ctx_t *ctx)
     int i;
     for (i = 0; i < XROOTD_MAX_FILES; i++) {
         xrootd_free_fhandle(ctx, i);
+    }
+}
+
+/*
+ * xrootd_on_disconnect — called at every connection teardown point.
+ *
+ * Logs a CLOSE line for any files the client left open (connection dropped
+ * before sending kXR_close), then writes a DISCONNECT summary line with the
+ * total bytes transferred and average session throughput.
+ *
+ * Must be called before xrootd_close_all_files() so the file paths and byte
+ * counts are still available.
+ */
+static void
+xrootd_on_disconnect(xrootd_ctx_t *ctx, ngx_connection_t *c)
+{
+    int        i;
+    ngx_msec_t now = ngx_current_msec;
+
+    /* Log any files that were left open without a client-sent kXR_close.
+     * These represent transfers that were interrupted mid-flight. */
+    for (i = 0; i < XROOTD_MAX_FILES; i++) {
+        if (ctx->files[i].fd < 0) {
+            continue;   /* slot already free */
+        }
+
+        /* Temporarily point req_start at the file open time so that the
+         * duration field in the log line reflects the open→disconnect span. */
+        ctx->req_start = ctx->files[i].open_time;
+
+        {
+            char   detail[64];
+            size_t br  = ctx->files[i].bytes_read;
+            ngx_msec_t dur = now - ctx->files[i].open_time;
+
+            if (br > 0 && dur > 0) {
+                double mbps = (double) br / (double) dur / 1000.0;
+                snprintf(detail, sizeof(detail), "interrupted %.2fMB/s", mbps);
+            } else {
+                snprintf(detail, sizeof(detail), "interrupted");
+            }
+
+            xrootd_log_access(ctx, c, "CLOSE", ctx->files[i].path, detail,
+                              0, kXR_Cancelled, "connection lost", br);
+        }
+    }
+
+    /* Write the DISCONNECT summary line only if the client actually logged in.
+     * Pre-login disconnects (e.g. port-scanner probes) are not worth logging. */
+    if (!ctx->logged_in) {
+        return;
+    }
+
+    {
+        char       detail[128];
+        ngx_msec_t sess_dur = now - ctx->session_start;
+
+        if (ctx->session_bytes > 0 && sess_dur > 0) {
+            double mbps = (double) ctx->session_bytes / (double) sess_dur / 1000.0;
+            snprintf(detail, sizeof(detail), "%.2fMB/s", mbps);
+        } else {
+            snprintf(detail, sizeof(detail), "-");
+        }
+
+        /* Use session_start for the duration field so the log shows total
+         * session duration rather than the last request's processing time. */
+        ctx->req_start = ctx->session_start;
+
+        xrootd_log_access(ctx, c, "DISCONNECT", "-", detail,
+                          1, 0, NULL, ctx->session_bytes);
     }
 }
 

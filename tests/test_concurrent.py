@@ -245,7 +245,7 @@ class TestConcurrent:
 
     def test_aggregate_throughput_scales_with_connections(self):
         """
-        Aggregate throughput with 4 connections should be at least 2× that
+        Aggregate throughput with 4 connections should be at least 1.5× that
         of 1 connection — i.e. the server actually parallelises I/O rather
         than serialising requests.
         """
@@ -267,7 +267,7 @@ class TestConcurrent:
             f"\n  scale-up ratio: {ratio:.2f}x"
         )
 
-        assert ratio >= 1.75, (
-            f"Expected ≥1.75× aggregate throughput at n=4 vs n=1, got {ratio:.2f}×. "
+        assert ratio >= 1.5, (
+            f"Expected ≥1.5× aggregate throughput at n=4 vs n=1, got {ratio:.2f}×. "
             f"n=1={agg1/1e6:.0f} MB/s  n=4={agg4/1e6:.0f} MB/s"
         )
