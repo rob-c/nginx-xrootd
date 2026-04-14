@@ -3393,7 +3393,9 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
 
     /* Resolve the path.
      * For read opens the file must already exist (realpath check).
-     * For write opens the file may not exist yet; resolve the parent dir. */
+     * For write opens with kXR_mkpath the parent dirs may not exist yet,
+     * so use xrootd_resolve_path_noexist; otherwise use the write resolver
+     * which requires the parent to exist. */
     if (!is_write) {
         if (!xrootd_resolve_path(c->log, &conf->root,
                                  clean_path, resolved, sizeof(resolved))) {
@@ -3401,9 +3403,30 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
                               0, kXR_NotFound, "file not found", 0);
             return xrootd_send_error(ctx, c, kXR_NotFound, "file not found");
         }
+
+        /* Reject opening a directory as a file */
+        {
+            struct stat st;
+            if (stat(resolved, &st) == 0 && S_ISDIR(st.st_mode)) {
+                xrootd_log_access(ctx, c, "OPEN", clean_path, "rd",
+                                  0, kXR_isDirectory, "is a directory", 0);
+                return xrootd_send_error(ctx, c, kXR_isDirectory,
+                                         "is a directory");
+            }
+        }
     } else {
-        if (!xrootd_resolve_path_write(c->log, &conf->root,
-                                       clean_path, resolved, sizeof(resolved))) {
+        int ok;
+        if (options & kXR_mkpath) {
+            /* Parent dirs may not exist yet — validate without realpath */
+            ok = xrootd_resolve_path_noexist(c->log, &conf->root,
+                                              clean_path, resolved,
+                                              sizeof(resolved));
+        } else {
+            ok = xrootd_resolve_path_write(c->log, &conf->root,
+                                           clean_path, resolved,
+                                           sizeof(resolved));
+        }
+        if (!ok) {
             xrootd_log_access(ctx, c, "OPEN", clean_path, "wr",
                               0, kXR_NotFound, "invalid path", 0);
             return xrootd_send_error(ctx, c, kXR_NotFound, "invalid path");
@@ -3448,12 +3471,20 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
             oflags = O_WRONLY;
         }
 
-        /* Step 2: creation / truncation modifiers */
+        /* Step 2: creation / truncation modifiers.
+         *
+         * kXR_new alone   → O_CREAT|O_EXCL  (fail if file exists)
+         * kXR_new|kXR_delete → O_CREAT|O_TRUNC  (create or overwrite)
+         * kXR_delete alone → O_CREAT|O_TRUNC
+         */
         if (options & kXR_new) {
             oflags |= O_CREAT;
+            if (!(options & kXR_delete)) {
+                oflags |= O_EXCL;   /* fail if already exists */
+            }
         }
         if (options & kXR_delete) {
-            oflags |= O_TRUNC;
+            oflags |= O_CREAT | O_TRUNC;
         }
 
         oflags |= O_NOCTTY;
