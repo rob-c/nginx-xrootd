@@ -21,7 +21,10 @@ from XRootD import client
 from XRootD.client.flags import OpenFlags
 
 ANON_URL = "root://localhost:11094"
+GSI_URL  = "root://localhost:11095"
 DATA_DIR = "/tmp/xrd-test/data"
+CA_DIR   = "/tmp/xrd-test/pki/ca"
+PROXY_PEM = "/tmp/xrd-test/pki/user/proxy_std.pem"
 
 
 def _md5(path: str) -> str:
@@ -39,12 +42,20 @@ def _xrdcp_put(local_path: str, remote_name: str, force: bool = False) -> int:
     return os.system(cmd)
 
 
+def _xrdcp_put_gsi(local_path: str, remote_name: str, force: bool = False) -> int:
+    """Upload local_path to the GSI server using the test proxy cert."""
+    flag = "-f" if force else ""
+    env = f"X509_CERT_DIR={CA_DIR} X509_USER_PROXY={PROXY_PEM}"
+    cmd = f"{env} xrdcp {flag} {local_path} {GSI_URL}//{remote_name}"
+    return os.system(cmd)
+
+
 @pytest.fixture(autouse=True)
 def cleanup_uploads():
     """Remove uploaded files from the data dir after each test."""
     yield
     for f in os.listdir(DATA_DIR):
-        if f.startswith("_test_write_"):
+        if f.startswith("_test_write_") or f.startswith("_test_gsi_write_"):
             try:
                 os.unlink(os.path.join(DATA_DIR, f))
             except OSError:
@@ -132,19 +143,91 @@ class TestWriteAnon:
         assert data == content, "read-back data does not match written data"
         f.close()
 
-    def test_upload_respects_read_only_on_gsi_port(self):
-        """The GSI server (port 11095) has no xrootd_allow_write, so uploads must fail."""
+    def test_upload_rejected_without_credentials_on_gsi_port(self):
+        """Uploading to the GSI port without a proxy cert must fail authentication."""
         content = b"should not be written\n"
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp.write(content)
             local = tmp.name
 
-        # xrdcp to the GSI port (no write allowed) — must not exit 0
-        cmd = f"xrdcp {local} root://localhost:11095//_test_write_readonly.txt 2>/dev/null"
+        # xrdcp to the GSI port with no proxy — must not exit 0
+        cmd = (
+            "env -u X509_USER_PROXY -u X509_CERT_DIR "
+            f"xrdcp {local} root://localhost:11095//_test_write_nocreds.txt 2>/dev/null"
+        )
         rc = os.system(cmd)
         os.unlink(local)
 
-        assert rc != 0, "Expected xrdcp to fail on read-only GSI server"
+        assert rc != 0, "Expected xrdcp to fail on GSI server without credentials"
         assert not os.path.exists(
-            os.path.join(DATA_DIR, "_test_write_readonly.txt")
-        ), "File should not have been created on read-only server"
+            os.path.join(DATA_DIR, "_test_write_nocreds.txt")
+        ), "File should not have been created without valid GSI credentials"
+
+
+class TestWriteGSI:
+    """Upload tests that authenticate via GSI proxy certificate on port 11095."""
+
+    def test_gsi_upload_small_file(self):
+        """Upload a small file over GSI and verify contents on disk."""
+        content = b"Hello from nginx-xrootd GSI write test!\n"
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(content)
+            local = tmp.name
+
+        remote = "_test_gsi_write_small.txt"
+        assert _xrdcp_put_gsi(local, remote) == 0, "GSI xrdcp upload failed"
+        os.unlink(local)
+
+        dest = os.path.join(DATA_DIR, remote)
+        assert os.path.exists(dest), "uploaded file not found on disk"
+        assert open(dest, "rb").read() == content, "file content mismatch"
+
+    def test_gsi_upload_large_file(self):
+        """Upload a 50 MiB file over GSI and verify MD5 integrity."""
+        size = 50 * 1024 * 1024
+        data = os.urandom(size)
+        expected_md5 = hashlib.md5(data).hexdigest()
+
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(data)
+            local = tmp.name
+
+        remote = "_test_gsi_write_large.bin"
+        assert _xrdcp_put_gsi(local, remote) == 0, "GSI xrdcp large upload failed"
+        os.unlink(local)
+
+        dest = os.path.join(DATA_DIR, remote)
+        assert os.path.getsize(dest) == size, (
+            f"size mismatch: {os.path.getsize(dest)} != {size}"
+        )
+        assert _md5(dest) == expected_md5, "MD5 mismatch after GSI large upload"
+
+    def test_gsi_write_then_read_back(self):
+        """Write via GSI xrdcp, read back via XRootD File API with GSI auth."""
+        content = b"GSI round-trip: " + os.urandom(128)
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(content)
+            local = tmp.name
+
+        remote = "_test_gsi_write_roundtrip.bin"
+        assert _xrdcp_put_gsi(local, remote) == 0, "GSI upload failed"
+        os.unlink(local)
+
+        os.environ["X509_CERT_DIR"] = CA_DIR
+        os.environ["X509_USER_PROXY"] = PROXY_PEM
+        try:
+            f = client.File()
+            status, _ = f.open(f"{GSI_URL}//{remote}", OpenFlags.READ)
+            assert status.ok, f"GSI open for read failed: {status.message}"
+
+            status, st = f.stat()
+            assert status.ok
+            assert st.size == len(content), f"stat size {st.size} != {len(content)}"
+
+            status, data = f.read(offset=0, size=len(content))
+            assert status.ok, f"GSI read failed: {status.message}"
+            assert data == content, "read-back data does not match written data"
+            f.close()
+        finally:
+            os.environ.pop("X509_CERT_DIR", None)
+            os.environ.pop("X509_USER_PROXY", None)
