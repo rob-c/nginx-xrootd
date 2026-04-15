@@ -7,7 +7,17 @@ ngx_addon_name=ngx_stream_xrootd_module
 # Build both the stream module and the companion HTTP metrics module
 ngx_module_type=STREAM
 ngx_module_name=ngx_stream_xrootd_module
-ngx_module_srcs="$ngx_addon_dir/src/ngx_stream_xrootd_module.c"
+ngx_module_srcs="$ngx_addon_dir/src/ngx_stream_xrootd_module.c \
+                 $ngx_addon_dir/src/ngx_xrootd_config.c \
+                 $ngx_addon_dir/src/ngx_xrootd_connection.c \
+                 $ngx_addon_dir/src/ngx_xrootd_handshake.c \
+                 $ngx_addon_dir/src/ngx_xrootd_session.c \
+                 $ngx_addon_dir/src/ngx_xrootd_gsi.c \
+                 $ngx_addon_dir/src/ngx_xrootd_read_handlers.c \
+                 $ngx_addon_dir/src/ngx_xrootd_write_handlers.c \
+                 $ngx_addon_dir/src/ngx_xrootd_aio.c \
+                 $ngx_addon_dir/src/ngx_xrootd_response.c \
+                 $ngx_addon_dir/src/ngx_xrootd_path.c"
 ngx_module_libs="-lssl -lcrypto"
 CORE_LIBS="$CORE_LIBS -lssl -lcrypto"
 . auto/module
