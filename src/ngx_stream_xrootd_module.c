@@ -2,21 +2,33 @@
  * ngx_stream_xrootd_module.c
  *
  * nginx stream module implementing the XRootD root:// protocol.
- * Acts as a read-only data server (kXR_DataServer) at the TCP level.
+ * Acts as a kXR_DataServer at the TCP level, with optional write support.
  *
- * Supported requests:
+ * Read operations (always available when logged in):
  *   handshake / protocol negotiation
  *   kXR_protocol   — negotiate capabilities and security mode
  *   kXR_login      — accept username; triggers GSI auth when configured
  *   kXR_auth       — GSI/x509 proxy certificate authentication
  *   kXR_ping       — liveness check
  *   kXR_stat       — path-based and handle-based stat
- *   kXR_open       — open files for reading
+ *   kXR_open       — open files for reading or writing
  *   kXR_read       — read file data (chunked with kXR_oksofar)
- *   kXR_close      — close an open handle
- *   kXR_dirlist    — list a directory (with optional per-entry stat)
+ *   kXR_readv      — scatter-gather vector read (up to 1024 segments)
+ *   kXR_close      — close an open handle (logs throughput)
+ *   kXR_dirlist    — list a directory (with optional kXR_dstat per-entry stat)
+ *   kXR_query      — kXR_Qcksum (adler32), kXR_Qspace (statvfs), kXR_Qconfig
  *   kXR_endsess    — graceful session termination
- *   write ops      — rejected with kXR_fsReadOnly (read-only server)
+ *
+ * Write operations (require xrootd_allow_write on):
+ *   kXR_pgwrite    — paged write with CRC32c integrity (used by xrdcp v5)
+ *   kXR_write      — raw write at offset (v3/v4 clients)
+ *   kXR_sync       — fsync an open handle
+ *   kXR_truncate   — truncate by path or open handle
+ *   kXR_mkdir      — create directory; recursive with kXR_mkdirpath
+ *   kXR_rmdir      — remove an empty directory
+ *   kXR_rm         — remove a file
+ *   kXR_mv         — rename/move a file or directory
+ *   kXR_chmod      — change permission bits
  *
  * -------------------------------------------------------------------------
  * ANONYMOUS CONNECTION FLOW
@@ -125,6 +137,7 @@
 #include <ngx_stream.h>
 
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -145,6 +158,11 @@
 #include <openssl/core_names.h>
 
 #include "xrootd_protocol.h"
+#include "ngx_xrootd_metrics.h"
+
+#if (NGX_THREADS)
+#include <ngx_thread_pool.h>
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Module forward declaration (defined at bottom of file)              */
@@ -180,15 +198,51 @@ extern ngx_module_t ngx_stream_xrootd_module;
 /* TCP receive buffer (sized to hold the largest expected request) */
 #define XROOTD_RECV_BUF      (XROOTD_MAX_PATH + XRD_REQUEST_HDR_LEN + 64)
 
+/* Increment a per-operation metric counter.  No-ops when metrics are disabled. */
+#define XROOTD_OP_OK(ctx, op)  \
+    do { if ((ctx)->metrics) { \
+        ngx_atomic_fetch_add(&(ctx)->metrics->op_ok[(op)], 1); \
+    } } while (0)
+
+#define XROOTD_OP_ERR(ctx, op) \
+    do { if ((ctx)->metrics) { \
+        ngx_atomic_fetch_add(&(ctx)->metrics->op_err[(op)], 1); \
+    } } while (0)
+
 /* ------------------------------------------------------------------ */
 /* Per-connection state machine                                         */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Per-connection state machine states.
+ *
+ * Normal flow:
+ *   HANDSHAKE → REQ_HEADER → REQ_PAYLOAD (if dlen > 0) → REQ_HEADER → …
+ *
+ * SENDING: entered when xrootd_queue_response_base() gets EAGAIN from
+ *   c->send().  The remaining bytes are stored in ctx->wbuf and the write
+ *   event is armed.  ngx_stream_xrootd_recv() returns immediately to avoid
+ *   reading a second request while the first response is still in flight.
+ *   ngx_stream_xrootd_send() drains wbuf and, when done, resets to
+ *   REQ_HEADER and re-invokes ngx_stream_xrootd_recv().
+ *
+ *   CRITICAL: the write handler must guard against state having already
+ *   advanced beyond SENDING (see the comment in ngx_stream_xrootd_send).
+ *
+ * AIO: entered when a pread(2)/pwrite(2) is posted to the thread pool.
+ *   The module keeps accepting incoming TCP data so the client's kernel
+ *   send buffer does not fill and stall the connection, but it does not
+ *   dispatch any new XRootD requests.  When the thread finishes, the
+ *   completion handler (xrootd_read_aio_done / xrootd_write_aio_done)
+ *   builds and queues the response, then calls xrootd_aio_resume() which
+ *   posts a read event so the loop re-enters without waiting for epoll.
+ */
 typedef enum {
     XRD_ST_HANDSHAKE,   /* accumulating the 20-byte client hello  */
     XRD_ST_REQ_HEADER,  /* accumulating a 24-byte request header  */
     XRD_ST_REQ_PAYLOAD, /* accumulating dlen bytes of payload     */
     XRD_ST_SENDING,     /* draining a large pending write buffer  */
+    XRD_ST_AIO,         /* async file I/O posted to thread pool   */
 } xrootd_state_t;
 
 /* ------------------------------------------------------------------ */
@@ -239,6 +293,7 @@ typedef struct {
     u_char    *wbuf;          /* allocated from pool */
     size_t     wbuf_len;
     size_t     wbuf_pos;
+    u_char    *wbuf_base;     /* base of wbuf allocation (for ngx_pfree after drain) */
 
     /* GSI handshake state: ephemeral DH key kept from kXGS_cert until kXGC_cert */
     EVP_PKEY  *gsi_dh_key;   /* freed after kXGC_cert processing */
@@ -251,6 +306,13 @@ typedef struct {
     size_t      session_bytes;         /* cumulative bytes transferred this session */
     size_t      session_bytes_written; /* cumulative bytes written this session     */
     ngx_msec_t  session_start;         /* ngx_current_msec at LOGIN                 */
+
+    /* Pointer into shared metrics slot for this connection's server */
+    ngx_xrootd_srv_metrics_t  *metrics;
+
+    /* Async I/O guard: set to 1 when the connection is being torn down so
+     * thread-pool completion handlers know to skip response delivery. */
+    ngx_uint_t                  destroyed;
 
 } xrootd_ctx_t;
 
@@ -285,6 +347,15 @@ typedef struct {
     ngx_str_t    access_log;       /* path from xrootd_access_log directive */
     ngx_fd_t     access_log_fd;    /* opened O_WRONLY|O_APPEND file, or
                                     * NGX_INVALID_FILE when not configured  */
+
+    /* Prometheus metrics — index into the shared memory server array */
+    ngx_int_t    metrics_slot;    /* -1 = not assigned                  */
+
+#if (NGX_THREADS)
+    /* Async file I/O thread pool (resolved in postconfiguration) */
+    ngx_thread_pool_t  *thread_pool;        /* NULL = sync fallback   */
+    ngx_str_t           thread_pool_name;   /* default: "default"     */
+#endif
 } ngx_stream_xrootd_srv_conf_t;
 
 /* ------------------------------------------------------------------ */
@@ -297,6 +368,7 @@ static char *ngx_stream_xrootd_merge_srv_conf(ngx_conf_t *cf,
 static char *ngx_stream_xrootd_enable(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf);
+static ngx_int_t ngx_xrootd_metrics_shm_init(ngx_shm_zone_t *shm_zone, void *data);
 
 static void ngx_stream_xrootd_handler(ngx_stream_session_t *s);
 static void ngx_stream_xrootd_recv(ngx_event_t *rev);
@@ -357,6 +429,10 @@ static ngx_int_t xrootd_handle_mv(xrootd_ctx_t *ctx,
     ngx_connection_t *c, ngx_stream_xrootd_srv_conf_t *conf);
 static ngx_int_t xrootd_handle_chmod(xrootd_ctx_t *ctx,
     ngx_connection_t *c, ngx_stream_xrootd_srv_conf_t *conf);
+static ngx_int_t xrootd_handle_query(xrootd_ctx_t *ctx,
+    ngx_connection_t *c, ngx_stream_xrootd_srv_conf_t *conf);
+static ngx_int_t xrootd_handle_readv(xrootd_ctx_t *ctx,
+    ngx_connection_t *c);
 
 static ngx_int_t xrootd_send_ok(xrootd_ctx_t *ctx, ngx_connection_t *c,
     const void *body, uint32_t bodylen);
@@ -512,6 +588,26 @@ static ngx_command_t ngx_stream_xrootd_commands[] = {
       offsetof(ngx_stream_xrootd_srv_conf_t, access_log),
       NULL },
 
+#if (NGX_THREADS)
+    /*
+     * xrootd_thread_pool <name>;
+     *
+     * Name of the thread_pool to use for async file I/O (kXR_read, kXR_write,
+     * kXR_pgwrite, kXR_readv).  Must match a thread_pool directive at the main
+     * config level.  Defaults to "default" when omitted.
+     *
+     * Example:
+     *   thread_pool xrootd_io threads=8 max_queue=65536;
+     *   server { xrootd_thread_pool xrootd_io; }
+     */
+    { ngx_string("xrootd_thread_pool"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_xrootd_srv_conf_t, thread_pool_name),
+      NULL },
+#endif
+
     ngx_null_command
 };
 
@@ -563,6 +659,7 @@ ngx_stream_xrootd_create_srv_conf(ngx_conf_t *cf)
     conf->gsi_store    = NULL;
     conf->gsi_ca_hash  = 0;
     conf->access_log_fd = NGX_INVALID_FILE;
+    conf->metrics_slot = -1;
 
     return conf;
 }
@@ -763,6 +860,91 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
             xcf->certificate.data, xcf->gsi_ca_hash);
     }
 
+    /* ---- Prometheus metrics shared memory ---- */
+    {
+        ngx_str_t   zone_name = ngx_string("xrootd_metrics");
+        size_t      zone_size;
+        ngx_uint_t  slot = 0;
+
+        zone_size = sizeof(ngx_xrootd_metrics_t) + ngx_pagesize;
+        ngx_xrootd_shm_zone = ngx_shared_memory_add(cf, &zone_name,
+                                                      zone_size,
+                                                      &ngx_stream_xrootd_module);
+        if (ngx_xrootd_shm_zone == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_xrootd_shm_zone->init = ngx_xrootd_metrics_shm_init;
+        ngx_xrootd_shm_zone->data = (void *) 1; /* mark as configured */
+
+        /* Assign one slot per enabled server block */
+        for (i = 0; i < cmcf->servers.nelts; i++) {
+            xcf = ngx_stream_conf_get_module_srv_conf(cscfp[i],
+                                                       ngx_stream_xrootd_module);
+            if (!xcf->enable || slot >= XROOTD_METRICS_MAX_SERVERS) {
+                continue;
+            }
+            xcf->metrics_slot = (ngx_int_t) slot++;
+        }
+    }
+
+#if (NGX_THREADS)
+    /* Resolve the thread pool for each enabled server block.
+     * If xrootd_thread_pool was not set, default to "default". */
+    {
+        static ngx_str_t default_pool_name = ngx_string("default");
+
+        for (i = 0; i < cmcf->servers.nelts; i++) {
+            ngx_str_t *pool_name;
+
+            xcf = ngx_stream_conf_get_module_srv_conf(cscfp[i],
+                                                       ngx_stream_xrootd_module);
+            if (!xcf->enable) {
+                continue;
+            }
+
+            pool_name = (xcf->thread_pool_name.len > 0)
+                        ? &xcf->thread_pool_name
+                        : &default_pool_name;
+
+            xcf->thread_pool = ngx_thread_pool_get(cf->cycle, pool_name);
+            if (xcf->thread_pool == NULL) {
+                ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
+                    "xrootd: thread pool \"%V\" not found — "
+                    "async file I/O disabled (add a thread_pool directive)",
+                    pool_name);
+            } else {
+                ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
+                    "xrootd: using thread pool \"%V\" for async file I/O",
+                    pool_name);
+            }
+        }
+    }
+#endif
+
+    return NGX_OK;
+}
+
+/*
+ * ngx_xrootd_metrics_shm_init — shared memory zone init callback.
+ *
+ * Called by nginx after the shared memory region is mapped.  We zero
+ * the region on first init; on reload (data != NULL) we preserve the
+ * existing counters so metrics survive nginx reload without resetting.
+ */
+static ngx_int_t
+ngx_xrootd_metrics_shm_init(ngx_shm_zone_t *shm_zone, void *data)
+{
+    ngx_xrootd_metrics_t *shm;
+
+    if (data) {
+        /* Reload: reuse existing counters */
+        shm_zone->data = data;
+        return NGX_OK;
+    }
+
+    shm = (ngx_xrootd_metrics_t *) shm_zone->shm.addr;
+    ngx_memzero(shm, sizeof(*shm));
+    shm_zone->data = shm;
     return NGX_OK;
 }
 
@@ -812,6 +994,45 @@ ngx_stream_xrootd_handler(ngx_stream_session_t *s)
 
     ngx_stream_set_ctx(s, ctx, ngx_stream_xrootd_module);
 
+    /* Bind metrics slot for this connection */
+    {
+        ngx_stream_xrootd_srv_conf_t *mconf;
+        mconf = ngx_stream_get_module_srv_conf(s, ngx_stream_xrootd_module);
+        if (mconf->metrics_slot >= 0 && ngx_xrootd_shm_zone != NULL
+            && ngx_xrootd_shm_zone->data != NULL
+            && ngx_xrootd_shm_zone->data != (void *) 1)
+        {
+            ngx_xrootd_metrics_t     *shm = ngx_xrootd_shm_zone->data;
+            ngx_xrootd_srv_metrics_t *srv = &shm->servers[mconf->metrics_slot];
+            ctx->metrics = srv;
+
+            /* Populate static metadata on first use */
+            if (!srv->in_use) {
+                srv->in_use = 1;
+                ngx_cpystrn((u_char *) srv->auth,
+                            (u_char *) (mconf->auth == 1 ? "gsi" : "anon"),
+                            sizeof(srv->auth));
+                /* Port: get from local socket address */
+                if (c->local_sockaddr) {
+                    sa_family_t fam = c->local_sockaddr->sa_family;
+                    if (fam == AF_INET) {
+                        struct sockaddr_in *sin =
+                            (struct sockaddr_in *) c->local_sockaddr;
+                        srv->port = ntohs(sin->sin_port);
+                    } else if (fam == AF_INET6) {
+                        struct sockaddr_in6 *sin6 =
+                            (struct sockaddr_in6 *) c->local_sockaddr;
+                        srv->port = ntohs(sin6->sin6_port);
+                    }
+                }
+            }
+
+            /* Connection accepted */
+            ngx_atomic_fetch_add(&srv->connections_total, 1);
+            ngx_atomic_fetch_add(&srv->connections_active, 1);
+        }
+    }
+
     /* Install event handlers */
     c->read->handler  = ngx_stream_xrootd_recv;
     c->write->handler = ngx_stream_xrootd_send;
@@ -859,6 +1080,16 @@ ngx_stream_xrootd_recv(ngx_event_t *rev)
             return;
         }
 
+        if (ctx->state == XRD_ST_AIO) {
+            /* Async file I/O is in flight.  Buffer any arriving client data
+             * but don't process it yet — the completion handler will re-arm
+             * the read event once the I/O finishes. */
+            if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+                goto fatal;
+            }
+            return;
+        }
+
         /* ---------------------------------------------------------- */
         /* Determine where to put incoming bytes and how many we need  */
         /* ---------------------------------------------------------- */
@@ -886,10 +1117,26 @@ ngx_stream_xrootd_recv(ngx_event_t *rev)
             goto process;
         }
 
+        /*
+         * Force an actual recv(2) syscall each iteration.
+         *
+         * nginx uses EPOLLRDHUP edge-triggered epoll.  When the kernel
+         * signals a hang-up (RDHUP), nginx sets rev->available = 0 and the
+         * c->recv() shim skips the syscall entirely, returning NGX_AGAIN.
+         * Setting available = -1 tells the shim to call recv() unconditionally.
+         * Without this, connections stall after the client half-closes its
+         * write side (which is how xrdcp signals end-of-upload).
+         */
+        rev->available = -1;
         n = c->recv(c, dest, need);
 
         if (n == NGX_AGAIN) {
             /* No data right now; wait for the next read event */
+            ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                          "xrootd: recv AGAIN st=%d hdr_pos=%uz avail=%d"
+                          " ready=%d active=%d",
+                          (int)ctx->state, ctx->hdr_pos,
+                          rev->available, (int)rev->ready, (int)rev->active);
             if (ngx_handle_read_event(rev, 0) != NGX_OK) {
                 goto fatal;
             }
@@ -945,6 +1192,13 @@ process:
             ngx_memcpy(ctx->cur_body, hdr->body, 16);
             ctx->cur_dlen        = (uint32_t) ntohl(hdr->dlen);
 
+            ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                          "xrootd: req sid=[%02xd%02xd] reqid=%04xd dlen=%uz"
+                          " avail=%d ready=%d",
+                          (int)ctx->cur_streamid[0], (int)ctx->cur_streamid[1],
+                          (int)ctx->cur_reqid, (size_t)ctx->cur_dlen,
+                          c->read->available, (int)c->read->ready);
+
             {
                 /* Write payloads (pgwrite/write/writev) can be up to 16 MiB.
                  * All other payloads are paths, tokens, or small metadata. */
@@ -953,6 +1207,9 @@ process:
                     ctx->cur_reqid == kXR_write   ||
                     ctx->cur_reqid == kXR_writev) {
                     max_pl = XROOTD_MAX_WRITE_PAYLOAD;
+                } else if (ctx->cur_reqid == kXR_readv) {
+                    /* readv payload = up to 1024 readahead_list structs = 16 KiB */
+                    max_pl = XROOTD_READV_MAXSEGS * XROOTD_READV_SEGSIZE;
                 } else {
                     max_pl = XROOTD_MAX_PATH + 64;
                 }
@@ -984,7 +1241,15 @@ process:
                 goto fatal;
             }
 
-            /* Reset for next request (dispatch may have set SENDING) */
+            /* Reset for next request (dispatch may have set SENDING or AIO) */
+            if (ctx->state == XRD_ST_AIO) {
+                /* Re-arm the read event so epoll wakes us when the client
+                 * sends its next request (after the AIO response is sent). */
+                if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+                    goto fatal;
+                }
+                return;   /* async I/O posted — resume loop when I/O completes */
+            }
             if (ctx->state != XRD_ST_SENDING) {
                 ctx->state   = XRD_ST_REQ_HEADER;
                 ctx->hdr_pos = 0;
@@ -1014,6 +1279,26 @@ fatal:
 
 /* ================================================================== */
 /*  Write event handler — drains the pending write buffer              */
+/*                                                                      */
+/*  This handler runs when the OS send buffer has room after a prior   */
+/*  c->send() returned EAGAIN (stored in ctx->wbuf, state=SENDING).    */
+/*                                                                      */
+/*  Race condition to guard against                                     */
+/*  ─────────────────────────────────                                   */
+/*  After transitioning to SENDING and arming the write event, the AIO  */
+/*  completion path (xrootd_read_aio_done / xrootd_write_aio_done) can  */
+/*  fire first via ngx_post_event and advance the state to AIO,         */
+/*  REQ_PAYLOAD, or REQ_HEADER before the write handler runs.           */
+/*                                                                      */
+/*  If the write handler unconditionally resets to REQ_HEADER and calls */
+/*  ngx_stream_xrootd_recv(), a second concurrent AIO is dispatched.   */
+/*  Both AIOs then race to overwrite ctx->wbuf, silently discarding     */
+/*  part of a response and corrupting the TCP stream.  Clients receive  */
+/*  a truncated response and hang waiting for the missing bytes.        */
+/*                                                                      */
+/*  Fix: only proceed to REQ_HEADER+recv if state is still SENDING.    */
+/*  Any other state means the pipeline already advanced correctly via   */
+/*  the read-event path; just return.                                   */
 /* ================================================================== */
 
 static void
@@ -1050,9 +1335,31 @@ ngx_stream_xrootd_send(ngx_event_t *wev)
         return;
     }
 
-    /* All data sent — resume reading */
+    /* All data sent.
+     *
+     * Only transition back to reading if we are still in XRD_ST_SENDING.
+     * Between arming the write event and the write completing, the posted
+     * read event may have already fired and advanced the state machine to
+     * XRD_ST_AIO, XRD_ST_REQ_PAYLOAD, or even XRD_ST_REQ_HEADER.
+     * Overwriting those states would corrupt the pipeline.
+     *
+     * In those cases return immediately; the state machine is already
+     * advancing correctly via the read-event path.
+     */
+    if (ctx->state != XRD_ST_SENDING) {
+        ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                      "xrootd: send_done (state=%d, no recv) avail=%d ready=%d active=%d",
+                      (int)ctx->state,
+                      c->read->available, (int)c->read->ready,
+                      (int)c->read->active);
+        return;
+    }
+
     ctx->state   = XRD_ST_REQ_HEADER;
     ctx->hdr_pos = 0;
+    ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                  "xrootd: send_done avail=%d ready=%d active=%d",
+                  c->read->available, (int)c->read->ready, (int)c->read->active);
     ngx_stream_xrootd_recv(c->read);
 }
 
@@ -1069,9 +1376,16 @@ ngx_stream_xrootd_send(ngx_event_t *wev)
  *
  * Returns NGX_OK (all sent or queued), NGX_ERROR on failure.
  */
+/*
+ * xrootd_queue_response_base — like xrootd_queue_response but also saves
+ * `base` into ctx->wbuf_base so that xrootd_flush_pending can ngx_pfree it
+ * once the buffer has been fully drained.  Pass NULL for `base` when the
+ * caller does not need deferred freeing (e.g. stack-allocated or small buffers
+ * that the pool can reclaim at connection close).
+ */
 static ngx_int_t
-xrootd_queue_response(xrootd_ctx_t *ctx, ngx_connection_t *c,
-                      u_char *buf, size_t len)
+xrootd_queue_response_base(xrootd_ctx_t *ctx, ngx_connection_t *c,
+                            u_char *buf, size_t len, u_char *base)
 {
     ssize_t n;
 
@@ -1083,11 +1397,12 @@ xrootd_queue_response(xrootd_ctx_t *ctx, ngx_connection_t *c,
             continue;
         }
         if (n == NGX_AGAIN) {
-            /* Store unsent remainder */
-            ctx->wbuf     = buf;
-            ctx->wbuf_len = len;
-            ctx->wbuf_pos = 0;
-            ctx->state    = XRD_ST_SENDING;
+            /* Store unsent remainder; track base for deferred ngx_pfree */
+            ctx->wbuf      = buf;
+            ctx->wbuf_len  = len;
+            ctx->wbuf_pos  = 0;
+            ctx->wbuf_base = base;   /* NULL → no deferred free */
+            ctx->state     = XRD_ST_SENDING;
 
             if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
                 return NGX_ERROR;
@@ -1096,7 +1411,15 @@ xrootd_queue_response(xrootd_ctx_t *ctx, ngx_connection_t *c,
         }
         return NGX_ERROR;
     }
+    /* Fully sent — caller is responsible for freeing `base` if non-NULL */
     return NGX_OK;
+}
+
+static ngx_int_t
+xrootd_queue_response(xrootd_ctx_t *ctx, ngx_connection_t *c,
+                      u_char *buf, size_t len)
+{
+    return xrootd_queue_response_base(ctx, c, buf, len, NULL);
 }
 
 /*
@@ -1123,6 +1446,11 @@ xrootd_flush_pending(xrootd_ctx_t *ctx, ngx_connection_t *c)
         return NGX_ERROR;
     }
 
+    /* Free large AIO response buffer if it was tracked for deferred release */
+    if (ctx->wbuf_base) {
+        ngx_pfree(c->pool, ctx->wbuf_base);
+        ctx->wbuf_base = NULL;
+    }
     ctx->wbuf     = NULL;
     ctx->wbuf_len = 0;
     ctx->wbuf_pos = 0;
@@ -1341,6 +1669,13 @@ xrootd_dispatch(xrootd_ctx_t *ctx, ngx_connection_t *c,
         }
         return xrootd_handle_rm(ctx, c, conf);
 
+    case kXR_readv:
+        if (!ctx->logged_in || !ctx->auth_done) {
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "authentication required");
+        }
+        return xrootd_handle_readv(ctx, c);
+
     case kXR_writev:
         if (!conf->allow_write) {
             return xrootd_send_error(ctx, c, kXR_fsReadOnly,
@@ -1369,6 +1704,13 @@ xrootd_dispatch(xrootd_ctx_t *ctx, ngx_connection_t *c,
                                      "this is a read-only server");
         }
         return xrootd_handle_chmod(ctx, c, conf);
+
+    case kXR_query:
+        if (!ctx->logged_in || !ctx->auth_done) {
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "authentication required");
+        }
+        return xrootd_handle_query(ctx, c, conf);
 
     default:
         ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
@@ -1514,6 +1856,7 @@ xrootd_handle_login(xrootd_ctx_t *ctx, ngx_connection_t *c,
 
         ctx->session_start = ngx_current_msec;
         xrootd_log_access(ctx, c, "LOGIN", "-", user, 1, 0, NULL, 0);
+        XROOTD_OP_OK(ctx, XROOTD_OP_LOGIN);
 
         return xrootd_queue_response(ctx, c, buf, total);
     }
@@ -1569,6 +1912,7 @@ xrootd_handle_login(xrootd_ctx_t *ctx, ngx_connection_t *c,
         ctx->session_start = ngx_current_msec;
         /* Log the login event; identity will be filled in after kXGC_cert */
         xrootd_log_access(ctx, c, "LOGIN", "-", user, 1, 0, NULL, 0);
+        XROOTD_OP_OK(ctx, XROOTD_OP_LOGIN);
 
         return xrootd_queue_response(ctx, c, buf, total);
     }
@@ -2572,6 +2916,7 @@ xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c)
     if (chain == NULL) {
         xrootd_log_access(ctx, c, "AUTH", "-", "gsi",
                           0, kXR_NotAuthorized, "cannot parse GSI credential", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_AUTH);
         return xrootd_send_error(ctx, c, kXR_NotAuthorized,
                                  "cannot parse GSI credential");
     }
@@ -2617,6 +2962,7 @@ xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c)
                       "xrootd: GSI cert verification failed: %s", verr_str);
         xrootd_log_access(ctx, c, "AUTH", "-", "gsi",
                           0, kXR_NotAuthorized, verr_str, 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_AUTH);
         X509_STORE_CTX_free(vctx);
         sk_X509_pop_free(chain, X509_free);
         return xrootd_send_error(ctx, c, kXR_NotAuthorized,
@@ -2643,6 +2989,7 @@ xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c)
 
     /* Log the completed auth — identity (DN) is now populated in ctx->dn */
     xrootd_log_access(ctx, c, "AUTH", "-", "gsi", 1, 0, NULL, 0);
+    XROOTD_OP_OK(ctx, XROOTD_OP_AUTH);
 
     return xrootd_send_ok(ctx, c, NULL, 0);
 }
@@ -2652,6 +2999,7 @@ static ngx_int_t
 xrootd_handle_ping(xrootd_ctx_t *ctx, ngx_connection_t *c)
 {
     xrootd_log_access(ctx, c, "PING", "-", "-", 1, 0, NULL, 0);
+    XROOTD_OP_OK(ctx, XROOTD_OP_PING);
     return xrootd_send_ok(ctx, c, NULL, 0);
 }
 
@@ -2675,10 +3023,451 @@ xrootd_handle_ping(xrootd_ctx_t *ctx, ngx_connection_t *c)
  * a separate lseek call.  This also makes concurrent writes safe if the
  * kernel delivers them in order (which it will for a single TCP stream).
  */
+/* ================================================================== */
+/*  Async I/O helpers — thread pool support for blocking file I/O     */
+/* ================================================================== */
+
+/*
+ * xrootd_build_read_response — allocate and return the chunked kXR_read
+ * response buffer.  Called from the sync path and from the AIO completion.
+ *
+ * Returns NULL on allocation failure (caller should return NGX_ERROR).
+ */
+static u_char *
+xrootd_build_read_response(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    u_char *databuf, size_t data_total, size_t *rsp_total_out)
+{
+    size_t   n_chunks, last_size, rsp_total;
+    u_char  *rspbuf;
+    size_t   ri, di;
+
+    n_chunks = (data_total + XROOTD_READ_MAX - 1) / XROOTD_READ_MAX;
+    if (n_chunks == 0) { n_chunks = 1; }
+    last_size = data_total % XROOTD_READ_MAX;
+    if (last_size == 0 && data_total > 0) { last_size = XROOTD_READ_MAX; }
+
+    rsp_total = n_chunks * XRD_RESPONSE_HDR_LEN + data_total;
+    rspbuf    = ngx_palloc(c->pool, rsp_total);
+    if (rspbuf == NULL) { return NULL; }
+
+    ri = 0; di = 0;
+    for (size_t chunk = 0; chunk < n_chunks; chunk++) {
+        size_t   chunk_data = (chunk < n_chunks - 1) ? XROOTD_READ_MAX : last_size;
+        uint16_t status     = (chunk == n_chunks - 1) ? kXR_ok : kXR_oksofar;
+
+        xrootd_build_resp_hdr(ctx->cur_streamid, status,
+                              (uint32_t) chunk_data,
+                              (ServerResponseHdr *)(rspbuf + ri));
+        ri += XRD_RESPONSE_HDR_LEN;
+        ngx_memcpy(rspbuf + ri, databuf + di, chunk_data);
+        ri += chunk_data;
+        di += chunk_data;
+    }
+
+    *rsp_total_out = rsp_total;
+    return rspbuf;
+}
+
+/*
+ * xrootd_build_readv_response — build and return the chunked kXR_readv
+ * response buffer from a pre-assembled databuf (readahead_list headers
+ * + data bytes already in place).
+ */
+static u_char *
+xrootd_build_readv_response(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    u_char *databuf, size_t rsp_total, size_t *out_size)
+{
+    size_t   n_chunks, last_size, buf_size;
+    u_char  *rspbuf;
+    size_t   ri, di;
+
+    n_chunks = (rsp_total + XROOTD_READ_MAX - 1) / XROOTD_READ_MAX;
+    if (n_chunks == 0) { n_chunks = 1; }
+    last_size = rsp_total % XROOTD_READ_MAX;
+    if (last_size == 0 && rsp_total > 0) { last_size = XROOTD_READ_MAX; }
+
+    buf_size = n_chunks * XRD_RESPONSE_HDR_LEN + rsp_total;
+    rspbuf   = ngx_palloc(c->pool, buf_size);
+    if (rspbuf == NULL) { return NULL; }
+
+    ri = 0; di = 0;
+    for (size_t chunk = 0; chunk < n_chunks; chunk++) {
+        size_t   chunk_data = (chunk < n_chunks - 1) ? XROOTD_READ_MAX : last_size;
+        uint16_t status     = (chunk == n_chunks - 1) ? kXR_ok : kXR_oksofar;
+
+        xrootd_build_resp_hdr(ctx->cur_streamid, status,
+                              (uint32_t) chunk_data,
+                              (ServerResponseHdr *)(rspbuf + ri));
+        ri += XRD_RESPONSE_HDR_LEN;
+        ngx_memcpy(rspbuf + ri, databuf + di, chunk_data);
+        ri += chunk_data;
+        di += chunk_data;
+    }
+
+    *out_size = buf_size;
+    return rspbuf;
+}
+
+#if (NGX_THREADS)
+
+/* ------------------------------------------------------------------ */
+/*  AIO task context structs                                            */
+/* ------------------------------------------------------------------ */
+
+/* kXR_read async task */
+typedef struct {
+    ngx_connection_t              *c;
+    xrootd_ctx_t                  *ctx;
+    ngx_stream_xrootd_srv_conf_t  *conf;
+
+    int       fd;
+    int       handle_idx;
+    off_t     offset;
+    size_t    rlen;
+    u_char   *databuf;
+
+    /* Saved request streamid (ctx may be reused by the time completion fires) */
+    u_char    streamid[2];
+
+    /* Result from pread() */
+    ssize_t   nread;
+    int       io_errno;
+} xrootd_read_aio_t;
+
+/* kXR_write / kXR_pgwrite async task */
+typedef struct {
+    ngx_connection_t              *c;
+    xrootd_ctx_t                  *ctx;
+    ngx_stream_xrootd_srv_conf_t  *conf;
+
+    int            fd;
+    int            handle_idx;
+    off_t          offset;        /* file offset to write at        */
+    const u_char  *data;          /* flat data buffer (no CRC gaps) */
+    size_t         len;           /* bytes to write                 */
+
+    /* Saved context for response / logging */
+    u_char         streamid[2];
+    char           path[PATH_MAX];
+    int64_t        req_offset;    /* original request offset        */
+    ngx_uint_t     is_pgwrite;    /* 1 = kXR_pgwrite, 0 = kXR_write */
+
+    /* Result */
+    ssize_t        nwritten;
+    int            io_errno;
+
+    /* Pool-allocated payload buffer to free after pwrite() completes */
+    u_char        *payload_to_free;
+} xrootd_write_aio_t;
+
+/* kXR_readv per-segment descriptor for the thread */
+typedef struct {
+    int       fd;
+    int       handle_idx;
+    off_t     offset;
+    uint32_t  rlen;
+    u_char   *hdr_rlen_ptr;  /* pointer to rlen field in databuf (to patch) */
+    u_char   *data_ptr;      /* pointer to data area in databuf             */
+} xrootd_readv_seg_desc_t;
+
+/* kXR_readv async task */
+typedef struct {
+    ngx_connection_t              *c;
+    xrootd_ctx_t                  *ctx;
+
+    size_t                         n_segs;
+    xrootd_readv_seg_desc_t       *segs;     /* palloc'd array */
+    u_char                        *databuf;  /* full response body (pre-sized) */
+
+    u_char  streamid[2];
+
+    /* Written by thread */
+    size_t  bytes_total;
+    size_t  rsp_total;
+    int     io_error;
+    char    err_msg[64];
+} xrootd_readv_aio_t;
+
+/* ------------------------------------------------------------------ */
+/*  Thread handlers — run in the pool thread (blocking I/O is fine)   */
+/* ------------------------------------------------------------------ */
+
+static void
+xrootd_read_aio_thread(void *data, ngx_log_t *log)
+{
+    xrootd_read_aio_t *t = data;
+    t->nread = pread(t->fd, t->databuf, t->rlen, t->offset);
+    if (t->nread < 0) {
+        t->io_errno = errno;
+    }
+}
+
+static void
+xrootd_write_aio_thread(void *data, ngx_log_t *log)
+{
+    xrootd_write_aio_t *t = data;
+    t->nwritten = pwrite(t->fd, t->data, t->len, t->offset);
+    if (t->nwritten < 0) {
+        t->io_errno = errno;
+    }
+}
+
+static void
+xrootd_readv_aio_thread(void *data, ngx_log_t *log)
+{
+    xrootd_readv_aio_t *t = data;
+    size_t i;
+
+    t->bytes_total = 0;
+    t->io_error    = 0;
+    t->rsp_total   = 0;
+
+    for (i = 0; i < t->n_segs; i++) {
+        xrootd_readv_seg_desc_t *seg = &t->segs[i];
+        ssize_t nread;
+
+        nread = pread(seg->fd, seg->data_ptr, (size_t) seg->rlen, seg->offset);
+        if (nread < 0) {
+            t->io_error = 1;
+            snprintf(t->err_msg, sizeof(t->err_msg),
+                     "readv I/O error at seg %d: %s", (int) i, strerror(errno));
+            return;
+        }
+        if ((uint32_t) nread < seg->rlen) {
+            t->io_error = 2;
+            snprintf(t->err_msg, sizeof(t->err_msg),
+                     "readv past EOF at seg %d", (int) i);
+            return;
+        }
+        /* Patch the response readahead_list rlen field with actual bytes */
+        uint32_t rlen_be = htonl((uint32_t) nread);
+        ngx_memcpy(seg->hdr_rlen_ptr, &rlen_be, 4);
+
+        t->bytes_total += (size_t) nread;
+    }
+
+    /* Total response body = N headers (16 B each) + all data bytes */
+    t->rsp_total = t->n_segs * XROOTD_READV_SEGSIZE + t->bytes_total;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Completion handlers — run in the event loop after thread finishes  */
+/*                                                                      */
+/*  Execution model                                                     */
+/*  ────────────────                                                    */
+/*  Thread-pool tasks (xrootd_*_aio_thread) run in a worker thread.   */
+/*  When the task finishes, nginx posts the task->event to the main    */
+/*  event loop via the eventfd mechanism.  The completion handler      */
+/*  (task->event.handler = xrootd_*_aio_done) then runs in the main   */
+/*  thread — the same thread that drives the nginx event loop — so     */
+/*  there are no data races on ctx or c.                               */
+/*                                                                      */
+/*  After building and queuing the response each handler calls         */
+/*  xrootd_aio_resume() to post the read event.  This ensures the     */
+/*  client's next request is processed in the same epoll iteration     */
+/*  rather than waiting for the next kernel notification.              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * xrootd_aio_resume — re-enter the XRootD read loop after AIO completion.
+ *
+ * Uses ngx_post_event() to schedule ngx_stream_xrootd_recv() at the end of
+ * the current epoll iteration.  Any data the client already buffered is
+ * consumed immediately without an extra epoll round-trip.
+ *
+ * ngx_handle_read_event() is called first only if the read event is not
+ * already active/ready; it is a no-op otherwise.
+ */
+static void
+xrootd_aio_resume(ngx_connection_t *c)
+{
+    ngx_event_t *rev = c->read;
+    ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                  "xrootd: aio_resume avail=%d ready=%d active=%d posted=%d",
+                  rev->available, (int)rev->ready,
+                  (int)rev->active, (int)rev->posted);
+    if (!rev->active && !rev->ready) {
+        if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+            ngx_stream_finalize_session(c->data, NGX_STREAM_INTERNAL_SERVER_ERROR);
+        }
+    }
+    ngx_post_event(rev, &ngx_posted_events);
+}
+
+static void
+xrootd_read_aio_done(ngx_event_t *ev)
+{
+    ngx_thread_task_t  *task = ev->data;
+    xrootd_read_aio_t  *t   = task->ctx;
+    xrootd_ctx_t       *ctx = t->ctx;
+    ngx_connection_t   *c   = t->c;
+    size_t              rsp_total;
+    u_char             *rspbuf;
+
+    if (ctx->destroyed) {
+        return;   /* connection gone; pool may already be freed */
+    }
+
+    /* Restore the saved streamid so xrootd_build_read_response uses it */
+    ctx->cur_streamid[0] = t->streamid[0];
+    ctx->cur_streamid[1] = t->streamid[1];
+
+    if (t->nread < 0) {
+        ctx->state = XRD_ST_REQ_HEADER;
+        ctx->hdr_pos = 0;
+        ngx_pfree(c->pool, t->databuf);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_READ);
+        xrootd_send_error(ctx, c, kXR_IOError,
+                          t->io_errno ? strerror(t->io_errno) : "async read error");
+        xrootd_aio_resume(c);
+        return;
+    }
+
+    ctx->files[t->handle_idx].bytes_read += (size_t) t->nread;
+    ctx->session_bytes                   += (size_t) t->nread;
+    XROOTD_OP_OK(ctx, XROOTD_OP_READ);
+
+    rspbuf = xrootd_build_read_response(ctx, c,
+                                        t->databuf, (size_t) t->nread,
+                                        &rsp_total);
+    /* databuf has been copied into rspbuf; release it now */
+    ngx_pfree(c->pool, t->databuf);
+
+    if (rspbuf == NULL) {
+        ctx->state = XRD_ST_REQ_HEADER;
+        xrootd_aio_resume(c);
+        return;
+    }
+
+    ctx->state   = XRD_ST_REQ_HEADER;
+    ctx->hdr_pos = 0;
+
+    /* Pass rspbuf as the pool-allocated base so xrootd_flush_pending can
+     * free it once the entire response has been written to the socket. */
+    xrootd_queue_response_base(ctx, c, rspbuf, rsp_total, rspbuf);
+    if (ctx->state != XRD_ST_SENDING) {
+        /* Fully sent inline — free the response buffer now */
+        ngx_pfree(c->pool, rspbuf);
+    }
+    xrootd_aio_resume(c);
+}
+
+static void
+xrootd_write_aio_done(ngx_event_t *ev)
+{
+    ngx_thread_task_t   *task = ev->data;
+    xrootd_write_aio_t  *t   = task->ctx;
+    xrootd_ctx_t        *ctx = t->ctx;
+    ngx_connection_t    *c   = t->c;
+    char                 detail[64];
+    ngx_int_t            op  = t->is_pgwrite ? XROOTD_OP_WRITE : XROOTD_OP_WRITE;
+
+    if (ctx->destroyed) { return; }
+
+    ctx->cur_streamid[0] = t->streamid[0];
+    ctx->cur_streamid[1] = t->streamid[1];
+    ctx->state   = XRD_ST_REQ_HEADER;
+    ctx->hdr_pos = 0;
+
+    /* Free the payload buffer (written to disk; no longer needed) */
+    if (t->payload_to_free) {
+        ngx_pfree(c->pool, t->payload_to_free);
+    }
+
+    snprintf(detail, sizeof(detail), "%lld+%zu",
+             (long long) t->req_offset, t->len);
+
+    if (t->nwritten < 0) {
+        xrootd_log_access(ctx, c, "WRITE", t->path, detail,
+                          0, kXR_IOError,
+                          t->io_errno ? strerror(t->io_errno) : "async write error",
+                          0);
+        XROOTD_OP_ERR(ctx, op);
+        xrootd_send_error(ctx, c, kXR_IOError,
+                          t->io_errno ? strerror(t->io_errno) : "async write error");
+        xrootd_aio_resume(c);
+        return;
+    }
+
+    if ((size_t) t->nwritten < t->len) {
+        xrootd_log_access(ctx, c, "WRITE", t->path, detail,
+                          0, kXR_IOError, "short write (disk full?)", 0);
+        XROOTD_OP_ERR(ctx, op);
+        xrootd_send_error(ctx, c, kXR_IOError, "short write (disk full?)");
+        xrootd_aio_resume(c);
+        return;
+    }
+
+    ctx->files[t->handle_idx].bytes_written += (size_t) t->nwritten;
+    ctx->session_bytes_written              += (size_t) t->nwritten;
+
+    xrootd_log_access(ctx, c, "WRITE", t->path, detail,
+                      1, 0, NULL, (size_t) t->nwritten);
+    XROOTD_OP_OK(ctx, op);
+
+    if (t->is_pgwrite) {
+        xrootd_send_pgwrite_status(ctx, c, t->req_offset + (int64_t) t->nwritten);
+    } else {
+        xrootd_send_ok(ctx, c, NULL, 0);
+    }
+
+    xrootd_aio_resume(c);
+}
+
+static void
+xrootd_readv_aio_done(ngx_event_t *ev)
+{
+    ngx_thread_task_t   *task = ev->data;
+    xrootd_readv_aio_t  *t   = task->ctx;
+    xrootd_ctx_t        *ctx = t->ctx;
+    ngx_connection_t    *c   = t->c;
+    size_t               out_size;
+    u_char              *rspbuf;
+
+    if (ctx->destroyed) { return; }
+
+    ctx->cur_streamid[0] = t->streamid[0];
+    ctx->cur_streamid[1] = t->streamid[1];
+    ctx->state   = XRD_ST_REQ_HEADER;
+    ctx->hdr_pos = 0;
+
+    if (t->io_error) {
+        ngx_pfree(c->pool, t->databuf);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_READV);
+        xrootd_send_error(ctx, c, kXR_IOError, t->err_msg);
+        xrootd_aio_resume(c);
+        return;
+    }
+
+    XROOTD_OP_OK(ctx, XROOTD_OP_READV);
+    ctx->session_bytes += t->bytes_total;
+
+    rspbuf = xrootd_build_readv_response(ctx, c,
+                                         t->databuf, t->rsp_total,
+                                         &out_size);
+    /* databuf has been copied into rspbuf; release it now */
+    ngx_pfree(c->pool, t->databuf);
+
+    if (rspbuf == NULL) {
+        xrootd_aio_resume(c);
+        return;
+    }
+
+    xrootd_queue_response_base(ctx, c, rspbuf, out_size, rspbuf);
+    if (ctx->state != XRD_ST_SENDING) {
+        ngx_pfree(c->pool, rspbuf);
+    }
+    xrootd_aio_resume(c);
+}
+
+#endif /* NGX_THREADS */
+
 static ngx_int_t
 xrootd_handle_write(xrootd_ctx_t *ctx, ngx_connection_t *c)
 {
-    ClientWriteRequest *req = (ClientWriteRequest *) ctx->hdr_buf;
+    ClientWriteRequest           *req  = (ClientWriteRequest *) ctx->hdr_buf;
+    ngx_stream_xrootd_srv_conf_t *conf =
+        ngx_stream_get_module_srv_conf((ngx_stream_session_t *)(c->data), ngx_stream_xrootd_module);
     int     idx    = (int)(unsigned char) req->fhandle[0];
     int64_t offset = (int64_t) be64toh((uint64_t) req->offset);
     size_t  wlen   = ctx->cur_dlen;
@@ -2688,6 +3477,7 @@ xrootd_handle_write(xrootd_ctx_t *ctx, ngx_connection_t *c)
     if (idx < 0 || idx >= XROOTD_MAX_FILES || ctx->files[idx].fd < 0) {
         xrootd_log_access(ctx, c, "WRITE", "-", "-",
                           0, kXR_FileNotOpen, "invalid file handle", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_WRITE);
         return xrootd_send_error(ctx, c, kXR_FileNotOpen,
                                  "invalid file handle");
     }
@@ -2695,15 +3485,59 @@ xrootd_handle_write(xrootd_ctx_t *ctx, ngx_connection_t *c)
     if (!ctx->files[idx].writable) {
         xrootd_log_access(ctx, c, "WRITE", ctx->files[idx].path, "-",
                           0, kXR_NotAuthorized, "file not open for writing", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_WRITE);
         return xrootd_send_error(ctx, c, kXR_NotAuthorized,
                                  "file not open for writing");
     }
 
     if (wlen == 0) {
+        XROOTD_OP_OK(ctx, XROOTD_OP_WRITE);
         return xrootd_send_ok(ctx, c, NULL, 0);
     }
 
-    /* pwrite handles the offset; no lseek needed */
+#if (NGX_THREADS)
+    if (conf->thread_pool != NULL) {
+        ngx_thread_task_t   *task;
+        xrootd_write_aio_t  *t;
+
+        task = ngx_thread_task_alloc(c->pool, sizeof(xrootd_write_aio_t));
+        if (task == NULL) { return NGX_ERROR; }
+
+        t = task->ctx;
+        t->c               = c;
+        t->ctx             = ctx;
+        t->conf            = conf;
+        t->fd              = ctx->files[idx].fd;
+        t->handle_idx      = idx;
+        t->offset          = (off_t) offset;
+        t->data            = ctx->payload ? ctx->payload : (u_char *) "";
+        t->len             = wlen;
+        t->req_offset      = offset;
+        t->is_pgwrite      = 0;
+        t->nwritten        = -1;
+        t->io_errno        = 0;
+        t->payload_to_free = ctx->payload;   /* freed in done handler */
+        t->streamid[0]     = ctx->cur_streamid[0];
+        t->streamid[1]     = ctx->cur_streamid[1];
+        ngx_memcpy(t->path, ctx->files[idx].path, sizeof(t->path));
+
+        task->handler       = xrootd_write_aio_thread;
+        task->event.handler = xrootd_write_aio_done;
+        task->event.data    = task;
+
+        if (ngx_thread_task_post(conf->thread_pool, task) != NGX_OK) {
+            ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                          "xrootd: thread_task_post failed, falling back to sync write");
+            goto sync_write;
+        }
+
+        ctx->state = XRD_ST_AIO;
+        return NGX_OK;
+    }
+
+sync_write:
+#endif /* NGX_THREADS */
+
     nwritten = pwrite(ctx->files[idx].fd,
                       ctx->payload ? ctx->payload : (u_char *) "",
                       wlen, (off_t) offset);
@@ -2714,62 +3548,67 @@ xrootd_handle_write(xrootd_ctx_t *ctx, ngx_connection_t *c)
     if (nwritten < 0) {
         xrootd_log_access(ctx, c, "WRITE", ctx->files[idx].path,
                           write_detail, 0, kXR_IOError, strerror(errno), 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_WRITE);
         return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
     }
 
     if ((size_t) nwritten < wlen) {
-        /* Short write — usually ENOSPC */
         xrootd_log_access(ctx, c, "WRITE", ctx->files[idx].path,
                           write_detail, 0, kXR_IOError, "short write (disk full?)", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_WRITE);
         return xrootd_send_error(ctx, c, kXR_IOError, "short write (disk full?)");
     }
 
     ctx->files[idx].bytes_written  += (size_t) nwritten;
     ctx->session_bytes_written     += (size_t) nwritten;
 
-    ngx_log_debug3(NGX_LOG_DEBUG_STREAM, c->log, 0,
-                   "xrootd: kXR_write handle=%d offset=%L len=%uz",
-                   idx, offset, wlen);
-
     xrootd_log_access(ctx, c, "WRITE", ctx->files[idx].path,
                       write_detail, 1, 0, NULL, (size_t) nwritten);
+    XROOTD_OP_OK(ctx, XROOTD_OP_WRITE);
 
     return xrootd_send_ok(ctx, c, NULL, 0);
 }
 
 /*
- * kXR_pgwrite — paged write with per-page CRC32 checksums.
+ * kXR_pgwrite — paged write with per-page CRC32c checksums.
  *
- * Used by modern xrdcp (XRootD v5+) instead of kXR_write.
+ * Used by modern xrdcp (XRootD v5+) in preference to kXR_write.
  *
- * Payload layout:
- *   For each 4096-byte page: [4096 bytes of data] [4 bytes CRC32 BE]
- *   The last page may carry fewer than 4096 data bytes but always has 4 bytes CRC32.
+ * Payload layout (CRC comes FIRST, not last):
+ *   [4 bytes CRC32c][up to 4096 bytes data] per page, back-to-back.
+ *   The last page may carry fewer than 4096 data bytes but still has 4 bytes CRC32c.
+ *   CRC32c uses the Castagnoli polynomial (not generic CRC32).
  *
- * We strip the CRC32 trailers and write the raw data pages using pwrite().
- * CRC32 verification is intentionally skipped — the TCP checksum already
- * ensures integrity on loopback and LAN, and verifying would require a full
- * CRC32 implementation for no practical benefit in this deployment context.
+ * We strip the CRC32c fields to produce a flat data buffer, then write it
+ * with a single pwrite() — either synchronously or via the thread pool.
+ * CRC32c verification is intentionally skipped: the TCP checksum already
+ * ensures integrity on loopback and LAN.
  *
- * The response for a successful pgwrite is kXR_ok with dlen=0 (no error
- * vector needed since we don't report per-page checksum failures).
+ * Response format: kXR_status (NOT plain kXR_ok).
+ *   The xrdcp v5 client parses pgwrite responses as ServerResponseV2
+ *   (32 bytes: 8-byte header + 16-byte Status body + 8-byte pgWrite body).
+ *   Sending a plain 8-byte kXR_ok causes the client to read 24 bytes past
+ *   the end of the response buffer and crash.  See xrootd_send_pgwrite_status().
  */
 static ngx_int_t
 xrootd_handle_pgwrite(xrootd_ctx_t *ctx, ngx_connection_t *c)
 {
-    ClientPgWriteRequest *req = (ClientPgWriteRequest *) ctx->hdr_buf;
-    int     idx    = (int)(unsigned char) req->fhandle[0];
-    int64_t offset = (int64_t) be64toh((uint64_t) req->offset);
-    size_t  dlen   = ctx->cur_dlen;
+    ClientPgWriteRequest         *req  = (ClientPgWriteRequest *) ctx->hdr_buf;
+    ngx_stream_xrootd_srv_conf_t *conf =
+        ngx_stream_get_module_srv_conf((ngx_stream_session_t *)(c->data), ngx_stream_xrootd_module);
+    int     idx     = (int)(unsigned char) req->fhandle[0];
+    int64_t offset  = (int64_t) be64toh((uint64_t) req->offset);
+    size_t  dlen    = ctx->cur_dlen;
     u_char *payload = ctx->payload;
     int64_t write_offset;
-    size_t  remain, page_data, total_written;
+    size_t  page_data, total_written;
     ssize_t nw;
     char    write_detail[64];
 
     if (idx < 0 || idx >= XROOTD_MAX_FILES || ctx->files[idx].fd < 0) {
         xrootd_log_access(ctx, c, "WRITE", "-", "-",
                           0, kXR_FileNotOpen, "invalid file handle", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_WRITE);
         return xrootd_send_error(ctx, c, kXR_FileNotOpen,
                                  "invalid file handle");
     }
@@ -2777,78 +3616,127 @@ xrootd_handle_pgwrite(xrootd_ctx_t *ctx, ngx_connection_t *c)
     if (!ctx->files[idx].writable) {
         xrootd_log_access(ctx, c, "WRITE", ctx->files[idx].path, "-",
                           0, kXR_NotAuthorized, "file not open for writing", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_WRITE);
         return xrootd_send_error(ctx, c, kXR_NotAuthorized,
                                  "file not open for writing");
     }
 
     if (payload == NULL || dlen == 0) {
+        XROOTD_OP_OK(ctx, XROOTD_OP_WRITE);
         return xrootd_send_ok(ctx, c, NULL, 0);
     }
 
     /*
-     * Walk the payload.  The xrdcp client sends units in the order:
-     *   [4-byte CRC32 BE] [page data (1..4096 bytes)]
+     * Strip interleaved 4-byte CRC32c fields from the pgwrite payload to
+     * produce a flat data buffer for pwrite().
      *
-     * The first page may be shorter than 4096 bytes if the file is small or
-     * the write offset is not page-aligned.  Subsequent pages are always 4096
-     * bytes.  We discard the CRC32 (TCP already provides integrity) and write
-     * only the raw data.
+     * Payload layout (CRC first):
+     *   [XRD_PGWRITE_CKSZ=4 bytes CRC32c][up to XRD_PGWRITE_PAGESZ=4096 bytes data]
+     * repeated for each page.  The last page may have fewer than 4096 data
+     * bytes.  The CRC32c values are discarded.
      */
-    write_offset  = offset;
-    remain        = dlen;
-    total_written = 0;
+    {
+        u_char *flat    = ngx_palloc(c->pool, dlen);   /* upper bound */
+        u_char *src     = payload;
+        u_char *dst;
+        size_t  rem     = dlen;
+        size_t  flat_sz = 0;
 
-    while (remain > XRD_PGWRITE_CKSZ) {
-        /* Skip the 4-byte CRC32 that precedes the page data */
-        payload += XRD_PGWRITE_CKSZ;
-        remain  -= XRD_PGWRITE_CKSZ;
+        if (flat == NULL) { return NGX_ERROR; }
+        dst = flat;
 
-        /* Data bytes in this page: full 4096 unless it's the last page */
-        page_data = (remain >= XRD_PGWRITE_PAGESZ) ? XRD_PGWRITE_PAGESZ : remain;
-
-        nw = pwrite(ctx->files[idx].fd, payload, page_data, (off_t) write_offset);
-        if (nw < 0) {
-            snprintf(write_detail, sizeof(write_detail), "%lld+%zu",
-                     (long long) offset, total_written);
-            xrootd_log_access(ctx, c, "WRITE", ctx->files[idx].path,
-                              write_detail, 0, kXR_IOError, strerror(errno), 0);
-            return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
+        while (rem > XRD_PGWRITE_CKSZ) {
+            src += XRD_PGWRITE_CKSZ;
+            rem -= XRD_PGWRITE_CKSZ;
+            page_data = (rem >= XRD_PGWRITE_PAGESZ) ? XRD_PGWRITE_PAGESZ : rem;
+            ngx_memcpy(dst, src, page_data);
+            dst     += page_data;
+            src     += page_data;
+            rem     -= page_data;
+            flat_sz += page_data;
         }
 
-        if ((size_t) nw < page_data) {
-            snprintf(write_detail, sizeof(write_detail), "%lld+%zu",
-                     (long long) offset, total_written);
-            xrootd_log_access(ctx, c, "WRITE", ctx->files[idx].path,
-                              write_detail, 0, kXR_IOError, "short write (disk full?)", 0);
-            return xrootd_send_error(ctx, c, kXR_IOError, "short write (disk full?)");
+#if (NGX_THREADS)
+        if (conf->thread_pool != NULL) {
+            ngx_thread_task_t   *task;
+            xrootd_write_aio_t  *t;
+
+            task = ngx_thread_task_alloc(c->pool, sizeof(xrootd_write_aio_t));
+            if (task == NULL) { return NGX_ERROR; }
+
+            t = task->ctx;
+            t->c               = c;
+            t->ctx             = ctx;
+            t->conf            = conf;
+            t->fd              = ctx->files[idx].fd;
+            t->handle_idx      = idx;
+            t->offset          = (off_t) offset;
+            t->data            = flat;
+            t->len             = flat_sz;
+            t->req_offset      = offset;
+            t->is_pgwrite      = 1;
+            t->nwritten        = -1;
+            t->io_errno        = 0;
+            t->payload_to_free = flat;   /* freed in done handler */
+            t->streamid[0]     = ctx->cur_streamid[0];
+            t->streamid[1]     = ctx->cur_streamid[1];
+            ngx_memcpy(t->path, ctx->files[idx].path, sizeof(t->path));
+
+            task->handler       = xrootd_write_aio_thread;
+            task->event.handler = xrootd_write_aio_done;
+            task->event.data    = task;
+
+            if (ngx_thread_task_post(conf->thread_pool, task) == NGX_OK) {
+                ctx->state = XRD_ST_AIO;
+                return NGX_OK;
+            }
+            ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                          "xrootd: thread_task_post failed, falling back to sync pgwrite");
+        }
+#endif /* NGX_THREADS */
+
+        /* Synchronous path: write the flat buffer page by page */
+        write_offset  = offset;
+        total_written = 0;
+        src = flat;
+        rem = flat_sz;
+
+        while (rem > 0) {
+            page_data = (rem >= XRD_PGWRITE_PAGESZ) ? XRD_PGWRITE_PAGESZ : rem;
+            nw = pwrite(ctx->files[idx].fd, src, page_data, (off_t) write_offset);
+            if (nw < 0) {
+                snprintf(write_detail, sizeof(write_detail), "%lld+%zu",
+                         (long long) offset, total_written);
+                xrootd_log_access(ctx, c, "WRITE", ctx->files[idx].path,
+                                  write_detail, 0, kXR_IOError, strerror(errno), 0);
+                XROOTD_OP_ERR(ctx, XROOTD_OP_WRITE);
+                return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
+            }
+            if ((size_t) nw < page_data) {
+                snprintf(write_detail, sizeof(write_detail), "%lld+%zu",
+                         (long long) offset, total_written);
+                xrootd_log_access(ctx, c, "WRITE", ctx->files[idx].path,
+                                  write_detail, 0, kXR_IOError, "short write (disk full?)", 0);
+                XROOTD_OP_ERR(ctx, XROOTD_OP_WRITE);
+                return xrootd_send_error(ctx, c, kXR_IOError, "short write (disk full?)");
+            }
+            total_written += (size_t) nw;
+            write_offset  += (int64_t) nw;
+            src           += page_data;
+            rem           -= page_data;
         }
 
-        total_written += (size_t) nw;
-        write_offset  += (int64_t) nw;
-        payload       += page_data;
-        remain        -= page_data;
+        ctx->files[idx].bytes_written += total_written;
+        ctx->session_bytes_written    += total_written;
+
+        snprintf(write_detail, sizeof(write_detail), "%lld+%zu",
+                 (long long) offset, total_written);
+        xrootd_log_access(ctx, c, "WRITE", ctx->files[idx].path,
+                          write_detail, 1, 0, NULL, total_written);
+        XROOTD_OP_OK(ctx, XROOTD_OP_WRITE);
+
+        return xrootd_send_pgwrite_status(ctx, c, write_offset);
     }
-
-    ctx->files[idx].bytes_written += total_written;
-    ctx->session_bytes_written    += total_written;
-
-    snprintf(write_detail, sizeof(write_detail), "%lld+%zu",
-             (long long) offset, total_written);
-
-    ngx_log_debug3(NGX_LOG_DEBUG_STREAM, c->log, 0,
-                   "xrootd: kXR_pgwrite handle=%d offset=%L wrote=%uz",
-                   idx, offset, total_written);
-
-    xrootd_log_access(ctx, c, "WRITE", ctx->files[idx].path,
-                      write_detail, 1, 0, NULL, total_written);
-
-    /*
-     * kXR_pgwrite requires a kXR_status response (not plain kXR_ok).
-     * The xrdcp v5 client parses the response as ServerResponseV2 which
-     * starts with a 24-byte ServerResponseStatus; a plain 8-byte kXR_ok
-     * causes the client to read past the buffer and crash.
-     */
-    return xrootd_send_pgwrite_status(ctx, c, write_offset);
 }
 
 /*
@@ -2866,6 +3754,7 @@ xrootd_handle_sync(xrootd_ctx_t *ctx, ngx_connection_t *c)
     if (idx < 0 || idx >= XROOTD_MAX_FILES || ctx->files[idx].fd < 0) {
         xrootd_log_access(ctx, c, "SYNC", "-", "-",
                           0, kXR_FileNotOpen, "invalid file handle", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_SYNC);
         return xrootd_send_error(ctx, c, kXR_FileNotOpen,
                                  "invalid file handle");
     }
@@ -2876,11 +3765,13 @@ xrootd_handle_sync(xrootd_ctx_t *ctx, ngx_connection_t *c)
     if (fsync(ctx->files[idx].fd) != 0) {
         xrootd_log_access(ctx, c, "SYNC", ctx->files[idx].path, "-",
                           0, kXR_IOError, strerror(errno), 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_SYNC);
         return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
     }
 
     xrootd_log_access(ctx, c, "SYNC", ctx->files[idx].path, "-",
                       1, 0, NULL, 0);
+    XROOTD_OP_OK(ctx, XROOTD_OP_SYNC);
     return xrootd_send_ok(ctx, c, NULL, 0);
 }
 
@@ -2917,6 +3808,7 @@ xrootd_handle_truncate(xrootd_ctx_t *ctx, ngx_connection_t *c,
                                      resolved, sizeof(resolved))) {
                 xrootd_log_access(ctx, c, "TRUNCATE", (char *) ctx->payload,
                                   detail, 0, kXR_NotFound, "file not found", 0);
+                XROOTD_OP_ERR(ctx, XROOTD_OP_TRUNCATE);
                 return xrootd_send_error(ctx, c, kXR_NotFound, "file not found");
             }
         }
@@ -2924,6 +3816,7 @@ xrootd_handle_truncate(xrootd_ctx_t *ctx, ngx_connection_t *c,
         if (rc != 0) {
             xrootd_log_access(ctx, c, "TRUNCATE", resolved, detail,
                               0, kXR_IOError, strerror(errno), 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_TRUNCATE);
             return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
         }
         xrootd_log_access(ctx, c, "TRUNCATE", resolved, detail,
@@ -2934,6 +3827,7 @@ xrootd_handle_truncate(xrootd_ctx_t *ctx, ngx_connection_t *c,
         if (idx < 0 || idx >= XROOTD_MAX_FILES || ctx->files[idx].fd < 0) {
             xrootd_log_access(ctx, c, "TRUNCATE", "-", detail,
                               0, kXR_FileNotOpen, "invalid file handle", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_TRUNCATE);
             return xrootd_send_error(ctx, c, kXR_FileNotOpen,
                                      "invalid file handle");
         }
@@ -2941,12 +3835,14 @@ xrootd_handle_truncate(xrootd_ctx_t *ctx, ngx_connection_t *c,
         if (rc != 0) {
             xrootd_log_access(ctx, c, "TRUNCATE", ctx->files[idx].path, detail,
                               0, kXR_IOError, strerror(errno), 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_TRUNCATE);
             return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
         }
         xrootd_log_access(ctx, c, "TRUNCATE", ctx->files[idx].path, detail,
                           1, 0, NULL, 0);
     }
 
+    XROOTD_OP_OK(ctx, XROOTD_OP_TRUNCATE);
     return xrootd_send_ok(ctx, c, NULL, 0);
 }
 
@@ -2986,6 +3882,7 @@ xrootd_handle_mkdir(xrootd_ctx_t *ctx, ngx_connection_t *c,
                                           resolved, sizeof(resolved))) {
             xrootd_log_access(ctx, c, "MKDIR", (char *) ctx->payload, "-",
                               0, kXR_NotFound, "invalid path", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_MKDIR);
             return xrootd_send_error(ctx, c, kXR_NotFound, "invalid path");
         }
     } else {
@@ -2994,6 +3891,7 @@ xrootd_handle_mkdir(xrootd_ctx_t *ctx, ngx_connection_t *c,
                                        resolved, sizeof(resolved))) {
             xrootd_log_access(ctx, c, "MKDIR", (char *) ctx->payload, "-",
                               0, kXR_NotFound, "invalid path", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_MKDIR);
             return xrootd_send_error(ctx, c, kXR_NotFound, "invalid path");
         }
     }
@@ -3002,6 +3900,7 @@ xrootd_handle_mkdir(xrootd_ctx_t *ctx, ngx_connection_t *c,
         if (xrootd_mkdir_recursive(resolved, mode) != 0 && errno != EEXIST) {
             xrootd_log_access(ctx, c, "MKDIR", resolved, "-",
                               0, kXR_IOError, strerror(errno), 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_MKDIR);
             return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
         }
     } else {
@@ -3012,17 +3911,20 @@ xrootd_handle_mkdir(xrootd_ctx_t *ctx, ngx_connection_t *c,
             } else if (err == EACCES) {
                 xrootd_log_access(ctx, c, "MKDIR", resolved, "-",
                                   0, kXR_NotAuthorized, "permission denied", 0);
+                XROOTD_OP_ERR(ctx, XROOTD_OP_MKDIR);
                 return xrootd_send_error(ctx, c, kXR_NotAuthorized,
                                          "permission denied");
             } else {
                 xrootd_log_access(ctx, c, "MKDIR", resolved, "-",
                                   0, kXR_IOError, strerror(err), 0);
+                XROOTD_OP_ERR(ctx, XROOTD_OP_MKDIR);
                 return xrootd_send_error(ctx, c, kXR_IOError, strerror(err));
             }
         }
     }
 
     xrootd_log_access(ctx, c, "MKDIR", resolved, "-", 1, 0, NULL, 0);
+    XROOTD_OP_OK(ctx, XROOTD_OP_MKDIR);
     return xrootd_send_ok(ctx, c, NULL, 0);
 }
 
@@ -3047,6 +3949,7 @@ xrootd_handle_rm(xrootd_ctx_t *ctx, ngx_connection_t *c,
                               resolved, sizeof(resolved))) {
         xrootd_log_access(ctx, c, "RM", (char *) ctx->payload, "-",
                           0, kXR_NotFound, "file not found", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_RM);
         return xrootd_send_error(ctx, c, kXR_NotFound, "file not found");
     }
 
@@ -3055,15 +3958,18 @@ xrootd_handle_rm(xrootd_ctx_t *ctx, ngx_connection_t *c,
         if (err == EACCES || err == EPERM) {
             xrootd_log_access(ctx, c, "RM", resolved, "-",
                               0, kXR_NotAuthorized, "permission denied", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_RM);
             return xrootd_send_error(ctx, c, kXR_NotAuthorized,
                                      "permission denied");
         }
         xrootd_log_access(ctx, c, "RM", resolved, "-",
                           0, kXR_IOError, strerror(err), 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_RM);
         return xrootd_send_error(ctx, c, kXR_IOError, strerror(err));
     }
 
     xrootd_log_access(ctx, c, "RM", resolved, "-", 1, 0, NULL, 0);
+    XROOTD_OP_OK(ctx, XROOTD_OP_RM);
     return xrootd_send_ok(ctx, c, NULL, 0);
 }
 
@@ -3088,6 +3994,7 @@ xrootd_handle_rmdir(xrootd_ctx_t *ctx, ngx_connection_t *c,
                               resolved, sizeof(resolved))) {
         xrootd_log_access(ctx, c, "RMDIR", (char *) ctx->payload, "-",
                           0, kXR_NotFound, "directory not found", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_RMDIR);
         return xrootd_send_error(ctx, c, kXR_NotFound, "directory not found");
     }
 
@@ -3096,36 +4003,46 @@ xrootd_handle_rmdir(xrootd_ctx_t *ctx, ngx_connection_t *c,
         if (err == ENOTEMPTY || err == EEXIST) {
             xrootd_log_access(ctx, c, "RMDIR", resolved, "-",
                               0, kXR_FSError, "directory not empty", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_RMDIR);
             return xrootd_send_error(ctx, c, kXR_FSError,
                                      "directory not empty");
         }
         if (err == EACCES || err == EPERM) {
             xrootd_log_access(ctx, c, "RMDIR", resolved, "-",
                               0, kXR_NotAuthorized, "permission denied", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_RMDIR);
             return xrootd_send_error(ctx, c, kXR_NotAuthorized,
                                      "permission denied");
         }
         if (err == ENOTDIR) {
             xrootd_log_access(ctx, c, "RMDIR", resolved, "-",
                               0, kXR_NotFile, "not a directory", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_RMDIR);
             return xrootd_send_error(ctx, c, kXR_NotFile, "not a directory");
         }
         xrootd_log_access(ctx, c, "RMDIR", resolved, "-",
                           0, kXR_IOError, strerror(err), 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_RMDIR);
         return xrootd_send_error(ctx, c, kXR_IOError, strerror(err));
     }
 
     xrootd_log_access(ctx, c, "RMDIR", resolved, "-", 1, 0, NULL, 0);
+    XROOTD_OP_OK(ctx, XROOTD_OP_RMDIR);
     return xrootd_send_ok(ctx, c, NULL, 0);
 }
 
 /*
  * kXR_mv — rename/move a file or directory.
  *
- * The header's arg1len gives the byte length of the source path.
- * Payload layout: src[arg1len] (null-terminated) + dest (null-terminated).
- * Both paths must be inside the server root; rename() is used, so cross-
- * device moves are not supported.
+ * Payload layout (from XrdClFileSystem.cc):
+ *   header.arg1len = source.length()   ← byte count, no trailing NUL
+ *   payload        = src[arg1len] + ' ' (0x20) + dst[...]
+ *
+ * The separator is a single ASCII space — NOT a null byte.  arg1len does
+ * NOT include any terminator.  The destination runs to the end of dlen.
+ *
+ * Both paths must be inside the server root; rename(2) is used, so cross-
+ * device moves return EXDEV.
  */
 static ngx_int_t
 xrootd_handle_mv(xrootd_ctx_t *ctx, ngx_connection_t *c,
@@ -3174,6 +4091,7 @@ xrootd_handle_mv(xrootd_ctx_t *ctx, ngx_connection_t *c,
                               src_resolved, sizeof(src_resolved))) {
         xrootd_log_access(ctx, c, "MV", src_buf, "-",
                           0, kXR_NotFound, "source not found", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_MV);
         return xrootd_send_error(ctx, c, kXR_NotFound, "source not found");
     }
 
@@ -3181,6 +4099,7 @@ xrootd_handle_mv(xrootd_ctx_t *ctx, ngx_connection_t *c,
                                     dst_resolved, sizeof(dst_resolved))) {
         xrootd_log_access(ctx, c, "MV", src_buf, "-",
                           0, kXR_NotFound, "invalid destination path", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_MV);
         return xrootd_send_error(ctx, c, kXR_NotFound,
                                  "invalid destination path");
     }
@@ -3190,15 +4109,18 @@ xrootd_handle_mv(xrootd_ctx_t *ctx, ngx_connection_t *c,
         if (err == EACCES || err == EPERM) {
             xrootd_log_access(ctx, c, "MV", src_resolved, "-",
                               0, kXR_NotAuthorized, "permission denied", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_MV);
             return xrootd_send_error(ctx, c, kXR_NotAuthorized,
                                      "permission denied");
         }
         xrootd_log_access(ctx, c, "MV", src_resolved, "-",
                           0, kXR_IOError, strerror(err), 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_MV);
         return xrootd_send_error(ctx, c, kXR_IOError, strerror(err));
     }
 
     xrootd_log_access(ctx, c, "MV", src_resolved, dst_resolved, 1, 0, NULL, 0);
+    XROOTD_OP_OK(ctx, XROOTD_OP_MV);
     return xrootd_send_ok(ctx, c, NULL, 0);
 }
 
@@ -3230,6 +4152,7 @@ xrootd_handle_chmod(xrootd_ctx_t *ctx, ngx_connection_t *c,
                               resolved, sizeof(resolved))) {
         xrootd_log_access(ctx, c, "CHMOD", (char *) ctx->payload, "-",
                           0, kXR_NotFound, "path not found", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_CHMOD);
         return xrootd_send_error(ctx, c, kXR_NotFound, "path not found");
     }
 
@@ -3238,16 +4161,241 @@ xrootd_handle_chmod(xrootd_ctx_t *ctx, ngx_connection_t *c,
         if (err == EACCES || err == EPERM) {
             xrootd_log_access(ctx, c, "CHMOD", resolved, "-",
                               0, kXR_NotAuthorized, "permission denied", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_CHMOD);
             return xrootd_send_error(ctx, c, kXR_NotAuthorized,
                                      "permission denied");
         }
         xrootd_log_access(ctx, c, "CHMOD", resolved, "-",
                           0, kXR_IOError, strerror(err), 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_CHMOD);
         return xrootd_send_error(ctx, c, kXR_IOError, strerror(err));
     }
 
     xrootd_log_access(ctx, c, "CHMOD", resolved, "-", 1, 0, NULL, 0);
+    XROOTD_OP_OK(ctx, XROOTD_OP_CHMOD);
     return xrootd_send_ok(ctx, c, NULL, 0);
+}
+
+/* ------------------------------------------------------------------ */
+/* kXR_query — query server information.                               */
+/*                                                                     */
+/* Supported infotypes:                                                */
+/*   kXR_QChecksum (8) — compute adler32 checksum for a file by path  */
+/*                       or by open handle.                            */
+/*                       Response: "<algo> <hexval>\0"                 */
+/*                       e.g.    "adler32 1a2b3c4d\0"                 */
+/*                                                                     */
+/*   kXR_QSpace (6)    — report available storage space for xrootd_root. */
+/*                       Response: oss.* key-value string (text).      */
+/*                       e.g. "oss.cgroup=default&oss.space=53687091200 */
+/*                             &oss.free=42949672960&oss.maxf=42949672960 */
+/*                             &oss.used=10737418240&oss.quota=-1\0"   */
+/*                                                                     */
+/* All other infotypes return kXR_Unsupported.                         */
+/*                                                                     */
+/* Adler32 algorithm:                                                  */
+/*   A_0 = 1, B_0 = 0                                                 */
+/*   For each byte b: A += b; B += A;  (mod 65521)                    */
+/*   Result = (B << 16) | A                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Compute adler32 of a file identified by an already-resolved path.
+ * Returns the checksum value, or 0xFFFFFFFF on I/O error.
+ */
+static uint32_t
+xrootd_adler32_file(const char *path, ngx_log_t *log)
+{
+    int          fd;
+    ssize_t      n;
+    uint32_t     A = 1, B = 0;
+    const uint32_t MOD = 65521;
+    u_char       buf[65536];
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        ngx_log_error(NGX_LOG_ERR, log, errno,
+                      "xrootd: adler32 open(\"%s\") failed", path);
+        return 0xFFFFFFFF;
+    }
+
+    for (;;) {
+        n = read(fd, buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            ngx_log_error(NGX_LOG_ERR, log, errno,
+                          "xrootd: adler32 read(\"%s\") failed", path);
+            close(fd);
+            return 0xFFFFFFFF;
+        }
+        if (n == 0) break;
+
+        for (ssize_t i = 0; i < n; i++) {
+            A = (A + buf[i]) % MOD;
+            B = (B + A)      % MOD;
+        }
+    }
+
+    close(fd);
+    return (B << 16) | A;
+}
+
+static ngx_int_t
+xrootd_handle_query(xrootd_ctx_t *ctx, ngx_connection_t *c,
+                    ngx_stream_xrootd_srv_conf_t *conf)
+{
+    ClientQueryRequest *req = (ClientQueryRequest *) ctx->hdr_buf;
+    uint16_t infotype = ntohs(req->infotype);
+
+    /* ---- kXR_Qcksum (3): adler32 by path or open handle ---- */
+    if (infotype == kXR_Qcksum) {
+        char     resolved[PATH_MAX];
+        uint32_t cksum;
+        char     resp[64];
+
+        if (ctx->cur_dlen > 0 && ctx->payload != NULL) {
+            /* Path-based checksum */
+            char pathbuf[XROOTD_MAX_PATH + 1];
+            xrootd_strip_cgi((const char *) ctx->payload,
+                             pathbuf, sizeof(pathbuf));
+
+            if (!xrootd_resolve_path(c->log, &conf->root,
+                                     pathbuf, resolved, sizeof(resolved))) {
+                xrootd_log_access(ctx, c, "QUERY", pathbuf, "cksum",
+                                  0, kXR_NotFound, "file not found", 0);
+                XROOTD_OP_ERR(ctx, XROOTD_OP_QUERY_CKSUM);
+                return xrootd_send_error(ctx, c, kXR_NotFound,
+                                         "file not found");
+            }
+
+            cksum = xrootd_adler32_file(resolved, c->log);
+            if (cksum == 0xFFFFFFFF) {
+                xrootd_log_access(ctx, c, "QUERY", resolved, "cksum",
+                                  0, kXR_IOError, "read error", 0);
+                XROOTD_OP_ERR(ctx, XROOTD_OP_QUERY_CKSUM);
+                return xrootd_send_error(ctx, c, kXR_IOError,
+                                         "checksum computation failed");
+            }
+
+        } else {
+            /* Handle-based checksum */
+            int idx = (int)(unsigned char) req->fhandle[0];
+            if (idx < 0 || idx >= XROOTD_MAX_FILES
+                        || ctx->files[idx].fd < 0) {
+                XROOTD_OP_ERR(ctx, XROOTD_OP_QUERY_CKSUM);
+                return xrootd_send_error(ctx, c, kXR_FileNotOpen,
+                                         "invalid file handle");
+            }
+            ngx_cpystrn((u_char *) resolved,
+                        (u_char *) ctx->files[idx].path,
+                        sizeof(resolved));
+            cksum = xrootd_adler32_file(resolved, c->log);
+            if (cksum == 0xFFFFFFFF) {
+                XROOTD_OP_ERR(ctx, XROOTD_OP_QUERY_CKSUM);
+                return xrootd_send_error(ctx, c, kXR_IOError,
+                                         "checksum computation failed");
+            }
+        }
+
+        /* Response format: "adler32 <8-hex-digits>\0" */
+        snprintf(resp, sizeof(resp), "adler32 %08x", (unsigned int) cksum);
+
+        xrootd_log_access(ctx, c, "QUERY", resolved, "cksum", 1, 0, NULL, 0);
+        XROOTD_OP_OK(ctx, XROOTD_OP_QUERY_CKSUM);
+        return xrootd_send_ok(ctx, c, resp, (uint32_t)(strlen(resp) + 1));
+    }
+
+    /* ---- kXR_Qspace (5): storage space for xrootd_root ---- */
+    if (infotype == kXR_Qspace) {
+        struct statvfs  vfs;
+        char            resp[256];
+        unsigned long long total, free_bytes, used_bytes;
+
+        /* statvfs on the configured root directory */
+        if (statvfs((const char *) conf->root.data, &vfs) != 0) {
+            xrootd_log_access(ctx, c, "QUERY", (char *) conf->root.data,
+                              "space", 0, kXR_IOError, strerror(errno), 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_QUERY_SPACE);
+            return xrootd_send_error(ctx, c, kXR_IOError,
+                                     "statvfs failed");
+        }
+
+        total      = (unsigned long long) vfs.f_blocks * vfs.f_frsize;
+        free_bytes = (unsigned long long) vfs.f_bavail * vfs.f_frsize;
+        used_bytes = total - (unsigned long long) vfs.f_bfree * vfs.f_frsize;
+
+        /*
+         * oss.* key-value format as used by XRootD's OSS layer:
+         *   oss.cgroup  — storage group name (use "default")
+         *   oss.space   — total filesystem bytes
+         *   oss.free    — bytes available to unpriv processes (f_bavail)
+         *   oss.maxf    — largest single free segment (approximate: == free)
+         *   oss.used    — bytes used
+         *   oss.quota   — -1 means no quota configured
+         */
+        snprintf(resp, sizeof(resp),
+                 "oss.cgroup=default"
+                 "&oss.space=%llu"
+                 "&oss.free=%llu"
+                 "&oss.maxf=%llu"
+                 "&oss.used=%llu"
+                 "&oss.quota=-1",
+                 total, free_bytes, free_bytes, used_bytes);
+
+        xrootd_log_access(ctx, c, "QUERY", (char *) conf->root.data,
+                          "space", 1, 0, NULL, 0);
+        XROOTD_OP_OK(ctx, XROOTD_OP_QUERY_SPACE);
+        return xrootd_send_ok(ctx, c, resp, (uint32_t)(strlen(resp) + 1));
+    }
+
+    /* ---- kXR_Qconfig (7): configuration query ---- */
+    if (infotype == kXR_Qconfig) {
+        /*
+         * The payload is a newline-separated list of config keys the client
+         * wants.  We respond with "key=value\n" pairs; keys we don't know
+         * echo back as "key=0\n".  xrdcp queries "chksum" and "readv" among
+         * others; we advertise adler32 support.
+         */
+        char    resp[512];
+        size_t  pos = 0;
+        const char *p = (ctx->payload && ctx->cur_dlen > 0)
+                        ? (const char *) ctx->payload : "";
+        const char *nl;
+
+        while (*p) {
+            nl = strchr(p, '\n');
+            size_t keylen = nl ? (size_t)(nl - p) : strlen(p);
+            char key[128];
+            if (keylen >= sizeof(key)) keylen = sizeof(key) - 1;
+            memcpy(key, p, keylen);
+            key[keylen] = '\0';
+
+            int n;
+            if (strcmp(key, "chksum") == 0) {
+                n = snprintf(resp + pos, sizeof(resp) - pos,
+                             "chksum=adler32\n");
+            } else if (strcmp(key, "readv") == 0) {
+                n = snprintf(resp + pos, sizeof(resp) - pos, "readv=1\n");
+            } else {
+                n = snprintf(resp + pos, sizeof(resp) - pos, "%s=0\n", key);
+            }
+            if (n > 0) pos += (size_t) n;
+            if (pos >= sizeof(resp) - 1) break;
+            p = nl ? nl + 1 : p + keylen;
+        }
+        if (pos == 0) {
+            /* no keys requested — return empty ok */
+            return xrootd_send_ok(ctx, c, NULL, 0);
+        }
+        return xrootd_send_ok(ctx, c, resp, (uint32_t) pos);
+    }
+
+    /* All other query types: not implemented */
+    ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                   "xrootd: kXR_query unsupported infotype=%d",
+                   (int) infotype);
+    return xrootd_send_error(ctx, c, kXR_Unsupported,
+                             "query type not supported");
 }
 
 /* kXR_endsess — client wants to end the session gracefully */
@@ -3284,6 +4432,7 @@ xrootd_handle_stat(xrootd_ctx_t *ctx, ngx_connection_t *c,
                                  reqpath, resolved, sizeof(resolved))) {
             xrootd_log_access(ctx, c, "STAT", reqpath, "-",
                               0, kXR_NotFound, "file not found", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_STAT);
             return xrootd_send_error(ctx, c, kXR_NotFound,
                                      "file not found");
         }
@@ -3291,6 +4440,7 @@ xrootd_handle_stat(xrootd_ctx_t *ctx, ngx_connection_t *c,
         if (stat(resolved, &st) != 0) {
             xrootd_log_access(ctx, c, "STAT", reqpath, "-",
                               0, kXR_NotFound, strerror(errno), 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_STAT);
             return xrootd_send_error(ctx, c, kXR_NotFound,
                                      "file not found");
         }
@@ -3302,6 +4452,7 @@ xrootd_handle_stat(xrootd_ctx_t *ctx, ngx_connection_t *c,
                 || ctx->files[idx].fd < 0) {
             xrootd_log_access(ctx, c, "STAT", "-", "-",
                               0, kXR_FileNotOpen, "invalid file handle", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_STAT);
             return xrootd_send_error(ctx, c, kXR_FileNotOpen,
                                      "invalid file handle");
         }
@@ -3314,6 +4465,7 @@ xrootd_handle_stat(xrootd_ctx_t *ctx, ngx_connection_t *c,
         if (fstat(ctx->files[idx].fd, &st) != 0) {
             xrootd_log_access(ctx, c, "STAT", resolved, "-",
                               0, kXR_IOError, strerror(errno), 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_STAT);
             return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
         }
     }
@@ -3328,6 +4480,7 @@ xrootd_handle_stat(xrootd_ctx_t *ctx, ngx_connection_t *c,
                       (reqpath && reqpath[0]) ? reqpath : resolved,
                       is_vfs ? "vfs" : "-",
                       1, 0, NULL, 0);
+    XROOTD_OP_OK(ctx, XROOTD_OP_STAT);
 
     return xrootd_send_ok(ctx, c, body, (uint32_t)(strlen(body) + 1));
 }
@@ -3375,6 +4528,7 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
         xrootd_log_access(ctx, c, "OPEN",
                           ctx->payload ? (char *) ctx->payload : "-", "wr",
                           0, kXR_fsReadOnly, "read-only server", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_OPEN_WR);
         return xrootd_send_error(ctx, c, kXR_fsReadOnly,
                                  "this is a read-only server");
     }
@@ -3383,6 +4537,7 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
         xrootd_log_access(ctx, c, "OPEN", "-",
                           is_write ? "wr" : "rd",
                           0, kXR_ArgMissing, "no path given", 0);
+        XROOTD_OP_ERR(ctx, is_write ? XROOTD_OP_OPEN_WR : XROOTD_OP_OPEN_RD);
         return xrootd_send_error(ctx, c, kXR_ArgMissing, "no path given");
     }
 
@@ -3401,6 +4556,7 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
                                  clean_path, resolved, sizeof(resolved))) {
             xrootd_log_access(ctx, c, "OPEN", clean_path, "rd",
                               0, kXR_NotFound, "file not found", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_OPEN_RD);
             return xrootd_send_error(ctx, c, kXR_NotFound, "file not found");
         }
 
@@ -3410,6 +4566,7 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
             if (stat(resolved, &st) == 0 && S_ISDIR(st.st_mode)) {
                 xrootd_log_access(ctx, c, "OPEN", clean_path, "rd",
                                   0, kXR_isDirectory, "is a directory", 0);
+                XROOTD_OP_ERR(ctx, XROOTD_OP_OPEN_RD);
                 return xrootd_send_error(ctx, c, kXR_isDirectory,
                                          "is a directory");
             }
@@ -3429,6 +4586,7 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
         if (!ok) {
             xrootd_log_access(ctx, c, "OPEN", clean_path, "wr",
                               0, kXR_NotFound, "invalid path", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_OPEN_WR);
             return xrootd_send_error(ctx, c, kXR_NotFound, "invalid path");
         }
 
@@ -3502,6 +4660,7 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
         xrootd_log_access(ctx, c, "OPEN", resolved,
                           is_write ? "wr" : "rd",
                           0, kXR_ServerError, "too many open files", 0);
+        XROOTD_OP_ERR(ctx, is_write ? XROOTD_OP_OPEN_WR : XROOTD_OP_OPEN_RD);
         return xrootd_send_error(ctx, c, kXR_ServerError,
                                  "too many open files");
     }
@@ -3513,23 +4672,27 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
         if (err == ENOENT || err == ENOTDIR) {
             xrootd_log_access(ctx, c, "OPEN", resolved, mode_str,
                               0, kXR_NotFound, "file not found", 0);
+            XROOTD_OP_ERR(ctx, is_write ? XROOTD_OP_OPEN_WR : XROOTD_OP_OPEN_RD);
             return xrootd_send_error(ctx, c, kXR_NotFound,
                                      "file not found");
         }
         if (err == EEXIST) {
             xrootd_log_access(ctx, c, "OPEN", resolved, mode_str,
                               0, kXR_FileLocked, "file already exists", 0);
+            XROOTD_OP_ERR(ctx, is_write ? XROOTD_OP_OPEN_WR : XROOTD_OP_OPEN_RD);
             return xrootd_send_error(ctx, c, kXR_FileLocked,
                                      "file already exists");
         }
         if (err == EACCES) {
             xrootd_log_access(ctx, c, "OPEN", resolved, mode_str,
                               0, kXR_NotAuthorized, "permission denied", 0);
+            XROOTD_OP_ERR(ctx, is_write ? XROOTD_OP_OPEN_WR : XROOTD_OP_OPEN_RD);
             return xrootd_send_error(ctx, c, kXR_NotAuthorized,
                                      "permission denied");
         }
         xrootd_log_access(ctx, c, "OPEN", resolved, mode_str,
                           0, kXR_IOError, strerror(err), 0);
+        XROOTD_OP_ERR(ctx, is_write ? XROOTD_OP_OPEN_WR : XROOTD_OP_OPEN_RD);
         return xrootd_send_error(ctx, c, kXR_IOError, strerror(err));
     }
 
@@ -3617,9 +4780,208 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
 
     xrootd_log_access(ctx, c, "OPEN", resolved,
                       is_write ? "wr" : "rd", 1, 0, NULL, 0);
+    XROOTD_OP_OK(ctx, is_write ? XROOTD_OP_OPEN_WR : XROOTD_OP_OPEN_RD);
 
     return xrootd_queue_response(ctx, c, buf, total);
 }
+
+/* ------------------------------------------------------------------ */
+/* kXR_readv — scatter-gather / vector read                            */
+/*                                                                     */
+/* The payload is an array of readahead_list structs (16 bytes each).  */
+/* Each struct specifies an open file handle, a byte offset, and the   */
+/* number of bytes requested (rlen).  Segments may reference different  */
+/* open handles.                                                        */
+/*                                                                     */
+/* Response: for each segment, a readahead_list header (fhandle +      */
+/* actual rlen + offset) followed immediately by rlen bytes of data.   */
+/* All segments are concatenated into one body.  Large responses are   */
+/* split into kXR_oksofar chunks (same scheme as kXR_read).            */
+/*                                                                     */
+/* A short read (hit EOF) sets rlen to the actual bytes read in the    */
+/* response header for that segment.  Zero-length segments are echoed  */
+/* back with rlen=0.  An invalid file handle aborts the entire request. */
+/* ------------------------------------------------------------------ */
+static ngx_int_t
+xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c)
+{
+    readahead_list               *segs;
+    ngx_stream_xrootd_srv_conf_t *conf =
+        ngx_stream_get_module_srv_conf((ngx_stream_session_t *)(c->data), ngx_stream_xrootd_module);
+    size_t           n_segs, i;
+    u_char          *databuf;
+    size_t           max_rsp;
+
+/* Hard cap for the total readv response (256 MiB). */
+#define XROOTD_MAX_READV_TOTAL  (256u * 1024u * 1024u)
+
+    /* Validate payload: must be a non-empty, whole multiple of segment size */
+    if (ctx->payload == NULL || ctx->cur_dlen == 0 ||
+        (ctx->cur_dlen % XROOTD_READV_SEGSIZE) != 0) {
+        XROOTD_OP_ERR(ctx, XROOTD_OP_READV);
+        return xrootd_send_error(ctx, c, kXR_ArgInvalid,
+                                 "malformed readv request");
+    }
+
+    segs   = (readahead_list *) ctx->payload;
+    n_segs = ctx->cur_dlen / XROOTD_READV_SEGSIZE;
+
+    /* --- First pass: validate all handles and compute max response size --- */
+    max_rsp = 0;
+    for (i = 0; i < n_segs; i++) {
+        int      idx  = (int)(unsigned char) segs[i].fhandle[0];
+        uint32_t rlen = (uint32_t) ntohl((uint32_t) segs[i].rlen);
+
+        if (idx < 0 || idx >= XROOTD_MAX_FILES || ctx->files[idx].fd < 0) {
+            XROOTD_OP_ERR(ctx, XROOTD_OP_READV);
+            return xrootd_send_error(ctx, c, kXR_FileNotOpen,
+                                     "invalid file handle in readv");
+        }
+
+        if (rlen > XROOTD_READ_MAX) { rlen = XROOTD_READ_MAX; }
+        max_rsp += XROOTD_READV_SEGSIZE + rlen;
+
+        if (max_rsp > XROOTD_MAX_READV_TOTAL) {
+            XROOTD_OP_ERR(ctx, XROOTD_OP_READV);
+            return xrootd_send_error(ctx, c, kXR_ArgTooLong,
+                                     "readv total would exceed server limit");
+        }
+    }
+
+    /* Allocate response body buffer (max size) and pre-fill headers */
+    databuf = ngx_palloc(c->pool, max_rsp);
+    if (databuf == NULL) { return NGX_ERROR; }
+
+    /* Pre-fill readahead_list headers with fhandle and offset (BE).
+     * rlen fields are left for the thread to patch after pread(). */
+    {
+        u_char *p = databuf;
+        for (i = 0; i < n_segs; i++) {
+            uint32_t rlen = (uint32_t) ntohl((uint32_t) segs[i].rlen);
+            if (rlen > XROOTD_READ_MAX) { rlen = XROOTD_READ_MAX; }
+
+            ngx_memcpy(p, segs[i].fhandle, 4);
+            /* rlen field (p+4) will be patched by thread/sync path */
+            uint32_t rlen_be = htonl(rlen);
+            ngx_memcpy(p + 4, &rlen_be, 4);   /* requested rlen, thread patches actual */
+            ngx_memcpy(p + 8, &segs[i].offset, 8);
+
+            p += XROOTD_READV_SEGSIZE + rlen;  /* skip to next segment's header */
+        }
+    }
+
+#if (NGX_THREADS)
+    if (conf->thread_pool != NULL) {
+        ngx_thread_task_t       *task;
+        xrootd_readv_aio_t      *t;
+        xrootd_readv_seg_desc_t *seg_descs;
+
+        /* Allocate per-segment descriptors */
+        seg_descs = ngx_palloc(c->pool,
+                               n_segs * sizeof(xrootd_readv_seg_desc_t));
+        if (seg_descs == NULL) { return NGX_ERROR; }
+
+        /* Fill segment descriptors, pointing into databuf */
+        {
+            u_char *p = databuf;
+            for (i = 0; i < n_segs; i++) {
+                uint32_t rlen = (uint32_t) ntohl((uint32_t) segs[i].rlen);
+                if (rlen > XROOTD_READ_MAX) { rlen = XROOTD_READ_MAX; }
+
+                seg_descs[i].fd          = ctx->files[(int)(unsigned char)segs[i].fhandle[0]].fd;
+                seg_descs[i].handle_idx  = (int)(unsigned char) segs[i].fhandle[0];
+                seg_descs[i].offset      = (off_t)(int64_t) be64toh((uint64_t) segs[i].offset);
+                seg_descs[i].rlen        = rlen;
+                seg_descs[i].hdr_rlen_ptr = p + 4;   /* rlen field in header */
+                seg_descs[i].data_ptr    = p + XROOTD_READV_SEGSIZE;
+
+                p += XROOTD_READV_SEGSIZE + rlen;
+            }
+        }
+
+        task = ngx_thread_task_alloc(c->pool, sizeof(xrootd_readv_aio_t));
+        if (task == NULL) { return NGX_ERROR; }
+
+        t = task->ctx;
+        t->c           = c;
+        t->ctx         = ctx;
+        t->n_segs      = n_segs;
+        t->segs        = seg_descs;
+        t->databuf     = databuf;
+        t->bytes_total = 0;
+        t->rsp_total   = 0;
+        t->io_error    = 0;
+        t->streamid[0] = ctx->cur_streamid[0];
+        t->streamid[1] = ctx->cur_streamid[1];
+
+        task->handler       = xrootd_readv_aio_thread;
+        task->event.handler = xrootd_readv_aio_done;
+        task->event.data    = task;
+
+        if (ngx_thread_task_post(conf->thread_pool, task) == NGX_OK) {
+            ctx->state = XRD_ST_AIO;
+            return NGX_OK;
+        }
+        ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                      "xrootd: thread_task_post failed, falling back to sync readv");
+    }
+#endif /* NGX_THREADS */
+
+    /* --- Synchronous path: pread each segment in the event loop --- */
+    {
+        size_t  bytes_total = 0;
+        size_t  rsp_total;
+        u_char *p   = databuf;
+        u_char *rspbuf;
+        size_t  rsp_size;
+
+        for (i = 0; i < n_segs; i++) {
+            int      idx    = (int)(unsigned char) segs[i].fhandle[0];
+            int64_t  offset = (int64_t) be64toh((uint64_t) segs[i].offset);
+            uint32_t rlen   = (uint32_t) ntohl((uint32_t) segs[i].rlen);
+            ssize_t  nread  = 0;
+
+            if (rlen > XROOTD_READ_MAX) { rlen = XROOTD_READ_MAX; }
+
+            u_char *rlen_field = p + 4;
+            p += XROOTD_READV_SEGSIZE;
+
+            if (rlen > 0) {
+                nread = pread(ctx->files[idx].fd, p, (size_t) rlen, (off_t) offset);
+                if (nread < 0) {
+                    XROOTD_OP_ERR(ctx, XROOTD_OP_READV);
+                    return xrootd_send_error(ctx, c, kXR_IOError, "readv I/O error");
+                }
+                if ((uint32_t) nread < rlen) {
+                    XROOTD_OP_ERR(ctx, XROOTD_OP_READV);
+                    return xrootd_send_error(ctx, c, kXR_IOError, "readv past EOF");
+                }
+            }
+
+            uint32_t actual_rlen_be = htonl((uint32_t) nread);
+            ngx_memcpy(rlen_field, &actual_rlen_be, 4);
+
+            p           += (size_t) nread;
+            bytes_total += (size_t) nread;
+        }
+
+        rsp_total = (size_t)(p - databuf);
+
+        {
+            char detail[64];
+            snprintf(detail, sizeof(detail), "%zu_segs", n_segs);
+            xrootd_log_access(ctx, c, "READV", "-", detail, 1, 0, NULL, bytes_total);
+        }
+        XROOTD_OP_OK(ctx, XROOTD_OP_READV);
+        ctx->session_bytes += bytes_total;
+
+        rspbuf = xrootd_build_readv_response(ctx, c, databuf, rsp_total, &rsp_size);
+        if (rspbuf == NULL) { return NGX_ERROR; }
+
+        return xrootd_queue_response(ctx, c, rspbuf, rsp_size);
+    }
+}
+
 
 /* kXR_read — read file data
  *
@@ -3635,17 +4997,17 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
 static ngx_int_t
 xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
 {
-    ClientReadRequest *req = (ClientReadRequest *) ctx->hdr_buf;
-    int                idx;
-    int64_t            offset;
-    size_t             rlen;
-    off_t              seekpos;
-    u_char            *databuf, *rspbuf;
-    ssize_t            nread;
-    size_t             data_total;     /* actual bytes read */
-    size_t             n_chunks, last_size;
-    size_t             rsp_total;      /* total response bytes */
-    size_t             di, ri;         /* data / response cursor */
+    ClientReadRequest            *req  = (ClientReadRequest *) ctx->hdr_buf;
+    ngx_stream_xrootd_srv_conf_t *conf =
+        ngx_stream_get_module_srv_conf((ngx_stream_session_t *)(c->data), ngx_stream_xrootd_module);
+    int      idx;
+    int64_t  offset;
+    size_t   rlen;
+    u_char  *databuf;
+    ssize_t  nread;
+    size_t   data_total;
+    size_t   rsp_total;
+    u_char  *rspbuf;
 
     idx    = (int)(unsigned char) req->fhandle[0];
     offset = (int64_t) be64toh((uint64_t) req->offset);
@@ -3654,105 +5016,105 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
     if (idx < 0 || idx >= XROOTD_MAX_FILES || ctx->files[idx].fd < 0) {
         xrootd_log_access(ctx, c, "READ", "-", "-",
                           0, kXR_FileNotOpen, "invalid file handle", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_READ);
         return xrootd_send_error(ctx, c, kXR_FileNotOpen,
                                  "invalid file handle");
     }
 
     if (rlen == 0) {
+        XROOTD_OP_OK(ctx, XROOTD_OP_READ);
         return xrootd_send_ok(ctx, c, NULL, 0);
     }
 
-    /* Cap to something large but bounded; nginx pool handles the alloc */
     if (rlen > XROOTD_READ_MAX * 16) {
         rlen = XROOTD_READ_MAX * 16;   /* 64 MB hard cap */
     }
 
-    /* Seek to the requested offset */
-    seekpos = lseek(ctx->files[idx].fd, (off_t) offset, SEEK_SET);
-    if (seekpos == (off_t) -1) {
-        xrootd_log_access(ctx, c, "READ", ctx->files[idx].path, "-",
-                          0, kXR_IOError, strerror(errno), 0);
-        return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
-    }
-
-    /* Read all available data up to rlen in a single OS call.
-     * A short read (nread < rlen) means we hit EOF. */
     databuf = ngx_palloc(c->pool, rlen);
     if (databuf == NULL) {
         return NGX_ERROR;
     }
 
-    nread = read(ctx->files[idx].fd, databuf, rlen);
+#if (NGX_THREADS)
+    /* Async path: post pread() to the thread pool */
+    if (conf->thread_pool != NULL) {
+        ngx_thread_task_t  *task;
+        xrootd_read_aio_t  *t;
+
+        task = ngx_thread_task_alloc(c->pool, sizeof(xrootd_read_aio_t));
+        if (task == NULL) {
+            return NGX_ERROR;
+        }
+
+        t = task->ctx;
+        t->c          = c;
+        t->ctx        = ctx;
+        t->conf       = conf;
+        t->fd         = ctx->files[idx].fd;
+        t->handle_idx = idx;
+        t->offset     = (off_t) offset;
+        t->rlen       = rlen;
+        t->databuf    = databuf;
+        t->nread      = -1;
+        t->io_errno   = 0;
+        t->streamid[0] = ctx->cur_streamid[0];
+        t->streamid[1] = ctx->cur_streamid[1];
+
+        task->handler       = xrootd_read_aio_thread;
+        task->event.handler = xrootd_read_aio_done;
+        task->event.data    = task;
+
+        if (ngx_thread_task_post(conf->thread_pool, task) != NGX_OK) {
+            ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                          "xrootd: thread_task_post failed, falling back to sync read");
+            goto sync_read;
+        }
+
+        ctx->state = XRD_ST_AIO;
+        return NGX_OK;
+    }
+
+sync_read:
+#endif /* NGX_THREADS */
+
+    /* Synchronous path: pread() in the event loop worker */
+    nread = pread(ctx->files[idx].fd, databuf, rlen, (off_t) offset);
     if (nread < 0) {
+        ngx_pfree(c->pool, databuf);
         xrootd_log_access(ctx, c, "READ", ctx->files[idx].path, "-",
                           0, kXR_IOError, strerror(errno), 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_READ);
         return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
     }
 
     data_total = (size_t) nread;
 
-    /* Accumulate per-file and per-session byte counters */
     ctx->files[idx].bytes_read += data_total;
     ctx->session_bytes         += data_total;
 
-    ngx_log_debug4(NGX_LOG_DEBUG_STREAM, c->log, 0,
-                   "xrootd: kXR_read handle=%d offset=%L req=%uz got=%uz",
-                   idx, offset, rlen, data_total);
-
-    /*
-     * Log the read operation.  detail = "offset+requested_len" so that log
-     * consumers can reconstruct exactly what was asked for and compare it to
-     * the actual bytes returned in the <bytes> field.  This makes it easy to
-     * identify short reads (EOF hits) and see the full access pattern for a
-     * file.
-     */
     {
         char read_detail[64];
         snprintf(read_detail, sizeof(read_detail), "%lld+%zu",
                  (long long) offset, rlen);
         xrootd_log_access(ctx, c, "READ", ctx->files[idx].path,
                           read_detail, 1, 0, NULL, data_total);
+        XROOTD_OP_OK(ctx, XROOTD_OP_READ);
     }
 
-    /* Calculate chunking.
-     * If data_total fits in one chunk (or it's a short read = EOF), send
-     * a single kXR_ok response.  Otherwise send N-1 kXR_oksofar chunks
-     * followed by one kXR_ok chunk. */
-    n_chunks  = (data_total + XROOTD_READ_MAX - 1) / XROOTD_READ_MAX;
-    if (n_chunks == 0) {
-        n_chunks = 1;   /* zero-byte response still needs one header */
-    }
-    last_size = data_total % XROOTD_READ_MAX;
-    if (last_size == 0 && data_total > 0) {
-        last_size = XROOTD_READ_MAX;   /* exactly divisible */
-    }
+    rspbuf = xrootd_build_read_response(ctx, c, databuf, data_total, &rsp_total);
+    ngx_pfree(c->pool, databuf);   /* copied into rspbuf; no longer needed */
 
-    /* Allocate single response buffer:
-     *   n_chunks response headers  +  data_total bytes of payload */
-    rsp_total = n_chunks * XRD_RESPONSE_HDR_LEN + data_total;
-    rspbuf = ngx_palloc(c->pool, rsp_total);
     if (rspbuf == NULL) {
         return NGX_ERROR;
     }
 
-    ri = 0;
-    di = 0;
-    for (size_t chunk = 0; chunk < n_chunks; chunk++) {
-        size_t   chunk_data = (chunk < n_chunks - 1)
-                              ? XROOTD_READ_MAX : last_size;
-        uint16_t status     = (chunk == n_chunks - 1) ? kXR_ok : kXR_oksofar;
-
-        xrootd_build_resp_hdr(ctx->cur_streamid, status,
-                               (uint32_t) chunk_data,
-                               (ServerResponseHdr *)(rspbuf + ri));
-        ri += XRD_RESPONSE_HDR_LEN;
-
-        ngx_memcpy(rspbuf + ri, databuf + di, chunk_data);
-        ri += chunk_data;
-        di += chunk_data;
+    {
+        ngx_int_t rc = xrootd_queue_response_base(ctx, c, rspbuf, rsp_total, rspbuf);
+        if (ctx->state != XRD_ST_SENDING) {
+            ngx_pfree(c->pool, rspbuf);
+        }
+        return rc;
     }
-
-    return xrootd_queue_response(ctx, c, rspbuf, rsp_total);
 }
 
 /* kXR_close — close an open file handle */
@@ -3765,6 +5127,7 @@ xrootd_handle_close(xrootd_ctx_t *ctx, ngx_connection_t *c)
     if (idx < 0 || idx >= XROOTD_MAX_FILES || ctx->files[idx].fd < 0) {
         xrootd_log_access(ctx, c, "CLOSE", "-", "-",
                           0, kXR_FileNotOpen, "invalid file handle", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_CLOSE);
         return xrootd_send_error(ctx, c, kXR_FileNotOpen,
                                  "invalid file handle");
     }
@@ -3794,6 +5157,7 @@ xrootd_handle_close(xrootd_ctx_t *ctx, ngx_connection_t *c)
     }
 
     xrootd_free_fhandle(ctx, idx);
+    XROOTD_OP_OK(ctx, XROOTD_OP_CLOSE);
 
     return xrootd_send_ok(ctx, c, NULL, 0);
 }
@@ -3806,7 +5170,8 @@ xrootd_handle_close(xrootd_ctx_t *ctx, ngx_connection_t *c)
  * Each chunk is built in a pool-allocated buffer.
  *
  * If the client set kXR_dstat (options byte 0x02) we append a second
- * line per entry with "id flags size mtime".
+ * line per entry with "id size flags mtime" (same order as kXR_stat /
+ * kXR_open retstat — size BEFORE flags).
  */
 static ngx_int_t
 xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
@@ -3831,6 +5196,7 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
     if (ctx->payload == NULL || ctx->cur_dlen == 0) {
         xrootd_log_access(ctx, c, "DIRLIST", "-", "-",
                           0, kXR_ArgMissing, "no path given", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_DIRLIST);
         return xrootd_send_error(ctx, c, kXR_ArgMissing, "no path given");
     }
 
@@ -3839,6 +5205,7 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
                              resolved, sizeof(resolved))) {
         xrootd_log_access(ctx, c, "DIRLIST", (char *) ctx->payload, "-",
                           0, kXR_NotFound, "directory not found", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_DIRLIST);
         return xrootd_send_error(ctx, c, kXR_NotFound, "directory not found");
     }
 
@@ -3848,17 +5215,20 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
         if (err == ENOTDIR) {
             xrootd_log_access(ctx, c, "DIRLIST", resolved, "-",
                               0, kXR_NotFile, "path is not a directory", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_DIRLIST);
             return xrootd_send_error(ctx, c, kXR_NotFile,
                                      "path is not a directory");
         }
         if (err == ENOENT) {
             xrootd_log_access(ctx, c, "DIRLIST", resolved, "-",
                               0, kXR_NotFound, "directory not found", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_DIRLIST);
             return xrootd_send_error(ctx, c, kXR_NotFound,
                                      "directory not found");
         }
         xrootd_log_access(ctx, c, "DIRLIST", resolved, "-",
                           0, kXR_IOError, strerror(err), 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_DIRLIST);
         return xrootd_send_error(ctx, c, kXR_IOError, strerror(err));
     }
 
@@ -3870,6 +5240,37 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
 
     /* We write entries starting after the response header (filled last) */
     u_char *data = chunk + XRD_RESPONSE_HDR_LEN;
+
+    /*
+     * dStat lead-in sentinel (kXR_dstat mode only)
+     *
+     * The XRootD client library (DirectoryList::HasStatInfo) looks for the
+     * 9-byte prefix ".\n0 0 0 0" at byte 0 of the response body.  Only if
+     * that prefix is present does the client enter stat-pairing mode, where
+     * it alternates between treating a line as a filename and as a stat string.
+     *
+     * Without this sentinel every newline-delimited line is treated as a plain
+     * filename, so the stat strings appear as extra directory entries.
+     *
+     * The reference xrootd server writes ".\n0 0 0 0\n" (10 bytes).  The
+     * client strips only 9 bytes (the prefix without the trailing \n), leaving
+     * the 10th byte (\n) as the first character of the remaining data.  The
+     * client's splitString() skips zero-length tokens, so this leading \n is
+     * harmlessly consumed.
+     *
+     * Wire layout after prepending the lead-in:
+     *   ".\n0 0 0 0\n<name1>\n<stat1>\n<name2>\n<stat2>\n...\0"
+     * where the final \n is replaced by \0 (see the NUL-terminator comment
+     * near the final chunk send below).
+     *
+     * Each stat line is "<id> <size> <flags> <mtime>" — size before flags,
+     * matching kXR_stat and kXR_open retstat order.
+     */
+    if (want_stat) {
+        static const char dstat_leadin[] = ".\n0 0 0 0\n";
+        ngx_memcpy(data, dstat_leadin, 10);
+        chunk_pos = 10;
+    }
 
     while ((de = readdir(dp)) != NULL) {
         const char *name = de->d_name;
@@ -3891,15 +5292,13 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
         }
 
         if (chunk_pos + need > chunk_cap) {
-            /* Flush current chunk as kXR_oksofar */
-            data[chunk_pos] = '\0';
-
+            /* Flush current chunk as kXR_oksofar (no NUL — raw data only) */
             xrootd_build_resp_hdr(ctx->cur_streamid, kXR_oksofar,
-                                   (uint32_t)(chunk_pos + 1),
+                                   (uint32_t)chunk_pos,
                                    (ServerResponseHdr *) chunk);
 
             rc = xrootd_queue_response(ctx, c, chunk,
-                                       XRD_RESPONSE_HDR_LEN + chunk_pos + 1);
+                                       XRD_RESPONSE_HDR_LEN + chunk_pos);
             if (rc != NGX_OK) {
                 closedir(dp);
                 return rc;
@@ -3930,11 +5329,41 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
 
     closedir(dp);
 
-    /* Send the final chunk as kXR_ok */
-    data[chunk_pos] = '\0';
+    /*
+     * Send the final chunk as kXR_ok.
+     *
+     * NUL-terminator convention
+     * ─────────────────────────
+     * The XRootD client constructs a std::string from the response body via
+     * a C-string (NUL-terminated) pointer.  The correct wire format places the
+     * NUL at the position of the last '\n', not after it:
+     *
+     *   correct:  "file1\nfile2\0"          ← last \n → \0
+     *   wrong:    "file1\nfile2\n\0"        ← extra \n before \0 creates
+     *                                          a trailing empty token
+     *
+     * For dStat mode, splitString() is then applied to the body (after
+     * stripping the 9-byte prefix).  An extra trailing empty string causes
+     * entries.size() to be odd, which fails the size%2 sanity check and
+     * discards the entire listing.
+     *
+     * Empty-directory edge cases
+     * ──────────────────────────
+     * No-stat, empty dir  (chunk_pos == 0): send kXR_ok with dlen=0.
+     * dStat, empty dir    (chunk_pos == 10): the lead-in's trailing '\n'
+     *   at data[9] becomes '\0', giving ".\n0 0 0 0\0".  After the client
+     *   strips 9 bytes it sees "\0" → empty C-string → empty listing.
+     */
+    size_t final_len;
+    if (chunk_pos == 0) {
+        final_len = 0;                  /* empty dir, no stat */
+    } else {
+        data[chunk_pos - 1] = '\0';     /* replace trailing '\n' with NUL */
+        final_len = chunk_pos;
+    }
 
     xrootd_build_resp_hdr(ctx->cur_streamid, kXR_ok,
-                           (uint32_t)(chunk_pos + 1),
+                           (uint32_t)final_len,
                            (ServerResponseHdr *) chunk);
 
     ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
@@ -3942,9 +5371,10 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
 
     xrootd_log_access(ctx, c, "DIRLIST", resolved,
                       want_stat ? "stat" : "-", 1, 0, NULL, 0);
+    XROOTD_OP_OK(ctx, XROOTD_OP_DIRLIST);
 
     return xrootd_queue_response(ctx, c, chunk,
-                                 XRD_RESPONSE_HDR_LEN + chunk_pos + 1);
+                                 XRD_RESPONSE_HDR_LEN + final_len);
 }
 
 /* ================================================================== */
@@ -4625,6 +6055,19 @@ xrootd_on_disconnect(xrootd_ctx_t *ctx, ngx_connection_t *c)
 {
     int        i;
     ngx_msec_t now = ngx_current_msec;
+
+    /* Signal thread-pool completion handlers that the connection is gone.
+     * Any in-flight AIO task will see this and skip response delivery. */
+    ctx->destroyed = 1;
+
+    /* Decrement active connection counter and accumulate byte totals */
+    if (ctx->metrics) {
+        ngx_atomic_fetch_add(&ctx->metrics->connections_active, (ngx_atomic_int_t) -1);
+        ngx_atomic_fetch_add(&ctx->metrics->bytes_rx_total,
+                             (ngx_atomic_int_t) ctx->session_bytes_written);
+        ngx_atomic_fetch_add(&ctx->metrics->bytes_tx_total,
+                             (ngx_atomic_int_t) ctx->session_bytes);
+    }
 
     /* Log any files that were left open without a client-sent kXR_close.
      * These represent transfers that were interrupted mid-flight. */

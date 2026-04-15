@@ -4,7 +4,7 @@ An nginx stream module that speaks the [XRootD](https://xrootd.slac.stanford.edu
 
 This allows existing nginx infrastructure — TLS termination, access controls, rate limiting, load balancing, logging, reverse proxying — to be layered in front of XRootD file access without running a separate `xrootd` daemon.
 
-Inspired by [dCache's xrootd4j](https://github.com/dCache/xrootd4j) Java re-implementation of the same protocol. Tested against nginx 1.28.3 (current stable) and xrdcp v5.9.2.
+Inspired by [dCache's xrootd4j](https://github.com/dCache/xrootd4j) Java re-implementation of the same protocol. Tested against nginx 1.28.3 (current stable) and xrdcp / XRootD Python client v5.9.2.
 
 ---
 
@@ -71,10 +71,118 @@ CONNECT → HANDSHAKE → kXR_protocol → kXR_login [→ kXR_auth (GSI)]
 | `kXR_mv` | Rename or move a file or directory (`rename(2)` — same filesystem only) |
 | `kXR_chmod` | Change permission bits (9-bit Unix mode from request header) |
 | `kXR_close` | Closes an open handle; logs throughput |
-| `kXR_dirlist` | Lists a directory; supports `kXR_dstat` for per-entry stat |
+| `kXR_dirlist` | Lists a directory; supports `kXR_dstat` for per-entry stat (see [Protocol notes](#17-kxr_dirlist-dstat-sentinel)) |
+| `kXR_readv` | Scatter-gather vector read; up to 1024 segments per request across any mix of open handles |
+| `kXR_query` | Server queries — see [Queries](#queries) below |
 | `kXR_endsess` | Graceful session termination |
 
-Up to 16 files may be open simultaneously per connection. Write operations (`kXR_pgwrite`, `kXR_write`, `kXR_mkdir`, `kXR_rmdir`, `kXR_rm`, `kXR_mv`, `kXR_chmod`, `kXR_sync`, `kXR_truncate`) require `xrootd_allow_write on` (default: off).
+Up to 16 files may be open simultaneously per connection. `kXR_readv` and `kXR_query` are available to all authenticated clients regardless of the `xrootd_allow_write` setting. Write operations (`kXR_pgwrite`, `kXR_write`, `kXR_mkdir`, `kXR_rmdir`, `kXR_rm`, `kXR_mv`, `kXR_chmod`, `kXR_sync`, `kXR_truncate`) require `xrootd_allow_write on` (default: off).
+
+---
+
+## Queries
+
+The `kXR_query` request is supported for the following query types:
+
+### Checksum (`kXR_Qcksum` / `QueryCode.CHECKSUM`)
+
+Returns the adler32 checksum of a file identified by path. The response is a null-terminated ASCII string:
+
+```
+adler32 1a2b3c4d\0
+```
+
+The 8-hex-digit value matches the standard adler32 (Ziv-Lempel, same as `zlib.adler32()`). Used by xrdcp's `--cksum` flag to verify transfer integrity.
+
+**Example (Python):**
+```python
+from XRootD import client
+from XRootD.client.flags import QueryCode
+
+fs = client.FileSystem("root://myserver:1094")
+status, resp = fs.query(QueryCode.CHECKSUM, "/store/mc/sample.root")
+# resp → b"adler32 1a2b3c4d\x00"
+```
+
+**Example (xrdfs):**
+```bash
+xrdfs myserver:1094 query checksum /store/mc/sample.root
+# adler32 1a2b3c4d
+```
+
+### Space (`kXR_Qspace` / `QueryCode.SPACE`)
+
+Returns storage space statistics for the configured `xrootd_root` filesystem. The response is an `oss.*` key-value string (null-terminated), matching the format used by the XRootD OSS layer:
+
+```
+oss.cgroup=default&oss.space=1081101176832&oss.free=250821832704&oss.maxf=250821832704&oss.used=775286988800&oss.quota=-1\0
+```
+
+| Key | Value |
+|---|---|
+| `oss.cgroup` | Storage group name (`"default"`) |
+| `oss.space` | Total filesystem bytes |
+| `oss.free` | Bytes available to unprivileged processes (`f_bavail × f_frsize`) |
+| `oss.maxf` | Largest contiguous free segment (approximated as `oss.free`) |
+| `oss.used` | Bytes in use |
+| `oss.quota` | Quota limit (`-1` = no quota configured) |
+
+**Example (Python):**
+```python
+status, resp = fs.query(QueryCode.SPACE, "/")
+# resp → b"oss.cgroup=default&oss.space=1081101176832&..."
+```
+
+**Example (xrdfs):**
+```bash
+xrdfs myserver:1094 spaceinfo /
+```
+
+### Configuration (`kXR_Qconfig`)
+
+Returns values for the configuration keys listed in the request payload (newline-separated). Advertises `adler32` as the supported checksum algorithm:
+
+```
+chksum=adler32
+readv=1
+```
+
+Unknown keys echo back as `key=0`.
+
+---
+
+## Vector Read (`kXR_readv`)
+
+`kXR_readv` performs scatter-gather reads in a single round-trip: the client sends a list of *(file handle, offset, length)* segments and the server streams back each chunk in request order.
+
+**Limits:** up to 1024 segments per request; individual segment length is bounded only by the normal 4 MB read cap. The server caps the total response at 256 MiB as a safety limit.
+
+**Python XRootD client:**
+
+```python
+from XRootD import client
+from XRootD.client.flags import OpenFlags
+
+f = client.File()
+f.open("root://localhost:11094//data/file.root", OpenFlags.READ)
+
+# Read three non-contiguous byte ranges in one request
+chunks = [(0, 100), (4096, 512), (1_048_576, 8192)]
+status, result = f.vector_read(chunks)
+
+for chunk in result:
+    print(f"offset={chunk.offset} size={len(chunk.buffer)}")
+
+f.close()
+```
+
+**xrdfs command line:**
+
+```bash
+xrdfs localhost:11094 readv /data/file.root 0:100 4096:512 1048576:8192
+```
+
+**Wire format summary:** request payload = N × 16-byte `readahead_list` (fhandle[4] + rlen[4] + offset[8], all big-endian). Response = same headers prepended to each segment's data, concatenated; segments larger than `XROOTD_READ_MAX` are split across `kXR_oksofar` / `kXR_ok` boundaries identical to `kXR_read`.
 
 ---
 
@@ -125,16 +233,44 @@ make -j$(nproc)
 | `xrootd_certificate_key path` | `server` | — | Server private key PEM (GSI only) |
 | `xrootd_trusted_ca path` | `server` | — | CA certificate (or bundle) PEM (GSI only) |
 | `xrootd_access_log path\|off` | `server` | `off` | Per-request access log file |
+| `xrootd_thread_pool name` | `server` | `default` | Thread pool for async file I/O — must match a `thread_pool` directive at the main config level |
+
+### Async file I/O
+
+When nginx is compiled with `--with-threads` (the default for distribution packages), `kXR_read`, `kXR_write`, `kXR_pgwrite`, and `kXR_readv` offload blocking `pread(2)` / `pwrite(2)` calls to a thread pool, keeping the nginx event loop non-blocking. This prevents a slow disk or network filesystem from stalling other connections served by the same worker process.
+
+The state machine uses an `XRD_ST_AIO` state to represent a request in-flight to the thread pool. While a request is in-flight the module continues to accept incoming TCP data so the client's kernel send buffer does not fill up and stall the connection. When the thread completes, the completion handler posts a read event so the next request is processed without waiting for the next epoll wake-up.
+
+**Enable async I/O** by adding a `thread_pool` directive at the top level and referencing it from each `server {}` block:
+
+```nginx
+# At the top level (outside stream {})
+thread_pool xrootd_io threads=8 max_queue=65536;
+
+stream {
+    server {
+        listen 1094;
+        xrootd on;
+        xrootd_root /data;
+        xrootd_thread_pool xrootd_io;   # enable async I/O
+    }
+}
+```
+
+If `xrootd_thread_pool` is omitted nginx looks for a pool named `"default"`. If no matching pool is found the module falls back to synchronous I/O with a notice in the error log.
 
 ### Read-only example
 
 ```nginx
+thread_pool default threads=4 max_queue=65536;
+
 stream {
     server {
         listen 1094;
         xrootd on;
         xrootd_root /data/public;
         xrootd_access_log /var/log/nginx/xrootd_access.log;
+        # xrootd_thread_pool default;  # optional: explicit, otherwise auto
     }
 }
 ```
@@ -187,6 +323,87 @@ stream {
     }
 }
 ```
+
+---
+
+## Prometheus Metrics
+
+The module exposes Prometheus-format counters via a companion HTTP module. Add an `http {}` block to your nginx configuration and enable the `xrootd_metrics` directive in a `location`:
+
+```nginx
+http {
+    server {
+        listen 9100;
+        location /metrics {
+            xrootd_metrics on;
+        }
+    }
+}
+```
+
+Scrape with any Prometheus-compatible tool:
+
+```bash
+curl http://localhost:9100/metrics
+```
+
+### Available metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `xrootd_connections_total` | counter | `port`, `auth` | TCP connections accepted since process start |
+| `xrootd_connections_active` | gauge | `port`, `auth` | Currently open XRootD connections |
+| `xrootd_bytes_rx_total` | counter | `port`, `auth` | Bytes received from clients (write data) |
+| `xrootd_bytes_tx_total` | counter | `port`, `auth` | Bytes sent to clients (read data) |
+| `xrootd_requests_total` | counter | `port`, `auth`, `op`, `status` | Requests completed, broken down by operation and outcome |
+
+**Labels:**
+
+| Label | Values | Meaning |
+|---|---|---|
+| `port` | `"1094"`, `"1095"`, … | TCP listen port for the server block |
+| `auth` | `"anon"`, `"gsi"` | Authentication mode configured for the server |
+| `op` | see below | XRootD request type |
+| `status` | `"ok"`, `"error"` | Whether the operation succeeded |
+
+**`op` values for `xrootd_requests_total`:**
+
+`login`, `auth`, `stat`, `open_rd`, `open_wr`, `read`, `write`, `sync`, `close`, `dirlist`, `mkdir`, `rmdir`, `rm`, `mv`, `chmod`, `truncate`, `ping`
+
+Error series (`status="error"`) are omitted from the output when the counter is zero to keep scrape output compact.
+
+### Example output
+
+```
+# HELP xrootd_connections_total Total TCP connections accepted since process start.
+# TYPE xrootd_connections_total counter
+xrootd_connections_total{port="1094",auth="anon"} 42
+xrootd_connections_total{port="1095",auth="gsi"} 7
+# HELP xrootd_connections_active Currently open XRootD connections.
+# TYPE xrootd_connections_active gauge
+xrootd_connections_active{port="1094",auth="anon"} 3
+xrootd_connections_active{port="1095",auth="gsi"} 0
+# HELP xrootd_bytes_rx_total Bytes received from clients (write payloads).
+# TYPE xrootd_bytes_rx_total counter
+xrootd_bytes_rx_total{port="1094",auth="anon"} 12582912
+# HELP xrootd_bytes_tx_total Bytes sent to clients (read data).
+# TYPE xrootd_bytes_tx_total counter
+xrootd_bytes_tx_total{port="1094",auth="anon"} 4194304
+# HELP xrootd_requests_total XRootD requests completed, by operation and status.
+# TYPE xrootd_requests_total counter
+xrootd_requests_total{port="1094",auth="anon",op="login",status="ok"} 42
+xrootd_requests_total{port="1094",auth="anon",op="open_wr",status="ok"} 18
+xrootd_requests_total{port="1094",auth="anon",op="write",status="ok"} 18
+xrootd_requests_total{port="1094",auth="anon",op="close",status="ok"} 35
+```
+
+### Directive reference
+
+| Directive | Context | Default | Description |
+|---|---|---|---|
+| `xrootd_metrics on\|off` | `location` | `off` | Serve Prometheus metrics at this location |
+
+Up to 16 stream server blocks are tracked simultaneously (`XROOTD_METRICS_MAX_SERVERS`). Counters are shared across all nginx worker processes via a shared memory zone and are incremented atomically. Counter values are preserved across `nginx -s reload`.
 
 ---
 
@@ -523,6 +740,35 @@ The write-path resolver (`xrootd_resolve_path_write`) calls `realpath(3)` on the
 
 ---
 
+### 17. `kXR_dirlist` dStat sentinel: `".\n0 0 0 0\n"`
+
+When the client requests per-entry stat (`kXR_dstat` option flag), the response body **must** begin with the 10-byte lead-in string `".\n0 0 0 0\n"`. Without it the XRootD client library (`DirectoryList::HasStatInfo`) does not enter stat-pairing mode and instead treats every newline-delimited line as a separate filename — causing stat info strings to appear as extra directory entries.
+
+The client checks for the 9-byte prefix `".\n0 0 0 0"` at position 0 of the response body. If found it skips those 9 bytes, then pairs up the remaining newline-delimited tokens as (filename, stat-string) alternating. The 10th byte of the lead-in (`\n`) is harmlessly consumed as an empty token because the client's string-splitter skips zero-length fields.
+
+**Wire format (kXR_dstat):**
+```
+".\n0 0 0 0\n"                 ← 10-byte lead-in
+"<name1>\n<id1> <sz1> <fl1> <mt1>\n"   ← entry + stat pair
+"<name2>\n<id2> <sz2> <fl2> <mt2>\n"   ← entry + stat pair
+...
+```
+The last `\n` is replaced by `\0` (NUL terminator) rather than appending `\0` after it. The client parses the body as a C string, so interior entries must not contain NUL bytes.
+
+**Stat field order is `id size flags mtime`** (size before flags) — the same order used by `kXR_stat` and `kXR_open` retstat.
+
+---
+
+### 18. State machine: `XRD_ST_SENDING` guard in the write handler
+
+A subtle concurrency hazard exists between the nginx write event handler and the AIO completion path. When `xrootd_queue_response_base` finds the send buffer full (`EAGAIN`) it stores the remaining data in `ctx->wbuf`, transitions to `XRD_ST_SENDING`, and arms the write event. The write handler is later called to drain `ctx->wbuf`.
+
+Between arming the write event and the write handler firing, the AIO completion (`xrootd_read_aio_done` / `xrootd_write_aio_done`) may fire first via `ngx_post_event`, advance the state machine to `XRD_ST_AIO`, `XRD_ST_REQ_PAYLOAD`, or `XRD_ST_REQ_HEADER`, and dispatch a new request. If the write handler then unconditionally resets state to `XRD_ST_REQ_HEADER` and calls `ngx_stream_xrootd_recv`, a second concurrent AIO is dispatched. When both complete, the second overwrites `ctx->wbuf` before the first's bytes are sent, silently discarding part of a response and corrupting the TCP stream.
+
+**Fix:** `ngx_stream_xrootd_send` checks `ctx->state` after flushing. If state is no longer `XRD_ST_SENDING`, the state machine has already advanced via the read-event path and the write handler returns immediately without calling `ngx_stream_xrootd_recv`.
+
+---
+
 ## Protocol reference
 
 The implementation was derived from three authoritative sources checked against each other:
@@ -541,13 +787,9 @@ Items deferred from this implementation, roughly in priority order:
 
 - **SciToken / WLCG Bearer Token authentication** — complement GSI with token-based auth via `kXR_auth` / `kXR_authmore`
 - **TLS** — negotiate `kXR_haveTLS` / `kXR_gotoTLS` so clients can use `roots://`
-- **`kXR_readv`** — vectored read (scatter-gather); important for ROOT file I/O patterns which issue many small reads at known offsets
 - **Streaming write I/O** — replace full-payload buffering in pgwrite with streaming pwrite() to avoid 8 MB per-connection allocation for large uploads
-- **Async file I/O** — replace synchronous `read(2)` / `pwrite(2)` with nginx's native async file I/O (`ngx_file_aio`) to avoid blocking worker processes on slow storage
-- **`kXR_query`** — respond to checksum and space-usage queries
 - **`kXR_locate`** — redirect clients to the optimal replica
 - **RHEL 9 packaging** — RPM spec and `modulemd` for deployment via standard OS channels
-- **Prometheus metrics** — expose per-server byte counters and open-file gauges
 
 ---
 
@@ -555,18 +797,31 @@ Items deferred from this implementation, roughly in priority order:
 
 ```
 nginx-xrootd/
-├── config                         # nginx build system integration
+├── config                                   # nginx build system integration (stream + HTTP modules)
 ├── src/
-│   ├── xrootd_protocol.h          # XRootD wire constants and packed structs
-│   └── ngx_stream_xrootd_module.c # nginx stream module implementation
+│   ├── xrootd_protocol.h                    # XRootD wire constants and packed structs
+│   ├── ngx_xrootd_metrics.h                 # shared counter structs and op index constants
+│   ├── ngx_stream_xrootd_module.c           # nginx stream module (XRootD protocol handler)
+│   └── ngx_http_xrootd_metrics_module.c     # nginx HTTP module (Prometheus /metrics endpoint)
 └── tests/
     ├── test_xrootd.py             # functional tests (stat, read, dirlist, GSI auth)
     ├── test_write.py              # upload tests (pgwrite, integrity, GSI write)
     ├── test_fs_ops.py             # filesystem ops (mkdir, rmdir, rm, mv, chmod; anon + GSI)
     ├── test_file_api.py           # comprehensive File/FileSystem API tests (71 tests)
+    ├── test_metrics.py            # Prometheus metrics endpoint tests (14 tests)
+    ├── test_query.py              # kXR_query tests — checksum and space (14 tests)
+    ├── test_conformance.py        # protocol conformance: nginx vs reference xrootd (30 tests)
     ├── test_throughput.py         # throughput benchmarks (anon vs GSI)
-    └── test_concurrent.py         # concurrent transfer tests (n=1..8)
+    └── test_concurrent.py         # concurrent transfer tests (n=1..8, anon + GSI)
 ```
+
+Run all functional tests (201 tests, ~2 min):
+
+```bash
+pytest tests/ --ignore=tests/test_throughput.py -v
+```
+
+The conformance suite (`test_conformance.py`) starts a reference xrootd server on port 11096 pointing at the same data directory, then compares nginx responses against it for ping, stat, read, dirlist, checksum, write round-trip, open, and path-security operations.
 
 ---
 

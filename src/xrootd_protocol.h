@@ -162,6 +162,14 @@ typedef int64_t   kXR_int64;
 
 /* ------------------------------------------------------------------ */
 /* Stat response flags                                                  */
+/*                                                                      */
+/* These are combined into an integer and sent as a decimal string.    */
+/*                                                                      */
+/* kXR_stat / kXR_open retstat / kXR_dirlist dStat wire format:        */
+/*   "<id> <size> <flags> <mtime>\0"                                   */
+/* Field order: size comes BEFORE flags (not the other way around).    */
+/* Swapping them causes the client to misinterpret kXR_isDir (2) or   */
+/* kXR_readable (16) as the file size.                                 */
 /* ------------------------------------------------------------------ */
 
 #define kXR_file        0     /* regular file (no bit set) */
@@ -197,8 +205,27 @@ typedef int64_t   kXR_int64;
 #define kXR_vfs         1      /* stat the VFS, not the file */
 
 /* Dirlist options */
-#define kXR_dstat       0x02   /* include per-entry stat info */
+#define kXR_dstat       0x02   /* include per-entry stat info; see note below */
 #define kXR_online      0x01   /* only online entries */
+
+/*
+ * kXR_dstat wire format note:
+ *
+ * When kXR_dstat is set the server MUST prepend the 10-byte sentinel
+ *   ".\n0 0 0 0\n"
+ * to the response body before any real entries.  The XRootD client checks
+ * for the 9-byte prefix ".\n0 0 0 0" (DirectoryList::dStatPrefix) and only
+ * enters stat-pairing mode if it is present.  Without it the client treats
+ * every newline-delimited line (including stat lines) as a plain filename.
+ *
+ * Body layout (after the lead-in):
+ *   "<name1>\n<id1> <size1> <flags1> <mtime1>\n"   ← pair
+ *   "<name2>\n<id2> <size2> <flags2> <mtime2>\n"   ← pair
+ *   ...
+ * The final '\n' is replaced by '\0' (NUL-terminator).
+ * Intermediate kXR_oksofar chunks do NOT carry the lead-in or a NUL;
+ * they are raw newline-delimited data that the client accumulates.
+ */
 
 /* ------------------------------------------------------------------ */
 /* Packed wire structures                                               */
@@ -221,15 +248,25 @@ typedef struct {
 } ClientInitHandShake;   /* 20 bytes */
 
 /*
- * ServerInitHandShake — 12 bytes sent by the server in response.
- * NOTE: this is NOT in standard response-header format. It is its own
- * special framing (msglen + protover + msgval).
+ * ServerInitHandShake — legacy 12-byte server handshake response.
+ *
+ * This is NOT standard ServerResponseHdr framing — it has its own layout:
+ *   msglen[4] + protover[4] + msgval[4]
+ *
+ * DO NOT USE for XRootD v5 clients.  v5 clients send handshake + kXR_protocol
+ * as a single 44-byte segment and expect EACH server reply to be a standard
+ * 8-byte ServerResponseHdr + body.  Sending this old 12-byte frame parses as
+ * status=0x0008 / dlen=1312, causing the client to stall.
+ *
+ * This struct is kept for reference only.  The module responds to the
+ * handshake with a standard ServerResponseHdr{streamid={0,0}, status=kXR_ok,
+ * dlen=8} followed by 8 bytes of protover+msgval.
  */
 typedef struct {
     kXR_unt32  msglen;   /* htonl(8): 8 more bytes follow */
     kXR_unt32  protover; /* server protocol version       */
     kXR_unt32  msgval;   /* kXR_LBalServer=0 or kXR_DataServer=1 */
-} ServerInitHandShake;   /* 12 bytes */
+} ServerInitHandShake;   /* 12 bytes — legacy, not used */
 
 /* ------------------------------------------------------------------ */
 /* Standard request header — shared by every request (24 bytes)        */
@@ -561,6 +598,75 @@ typedef struct {
     kXR_int32  dlen;         /* path length */
     /* null-terminated path follows as payload */
 } ClientChmodRequest;        /* 24 bytes */
+
+/* ------------------------------------------------------------------ */
+/* kXR_readv (3025) — scatter-gather / vector read                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Each entry in the kXR_readv request payload describes one read segment.
+ * The response body is the same structure (with actual rlen filled in)
+ * followed immediately by rlen bytes of file data, repeated N times.
+ *
+ * Wire sizes (all big-endian):
+ *   fhandle  4 bytes  open file handle (same as kXR_open response)
+ *   rlen     4 bytes  requested / actual byte count
+ *   offset   8 bytes  file byte offset
+ *   -------- 16 bytes per segment
+ *
+ * Max elements: XrdProto::maxRvecsz = 16384 / 16 = 1024 per request.
+ * Source: XProtocol.hh  struct readahead_list / read_list
+ */
+typedef struct {
+    kXR_char   fhandle[4];  /* open file handle from kXR_open              */
+    kXR_int32  rlen;        /* request: bytes wanted; response: bytes given */
+    kXR_int64  offset;      /* file byte offset                             */
+} readahead_list;           /* 16 bytes; network byte order                 */
+
+#define XROOTD_READV_SEGSIZE  16    /* sizeof(readahead_list) */
+#define XROOTD_READV_MAXSEGS  1024  /* XrdProto::maxRvecsz                 */
+
+typedef struct {
+    kXR_char   streamid[2];
+    kXR_unt16  requestid;   /* kXR_readv */
+    kXR_char   reserved[15];
+    kXR_char   pathid;      /* 0 for primary path */
+    kXR_int32  dlen;        /* N * sizeof(readahead_list) */
+    /* payload: N readahead_list structs */
+} ClientReadVRequest;       /* 24 bytes */
+
+/* ------------------------------------------------------------------ */
+/* kXR_query (3001)                                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Query type codes (infotype field in ClientQueryRequest).
+ * Source: XProtocol.hh enum XQueryType (kXR_Q* constants).
+ * These are the values that xrdcp v5 and the XRootD Python client send.
+ */
+#define kXR_QStats      1   /* server statistics (text)                  */
+#define kXR_QPrep       2   /* prepare queue status                      */
+#define kXR_Qcksum      3   /* compute file checksum by path or handle   */
+#define kXR_Qxattr      4   /* extended attributes                       */
+#define kXR_Qspace      5   /* storage space information (oss.* text)    */
+#define kXR_Qckscan     6   /* checksum cancel / scan                    */
+#define kXR_Qconfig     7   /* server configuration items (text)         */
+#define kXR_Qvisa       8   /* visa string                               */
+#define kXR_QFinfo      9   /* file information                          */
+#define kXR_QFSinfo    10   /* filesystem information                    */
+#define kXR_Qopaque    16   /* opaque string (path-attached)             */
+#define kXR_Qopaquf    32   /* opaque string (file-attached)             */
+
+typedef struct {
+    kXR_char   streamid[2];
+    kXR_unt16  requestid;   /* kXR_query */
+    kXR_unt16  infotype;    /* one of kXR_Q* above                       */
+    kXR_char   reserved1[2];
+    kXR_char   fhandle[4];  /* open file handle (for handle-based queries) */
+    kXR_char   reserved2[8];
+    kXR_int32  dlen;        /* path length (0 for handle-based queries)  */
+    /* null-terminated path follows as payload when dlen > 0             */
+} ClientQueryRequest;       /* 24 bytes */
 
 /* ------------------------------------------------------------------ */
 /* kXR_endsess (3023)                                                   */
