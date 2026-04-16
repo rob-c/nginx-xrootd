@@ -577,9 +577,19 @@ xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c)
         return xrootd_send_ok(ctx, c, NULL, 0);
     }
 
-    ngx_log_debug2(NGX_LOG_DEBUG_STREAM, c->log, 0,
-                   "xrootd: kXR_auth credtype=\"%.4s\" payloadlen=%d",
-                   ctx->cur_body, (int) ctx->cur_dlen);
+    {
+        char credtype[5];
+        char safe_credtype[32];
+
+        ngx_memcpy(credtype, ctx->cur_body, 4);
+        credtype[4] = '\0';
+        xrootd_sanitize_log_string(credtype, safe_credtype,
+                                   sizeof(safe_credtype));
+
+        ngx_log_debug2(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                       "xrootd: kXR_auth credtype=\"%s\" payloadlen=%d",
+                       safe_credtype, (int) ctx->cur_dlen);
+    }
 
     if (ctx->payload == NULL || ctx->cur_dlen < 8) {
         /* Need at least "gsi\0" + 4-byte step number before parsing buckets. */
@@ -681,6 +691,24 @@ xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c)
                     sizeof(ctx->dn) - 1);
         OPENSSL_free(dn_str);
     }
+
+#if defined(XROOTD_HAVE_VOMS)
+    /* Extract VOMS VO membership while the cert chain is still live.
+     * Must happen before sk_X509_pop_free frees the chain below. */
+    if (conf->vomsdir.len > 0 && conf->voms_cert_dir.len > 0) {
+        ngx_int_t voms_rc = xrootd_extract_voms_info(
+            c->log, leaf, chain,
+            &conf->vomsdir, &conf->voms_cert_dir,
+            ctx->primary_vo, sizeof(ctx->primary_vo),
+            ctx->vo_list,    sizeof(ctx->vo_list));
+        if (voms_rc == NGX_OK) {
+            char vo_log[256];
+            xrootd_sanitize_log_string(ctx->vo_list, vo_log, sizeof(vo_log));
+            ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                          "xrootd: VOMS VO membership: %s", vo_log);
+        }
+    }
+#endif
 
     sk_X509_pop_free(chain, X509_free);
 

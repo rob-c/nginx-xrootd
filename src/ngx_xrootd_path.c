@@ -7,6 +7,304 @@ xrootd_hex_digit(u_char value)
                         : (u_char) ('A' + (value - 10));
 }
 
+static int xrootd_get_canonical_root(ngx_log_t *log, const ngx_str_t *root,
+                                     char *root_canon, size_t root_canon_sz);
+static int xrootd_path_component_forbidden(const char *comp, size_t comp_len);
+
+static ngx_flag_t
+xrootd_path_prefix_match(const char *prefix, const char *path)
+{
+    size_t prefix_len;
+
+    if (prefix == NULL || path == NULL) {
+        return 0;
+    }
+
+    prefix_len = strlen(prefix);
+    if (strncmp(prefix, path, prefix_len) != 0) {
+        return 0;
+    }
+
+    return path[prefix_len] == '\0' || path[prefix_len] == '/';
+}
+
+static mode_t
+xrootd_parent_group_mode_bits(const struct stat *parent, const struct stat *child)
+{
+    mode_t group_bits;
+
+    if (S_ISDIR(child->st_mode)) {
+        group_bits = parent->st_mode & S_IRWXG;
+    } else {
+        group_bits = parent->st_mode & (S_IRGRP | S_IWGRP);
+        if (child->st_mode & S_IXGRP) {
+            group_bits |= S_IXGRP;
+        }
+    }
+
+    return group_bits;
+}
+
+static ngx_int_t
+xrootd_apply_parent_group_policy_impl(ngx_log_t *log, int fd,
+                                      const char *path, ngx_array_t *rules)
+{
+    const xrootd_group_rule_t *rule;
+    struct stat                parent_st;
+    struct stat                child_st;
+    char                       parent[PATH_MAX];
+    char                      *slash;
+    mode_t                     desired_mode;
+    int                        rc;
+
+    (void) log;
+
+    rule = xrootd_find_group_rule(path, rules);
+    if (rule == NULL) {
+        return NGX_DECLINED;
+    }
+
+    rc = snprintf(parent, sizeof(parent), "%s", path);
+    if (rc < 0 || (size_t) rc >= sizeof(parent)) {
+        errno = ENAMETOOLONG;
+        return NGX_ERROR;
+    }
+
+    slash = strrchr(parent, '/');
+    if (slash == NULL || slash == parent) {
+        return NGX_DECLINED;
+    }
+
+    *slash = '\0';
+
+    if (stat(parent, &parent_st) != 0) {
+        return NGX_ERROR;
+    }
+
+    if (fd >= 0) {
+        if (fstat(fd, &child_st) != 0) {
+            return NGX_ERROR;
+        }
+    } else {
+        if (stat(path, &child_st) != 0) {
+            return NGX_ERROR;
+        }
+    }
+
+    desired_mode = (child_st.st_mode & ~(S_IRWXG | S_ISGID))
+                 | xrootd_parent_group_mode_bits(&parent_st, &child_st);
+
+    if (S_ISDIR(child_st.st_mode) && (parent_st.st_mode & S_ISGID)) {
+        desired_mode |= S_ISGID;
+    }
+
+    if (child_st.st_gid != parent_st.st_gid) {
+        if (fd >= 0) {
+            if (fchown(fd, (uid_t) -1, parent_st.st_gid) != 0) {
+                return NGX_ERROR;
+            }
+        } else {
+            if (chown(path, (uid_t) -1, parent_st.st_gid) != 0) {
+                return NGX_ERROR;
+            }
+        }
+    }
+
+    if ((child_st.st_mode & 07777) != (desired_mode & 07777)) {
+        if (fd >= 0) {
+            if (fchmod(fd, desired_mode & 07777) != 0) {
+                return NGX_ERROR;
+            }
+        } else {
+            if (chmod(path, desired_mode & 07777) != 0) {
+                return NGX_ERROR;
+            }
+        }
+    }
+
+    return NGX_OK;
+}
+
+#if defined(XROOTD_HAVE_VOMS)
+static ngx_flag_t
+xrootd_append_vo_token(char *primary_vo, size_t primary_vo_sz,
+                       char *vo_list, size_t vo_list_sz, const char *vo)
+{
+    size_t list_len;
+    size_t vo_len;
+
+    if (vo == NULL || vo[0] == '\0') {
+        return 1;
+    }
+
+    if (xrootd_vo_list_contains(vo_list, vo)) {
+        return 1;
+    }
+
+    vo_len = strlen(vo);
+    list_len = strlen(vo_list);
+
+    if (list_len == 0) {
+        if (vo_len + 1 > vo_list_sz || vo_len + 1 > primary_vo_sz) {
+            return 0;
+        }
+
+        ngx_cpystrn((u_char *) vo_list, (const u_char *) vo, vo_list_sz);
+        ngx_cpystrn((u_char *) primary_vo, (const u_char *) vo, primary_vo_sz);
+        return 1;
+    }
+
+    if (list_len + 1 + vo_len + 1 > vo_list_sz) {
+        return 0;
+    }
+
+    vo_list[list_len++] = ',';
+    ngx_memcpy(vo_list + list_len, vo, vo_len);
+    vo_list[list_len + vo_len] = '\0';
+    return 1;
+}
+
+static ngx_flag_t
+xrootd_fqan_to_vo(const char *fqan, char *vo, size_t vo_sz)
+{
+    const char *start;
+    const char *end;
+    size_t      len;
+
+    if (fqan == NULL || fqan[0] != '/') {
+        return 0;
+    }
+
+    start = fqan + 1;
+    end = strchr(start, '/');
+    if (end == NULL || end == start) {
+        return 0;
+    }
+
+    len = (size_t) (end - start);
+    if (len + 1 > vo_sz) {
+        return 0;
+    }
+
+    ngx_memcpy(vo, start, len);
+    vo[len] = '\0';
+    return 1;
+}
+
+ngx_int_t
+xrootd_extract_voms_info(ngx_log_t *log, X509 *leaf, STACK_OF(X509) *chain,
+                         const ngx_str_t *vomsdir, const ngx_str_t *cert_dir,
+                         char *primary_vo, size_t primary_vo_sz,
+                         char *vo_list, size_t vo_list_sz)
+{
+    struct vomsdata *vd;
+    struct voms    **entry;
+    STACK_OF(X509)  *voms_chain = NULL;
+    char             vomsdir_buf[PATH_MAX];
+    char             cert_dir_buf[PATH_MAX];
+    char             errbuf[512];
+    int              error = 0;
+    ngx_int_t        rc = NGX_DECLINED;
+
+    if (leaf == NULL || vomsdir == NULL || cert_dir == NULL
+        || vomsdir->len == 0 || cert_dir->len == 0)
+    {
+        return NGX_DECLINED;
+    }
+
+    if (vomsdir->len >= sizeof(vomsdir_buf) || cert_dir->len >= sizeof(cert_dir_buf)) {
+        return NGX_ERROR;
+    }
+
+    ngx_memcpy(vomsdir_buf, vomsdir->data, vomsdir->len);
+    vomsdir_buf[vomsdir->len] = '\0';
+    ngx_memcpy(cert_dir_buf, cert_dir->data, cert_dir->len);
+    cert_dir_buf[cert_dir->len] = '\0';
+
+    if (primary_vo != NULL && primary_vo_sz > 0) {
+        primary_vo[0] = '\0';
+    }
+    if (vo_list != NULL && vo_list_sz > 0) {
+        vo_list[0] = '\0';
+    }
+
+    vd = VOMS_Init(vomsdir_buf, cert_dir_buf);
+    if (vd == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (chain != NULL && sk_X509_num(chain) > 0) {
+        voms_chain = sk_X509_dup(chain);
+        if (voms_chain == NULL) {
+            VOMS_Destroy(vd);
+            return NGX_ERROR;
+        }
+
+        if (sk_X509_num(voms_chain) > 0
+            && X509_cmp(sk_X509_value(voms_chain, 0), leaf) == 0)
+        {
+            sk_X509_delete(voms_chain, 0);
+        }
+    }
+
+    if (!VOMS_Retrieve(leaf, voms_chain, RECURSE_CHAIN, vd, &error)) {
+        if (error != VERR_NOEXT && error != VERR_NODATA) {
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                          "xrootd: VOMS extraction failed: %s",
+                          VOMS_ErrorMessage(vd, error, errbuf, sizeof(errbuf)));
+            rc = NGX_ERROR;
+        }
+        goto done;
+    }
+
+    if (vd->data == NULL) {
+        goto done;
+    }
+
+    for (entry = vd->data; *entry != NULL; entry++) {
+        char **fqan;
+        char   derived_vo[128];
+
+        if ((*entry)->voname != NULL && (*entry)->voname[0] != '\0') {
+            if (!xrootd_append_vo_token(primary_vo, primary_vo_sz,
+                                        vo_list, vo_list_sz,
+                                        (*entry)->voname)) {
+                rc = NGX_ERROR;
+                goto done;
+            }
+        }
+
+        if ((*entry)->fqan == NULL) {
+            continue;
+        }
+
+        for (fqan = (*entry)->fqan; *fqan != NULL; fqan++) {
+            if (!xrootd_fqan_to_vo(*fqan, derived_vo, sizeof(derived_vo))) {
+                continue;
+            }
+
+            if (!xrootd_append_vo_token(primary_vo, primary_vo_sz,
+                                        vo_list, vo_list_sz,
+                                        derived_vo)) {
+                rc = NGX_ERROR;
+                goto done;
+            }
+        }
+    }
+
+    if (vo_list != NULL && vo_list[0] != '\0') {
+        rc = NGX_OK;
+    }
+
+done:
+    if (voms_chain != NULL) {
+        sk_X509_free(voms_chain);
+    }
+    VOMS_Destroy(vd);
+    return rc;
+}
+#endif
+
 size_t
 xrootd_sanitize_log_string(const char *in, char *out, size_t outsz)
 {
@@ -41,6 +339,331 @@ xrootd_sanitize_log_string(const char *in, char *out, size_t outsz)
 
     out[written] = '\0';
     return written;
+}
+
+ngx_int_t
+xrootd_normalize_policy_path(ngx_pool_t *pool, const ngx_str_t *src,
+                             ngx_str_t *dst)
+{
+    u_char *out;
+    size_t  i = 0;
+    size_t  written = 0;
+
+    if (pool == NULL || src == NULL || dst == NULL || src->len == 0) {
+        return NGX_ERROR;
+    }
+
+    out = ngx_pnalloc(pool, src->len + 2);
+    if (out == NULL) {
+        return NGX_ERROR;
+    }
+
+    out[written++] = '/';
+
+    while (i < src->len) {
+        size_t start;
+        size_t seg_len;
+
+        while (i < src->len && src->data[i] == '/') {
+            i++;
+        }
+
+        if (i == src->len) {
+            break;
+        }
+
+        start = i;
+        while (i < src->len && src->data[i] != '/') {
+            i++;
+        }
+
+        seg_len = i - start;
+        if (seg_len == 0) {
+            continue;
+        }
+
+        if (xrootd_path_component_forbidden((const char *) src->data + start,
+                                            seg_len)) {
+            return NGX_ERROR;
+        }
+
+        if (written > 1) {
+            out[written++] = '/';
+        }
+
+        ngx_memcpy(out + written, src->data + start, seg_len);
+        written += seg_len;
+    }
+
+    if (written == 0) {
+        out[written++] = '/';
+    }
+
+    out[written] = '\0';
+    dst->data = out;
+    dst->len = written;
+    return NGX_OK;
+}
+
+ngx_array_t *
+xrootd_merge_arrays(ngx_conf_t *cf, ngx_array_t *parent, ngx_array_t *child,
+                    size_t element_size)
+{
+    ngx_array_t *merged;
+    char        *dst;
+    size_t       total = 0;
+
+    if (parent != NULL) {
+        total += parent->nelts;
+    }
+    if (child != NULL) {
+        total += child->nelts;
+    }
+
+    if (total == 0) {
+        return NULL;
+    }
+
+    merged = ngx_array_create(cf->pool, (ngx_uint_t) total, element_size);
+    if (merged == NULL) {
+        return NULL;
+    }
+
+    if (parent != NULL && parent->nelts > 0) {
+        dst = ngx_array_push_n(merged, parent->nelts);
+        if (dst == NULL) {
+            return NULL;
+        }
+        ngx_memcpy(dst, parent->elts, parent->nelts * element_size);
+    }
+
+    if (child != NULL && child->nelts > 0) {
+        dst = ngx_array_push_n(merged, child->nelts);
+        if (dst == NULL) {
+            return NULL;
+        }
+        ngx_memcpy(dst, child->elts, child->nelts * element_size);
+    }
+
+    return merged;
+}
+
+ngx_int_t
+xrootd_finalize_vo_rules(ngx_log_t *log, const ngx_str_t *root,
+                         ngx_array_t *rules)
+{
+    xrootd_vo_rule_t *rule;
+    ngx_uint_t        i;
+    char              root_canon[PATH_MAX];
+
+    if (rules == NULL) {
+        return NGX_OK;
+    }
+
+    if (!xrootd_get_canonical_root(log, root, root_canon, sizeof(root_canon))) {
+        return NGX_ERROR;
+    }
+
+    rule = rules->elts;
+    for (i = 0; i < rules->nelts; i++) {
+        if (rule[i].path.len == 1 && rule[i].path.data[0] == '/') {
+            ngx_cpystrn((u_char *) rule[i].resolved, (u_char *) root_canon,
+                        sizeof(rule[i].resolved));
+            continue;
+        }
+
+        if (!xrootd_resolve_path_noexist(log, root, (const char *) rule[i].path.data,
+                                         rule[i].resolved,
+                                         sizeof(rule[i].resolved))) {
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
+}
+
+ngx_int_t
+xrootd_finalize_group_rules(ngx_log_t *log, const ngx_str_t *root,
+                            ngx_array_t *rules)
+{
+    xrootd_group_rule_t *rule;
+    ngx_uint_t           i;
+    char                 root_canon[PATH_MAX];
+
+    if (rules == NULL) {
+        return NGX_OK;
+    }
+
+    if (!xrootd_get_canonical_root(log, root, root_canon, sizeof(root_canon))) {
+        return NGX_ERROR;
+    }
+
+    rule = rules->elts;
+    for (i = 0; i < rules->nelts; i++) {
+        if (rule[i].path.len == 1 && rule[i].path.data[0] == '/') {
+            ngx_cpystrn((u_char *) rule[i].resolved, (u_char *) root_canon,
+                        sizeof(rule[i].resolved));
+            continue;
+        }
+
+        if (!xrootd_resolve_path_noexist(log, root, (const char *) rule[i].path.data,
+                                         rule[i].resolved,
+                                         sizeof(rule[i].resolved))) {
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
+}
+
+const xrootd_vo_rule_t *
+xrootd_find_vo_rule(const char *resolved_path, ngx_array_t *rules)
+{
+    const xrootd_vo_rule_t *best = NULL;
+    xrootd_vo_rule_t       *rule;
+    size_t                  best_len = 0;
+    ngx_uint_t              i;
+
+    if (resolved_path == NULL || rules == NULL) {
+        return NULL;
+    }
+
+    rule = rules->elts;
+    for (i = 0; i < rules->nelts; i++) {
+        size_t rule_len = strlen(rule[i].resolved);
+
+        if (!xrootd_path_prefix_match(rule[i].resolved, resolved_path)) {
+            continue;
+        }
+
+        if (rule_len >= best_len) {
+            best = &rule[i];
+            best_len = rule_len;
+        }
+    }
+
+    return best;
+}
+
+const xrootd_group_rule_t *
+xrootd_find_group_rule(const char *resolved_path, ngx_array_t *rules)
+{
+    const xrootd_group_rule_t *best = NULL;
+    xrootd_group_rule_t       *rule;
+    size_t                     best_len = 0;
+    ngx_uint_t                 i;
+
+    if (resolved_path == NULL || rules == NULL) {
+        return NULL;
+    }
+
+    rule = rules->elts;
+    for (i = 0; i < rules->nelts; i++) {
+        size_t rule_len = strlen(rule[i].resolved);
+
+        if (!xrootd_path_prefix_match(rule[i].resolved, resolved_path)) {
+            continue;
+        }
+
+        if (rule_len >= best_len) {
+            best = &rule[i];
+            best_len = rule_len;
+        }
+    }
+
+    return best;
+}
+
+ngx_flag_t
+xrootd_vo_list_contains(const char *vo_list, const char *required_vo)
+{
+    const char *start;
+    const char *end;
+    size_t      required_len;
+
+    if (required_vo == NULL || required_vo[0] == '\0') {
+        return 1;
+    }
+
+    if (vo_list == NULL || vo_list[0] == '\0') {
+        return 0;
+    }
+
+    required_len = strlen(required_vo);
+    start = vo_list;
+
+    while (*start != '\0') {
+        end = strchr(start, ',');
+        if (end == NULL) {
+            end = start + strlen(start);
+        }
+
+        if ((size_t) (end - start) == required_len
+            && ngx_strncmp(start, required_vo, required_len) == 0)
+        {
+            return 1;
+        }
+
+        start = (*end == '\0') ? end : end + 1;
+    }
+
+    return 0;
+}
+
+/*
+ * Check whether the resolved path is accessible given the client's VO
+ * membership list.  Returns NGX_OK if allowed, NGX_ERROR if denied.
+ *
+ * Allow rules:
+ *   - No vo_rules configured → open access.
+ *   - Resolved path is not under any restricted tree → open access.
+ *   - Path is under a restricted tree and client's vo_list contains the
+ *     required VO → access granted.
+ *   - Otherwise → denied.
+ */
+ngx_int_t
+xrootd_check_vo_acl(ngx_log_t *log, const char *resolved_path,
+                    ngx_array_t *vo_rules, const char *vo_list)
+{
+    const xrootd_vo_rule_t *rule;
+    char                    safe_path[512];
+    char                    safe_vo[128];
+
+    if (vo_rules == NULL || vo_rules->nelts == 0) {
+        return NGX_OK;
+    }
+
+    rule = xrootd_find_vo_rule(resolved_path, vo_rules);
+    if (rule == NULL) {
+        return NGX_OK;
+    }
+
+    if (xrootd_vo_list_contains(vo_list, (const char *) rule->vo.data)) {
+        return NGX_OK;
+    }
+
+    xrootd_sanitize_log_string(resolved_path, safe_path, sizeof(safe_path));
+    xrootd_sanitize_log_string((const char *) rule->vo.data, safe_vo, sizeof(safe_vo));
+    ngx_log_error(NGX_LOG_WARN, log, 0,
+                  "xrootd: VO ACL denied path=\"%s\" required_vo=\"%s\" "
+                  "client_vos=\"%s\"",
+                  safe_path, safe_vo, (vo_list && vo_list[0]) ? vo_list : "-");
+
+    return NGX_ERROR;
+}
+
+ngx_int_t
+xrootd_apply_parent_group_policy_fd(ngx_log_t *log, int fd, const char *path,
+                                    ngx_array_t *rules)
+{
+    return xrootd_apply_parent_group_policy_impl(log, fd, path, rules);
+}
+
+ngx_int_t
+xrootd_apply_parent_group_policy_path(ngx_log_t *log, const char *path,
+                                      ngx_array_t *rules)
+{
+    return xrootd_apply_parent_group_policy_impl(log, -1, path, rules);
 }
 
 static void
@@ -433,6 +1056,13 @@ xrootd_resolve_path_write(ngx_log_t *log, const ngx_str_t *root,
 int
 xrootd_mkdir_recursive(const char *path, mode_t mode)
 {
+    return xrootd_mkdir_recursive_policy(path, mode, NULL, NULL);
+}
+
+int
+xrootd_mkdir_recursive_policy(const char *path, mode_t mode,
+                              ngx_log_t *log, ngx_array_t *rules)
+{
     char  tmp[PATH_MAX];
     char *p;
     int   n;
@@ -451,8 +1081,14 @@ xrootd_mkdir_recursive(const char *path, mode_t mode)
         if (*p == '/') {
             /* Temporarily cut the string here so mkdir() sees the current prefix only. */
             *p = '\0';
-            if (mkdir(tmp, mode) != 0 && errno != EEXIST) {
-                return -1;
+            if (mkdir(tmp, mode) != 0) {
+                if (errno != EEXIST) {
+                    return -1;
+                }
+            } else if (log != NULL && rules != NULL) {
+                if (xrootd_apply_parent_group_policy_path(log, tmp, rules) == NGX_ERROR) {
+                    return -1;
+                }
             }
             /* Restore the separator and continue with the next deeper component. */
             *p = '/';
@@ -460,8 +1096,14 @@ xrootd_mkdir_recursive(const char *path, mode_t mode)
     }
 
     /* Final mkdir handles the full requested path after all parent prefixes. */
-    if (mkdir(tmp, mode) != 0 && errno != EEXIST) {
-        return -1;
+    if (mkdir(tmp, mode) != 0) {
+        if (errno != EEXIST) {
+            return -1;
+        }
+    } else if (log != NULL && rules != NULL) {
+        if (xrootd_apply_parent_group_policy_path(log, tmp, rules) == NGX_ERROR) {
+            return -1;
+        }
     }
 
     return 0;

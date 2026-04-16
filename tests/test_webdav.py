@@ -481,6 +481,68 @@ class TestMkcol:
 
 
 # ---------------------------------------------------------------------------
+# Path hardening
+# ---------------------------------------------------------------------------
+
+class TestPathHardening:
+
+    def test_delete_rejects_double_encoded_nul_path(self):
+        """
+        nginx normalizes the URI once before it reaches the module. A second
+        decode inside the handler must not turn `%2500` into an in-band NUL.
+        """
+        name = f"{_PFX}delete_nul.txt"
+        dst = _data_path(name)
+        with open(dst, "wb") as fh:
+            fh.write(b"webdav nul hardening\n")
+
+        try:
+            code = _http_code(
+                "--path-as-is",
+                "-X", "DELETE",
+                f"{BASE_URL}/{name}%2500tail",
+            )
+            assert code == 400, f"Expected 400 for decoded-NUL path, got {code}"
+            assert os.path.exists(dst), "double-encoded NUL unexpectedly deleted the file"
+        finally:
+            if os.path.exists(dst):
+                os.unlink(dst)
+
+    def test_mkcol_rejects_double_encoded_traversal_segments(self):
+        """
+        A second decode must not reinterpret `%252F..%252F` as `/../` and create
+        a sibling directory outside the requested lexical path.
+        """
+        parent = f"{_PFX}mkcol_parent"
+        target = f"{_PFX}mkcol_escape"
+        parent_path = _data_path(parent)
+        target_path = _data_path(target)
+
+        if os.path.exists(parent_path):
+            shutil.rmtree(parent_path)
+        if os.path.exists(target_path):
+            shutil.rmtree(target_path)
+
+        os.makedirs(parent_path, exist_ok=True)
+
+        try:
+            code = _http_code(
+                "--path-as-is",
+                "-X", "MKCOL",
+                f"{BASE_URL}/{parent}%252F..%252F{target}",
+            )
+            assert code == 403, f"Expected 403 for traversal path, got {code}"
+            assert not os.path.exists(target_path), (
+                "double-encoded traversal unexpectedly created a sibling directory"
+            )
+        finally:
+            if os.path.exists(parent_path):
+                shutil.rmtree(parent_path)
+            if os.path.exists(target_path):
+                shutil.rmtree(target_path)
+
+
+# ---------------------------------------------------------------------------
 # PROPFIND
 # ---------------------------------------------------------------------------
 
@@ -566,6 +628,22 @@ class TestPropfind:
         ns = {"D": "DAV:"}
         lm = root.findall(".//D:getlastmodified", ns)
         assert lm, "D:getlastmodified missing from PROPFIND Depth:0 response"
+
+    def test_propfind_depth1_escapes_xml_metacharacters_in_href(self):
+        """Hostile filenames must not break PROPFIND XML output."""
+        name = f"{_PFX}xml_&_<>.txt"
+        dst = _data_path(name)
+        with open(dst, "wb") as fh:
+            fh.write(b"xml escape\n")
+
+        try:
+            root = self._propfind("/", "1")
+            ns = {"D": "DAV:"}
+            hrefs = [el.text for el in root.findall(".//D:href", ns)]
+            assert f"/{name}" in hrefs, hrefs
+        finally:
+            if os.path.exists(dst):
+                os.unlink(dst)
 
 
 # ---------------------------------------------------------------------------

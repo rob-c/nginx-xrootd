@@ -137,6 +137,56 @@ How many threads to use: a good starting point is one thread per disk spindle, o
 
 ---
 
+### `xrootd_vomsdir <path>`
+
+Path to the directory containing VOMS server information (`.lsc` files), one per VO. Required when `xrootd_require_vo` is used. Compile-time `XROOTD_HAVE_VOMS` flag must be set.
+
+```nginx
+xrootd_vomsdir /etc/voms;
+```
+
+---
+
+### `xrootd_voms_cert_dir <path>`
+
+Path to the hashed CA certificate directory used for verifying VOMS attribute certificates. Required when `xrootd_require_vo` is used.
+
+```nginx
+xrootd_voms_cert_dir /etc/grid-security/certificates;
+```
+
+---
+
+### `xrootd_require_vo <path> <vo>`
+
+Restricts access to `<path>` (and all descendants) to clients whose VOMS proxy certificate includes membership in `<vo>`. Can be specified multiple times for different paths.
+
+`xrootd_auth gsi` and VOMS support (`XROOTD_HAVE_VOMS`) must be enabled.
+
+```nginx
+xrootd_require_vo /atlas atlas;   # only ATLAS members can access /atlas
+xrootd_require_vo /cms   cms;     # only CMS members can access /cms
+```
+
+If a client authenticated with GSI but has no VOMS extensions, they have an empty VO list and will be denied access to any protected path.
+
+---
+
+### `xrootd_inherit_parent_group <path>`
+
+When a file or directory is created under `<path>`, nginx automatically adjusts its GID and group permission bits to match the parent directory. This mimics the Linux `setgid` bit at the application layer, which is useful when the backing filesystem (e.g. CephFS) does not reliably propagate `setgid` across mounts.
+
+```nginx
+xrootd_inherit_parent_group /cms;   # keep /cms/* group-owned by cms group
+```
+
+What happens on each create:
+- **File**: GID set to parent GID; group read/write bits copied from parent; group execute preserved if already set.
+- **Directory**: GID set to parent GID; group rwx bits copied from parent; `S_ISGID` added if the parent has it.
+- **Recursive mkdir (`kXR_mkdirpath`)**: policy applied to each newly created directory level.
+
+---
+
 ## Complete examples
 
 ### Minimal read-only server
@@ -174,6 +224,48 @@ stream {
     }
 }
 ```
+
+### VO-restricted storage with group inheritance (CephFS-style)
+
+```nginx
+worker_processes auto;
+thread_pool default threads=8 max_queue=65536;
+
+events { worker_connections 1024; }
+
+stream {
+    server {
+        listen 1095;
+        xrootd on;
+        xrootd_auth          gsi;
+        xrootd_allow_write   on;
+        xrootd_root          /ceph/store;
+
+        xrootd_certificate     /etc/grid-security/hostcert.pem;
+        xrootd_certificate_key /etc/grid-security/hostkey.pem;
+        xrootd_trusted_ca      /etc/grid-security/ca.pem;
+
+        # VOMS: where to find VO membership information
+        xrootd_vomsdir         /etc/voms;
+        xrootd_voms_cert_dir   /etc/grid-security/certificates;
+
+        # Restrict /atlas and /cms sub-trees to their respective VOs
+        xrootd_require_vo /atlas atlas;
+        xrootd_require_vo /cms   cms;
+
+        # Keep group ownership consistent for all new files/dirs
+        xrootd_inherit_parent_group /atlas;
+        xrootd_inherit_parent_group /cms;
+
+        xrootd_access_log /var/log/nginx/xrootd_gsi.log;
+        xrootd_thread_pool default;
+    }
+}
+```
+
+With `setgid` on the top-level directories (set once with `chmod g+s /ceph/store/atlas /ceph/store/cms`), all files written through nginx will automatically inherit the correct GID and group permissions.
+
+---
 
 ### Two ports: read-only anonymous + read-write GSI-authenticated
 
@@ -230,6 +322,10 @@ http {
 | `xrootd_certificate <path>` | `server` | — | If `auth gsi` |
 | `xrootd_certificate_key <path>` | `server` | — | If `auth gsi` |
 | `xrootd_trusted_ca <path>` | `server` | — | If `auth gsi` |
+| `xrootd_vomsdir <path>` | `server` | — | If `require_vo` |
+| `xrootd_voms_cert_dir <path>` | `server` | — | If `require_vo` |
+| `xrootd_require_vo <path> <vo>` | `server` | — | No |
+| `xrootd_inherit_parent_group <path>` | `server` | — | No |
 | `xrootd_access_log <path>\|off` | `server` | `off` | No |
 | `xrootd_thread_pool <name>` | `server` | `default` | No |
 | `xrootd_metrics on\|off` | `location` (HTTP) | `off` | No |

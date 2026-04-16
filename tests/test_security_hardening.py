@@ -16,7 +16,7 @@ import tempfile
 import time
 
 from XRootD import client
-from XRootD.client.flags import MkDirFlags
+from XRootD.client.flags import DirListFlags, MkDirFlags
 
 
 ANON_URL = "root://localhost:11094"
@@ -31,6 +31,7 @@ kXR_OK = 0
 kXR_ERROR = 4003
 
 kXR_CHMOD = 3002
+kXR_QUERY = 3001
 kXR_LOGIN = 3007
 kXR_MV = 3009
 kXR_RM = 3014
@@ -38,6 +39,7 @@ kXR_RMDIR = 3015
 
 kXR_ARG_INVALID = 3000
 kXR_NOT_AUTHORIZED = 3010
+kXR_QCONFIG = 7
 
 
 def _recv_exact(sock: socket.socket, nbytes: int) -> bytes:
@@ -302,3 +304,62 @@ def test_malicious_path_is_escaped_in_access_and_error_logs():
     assert payload not in access_delta
     assert b"path traversal attempt: /../log\\x0Arm" in error_delta
     assert payload not in error_delta
+
+
+def test_qconfig_long_payload_is_truncated_without_stack_leak():
+    """Long Qconfig queries must stop at the fixed buffer boundary cleanly."""
+    key = b"A" * 120
+    payload = b"\n".join([key] * 20)
+    expected = (key + b"=0\n") * 4
+
+    with _raw_session() as sock:
+        _login_anon(sock, streamid=b"\x00\x09")
+        req = struct.pack(
+            "!2sHH2s4s8sI",
+            b"\x00\x0a",
+            kXR_QUERY,
+            kXR_QCONFIG,
+            b"\x00\x00",
+            b"\x00" * 4,
+            b"\x00" * 8,
+            len(payload),
+        )
+        sock.sendall(req + payload)
+        status, body = _read_response(sock)
+
+    assert status == kXR_OK, f"expected OK response, got {status}"
+    assert body == expected, body
+
+
+def test_dirlist_stat_skips_control_byte_names():
+    """Directory listings must not let newline-bearing names forge extra entries."""
+    fs = client.FileSystem(ANON_URL)
+    dirname = "_harden_dirlist_ctrl"
+    dirpath = os.path.join(DATA_DIR, dirname)
+    safe_name = "safe.txt"
+    bad_name = "evil_dirlist\nshadow.txt"
+
+    os.makedirs(dirpath, exist_ok=True)
+    with open(os.path.join(dirpath, safe_name), "w", encoding="utf-8") as fh:
+        fh.write("safe\n")
+    with open(os.path.join(dirpath, bad_name), "w", encoding="utf-8") as fh:
+        fh.write("unsafe\n")
+
+    try:
+        status, listing = fs.dirlist(f"/{dirname}", DirListFlags.STAT)
+        assert status.ok, f"dirlist failed: {status.message}"
+        names = {entry.name for entry in listing}
+        assert safe_name in names
+        assert bad_name not in names
+        assert "evil_dirlist" not in names
+        assert "shadow.txt" not in names
+    finally:
+        for name in (safe_name, bad_name):
+            try:
+                os.unlink(os.path.join(dirpath, name))
+            except FileNotFoundError:
+                pass
+        try:
+            os.rmdir(dirpath)
+        except FileNotFoundError:
+            pass

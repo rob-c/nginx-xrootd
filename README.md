@@ -109,7 +109,7 @@ Full setup: [docs/getting-started.md](docs/getting-started.md)
 
 ## Status
 
-307 tests pass against xrdcp / XRootD Python client v5.9.2 and nginx 1.28.3.
+302 tests pass against xrdcp / XRootD Python client v5.9.2 and nginx 1.28.3.
 
 ## License
 

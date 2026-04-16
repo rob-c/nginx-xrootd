@@ -385,6 +385,14 @@ xrootd_handle_truncate(xrootd_ctx_t *ctx, ngx_connection_t *c,
                 return xrootd_send_error(ctx, c, kXR_NotFound, "file not found");
             }
         }
+        if (xrootd_check_vo_acl(c->log, resolved, conf->vo_rules,
+                                 ctx->vo_list) != NGX_OK) {
+            xrootd_log_access(ctx, c, "TRUNCATE", resolved, detail,
+                              0, kXR_NotAuthorized, "VO not authorized", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_TRUNCATE);
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "VO not authorized");
+        }
         rc = truncate(resolved, (off_t) length);
         if (rc != 0) {
             xrootd_log_access(ctx, c, "TRUNCATE", resolved, detail,
@@ -481,8 +489,19 @@ xrootd_handle_mkdir(xrootd_ctx_t *ctx, ngx_connection_t *c,
         }
     }
 
+    if (xrootd_check_vo_acl(c->log, resolved, conf->vo_rules,
+                             ctx->vo_list) != NGX_OK) {
+        xrootd_log_access(ctx, c, "MKDIR", resolved, "-",
+                          0, kXR_NotAuthorized, "VO not authorized", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_MKDIR);
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized, "VO not authorized");
+    }
+
     if (recursive) {
-        if (xrootd_mkdir_recursive(resolved, mode) != 0 && errno != EEXIST) {
+        if (xrootd_mkdir_recursive_policy(resolved, mode, c->log,
+                                          conf->group_rules) != 0
+            && errno != EEXIST)
+        {
             xrootd_log_access(ctx, c, "MKDIR", resolved, "-",
                               0, kXR_IOError, strerror(errno), 0);
             XROOTD_OP_ERR(ctx, XROOTD_OP_MKDIR);
@@ -506,6 +525,11 @@ xrootd_handle_mkdir(xrootd_ctx_t *ctx, ngx_connection_t *c,
                 XROOTD_OP_ERR(ctx, XROOTD_OP_MKDIR);
                 return xrootd_send_error(ctx, c, kXR_IOError, strerror(err));
             }
+        }
+        /* Align ownership/group-bits of new directory with parent dir policy. */
+        if (conf->group_rules != NULL) {
+            xrootd_apply_parent_group_policy_path(c->log, resolved,
+                                                  conf->group_rules);
         }
     }
 
@@ -547,6 +571,14 @@ xrootd_handle_rm(xrootd_ctx_t *ctx, ngx_connection_t *c,
                           0, kXR_NotFound, "file not found", 0);
         XROOTD_OP_ERR(ctx, XROOTD_OP_RM);
         return xrootd_send_error(ctx, c, kXR_NotFound, "file not found");
+    }
+
+    if (xrootd_check_vo_acl(c->log, resolved, conf->vo_rules,
+                             ctx->vo_list) != NGX_OK) {
+        xrootd_log_access(ctx, c, "RM", resolved, "-",
+                          0, kXR_NotAuthorized, "VO not authorized", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_RM);
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized, "VO not authorized");
     }
 
     if (unlink(resolved) != 0) {
@@ -602,6 +634,14 @@ xrootd_handle_rmdir(xrootd_ctx_t *ctx, ngx_connection_t *c,
                           0, kXR_NotFound, "directory not found", 0);
         XROOTD_OP_ERR(ctx, XROOTD_OP_RMDIR);
         return xrootd_send_error(ctx, c, kXR_NotFound, "directory not found");
+    }
+
+    if (xrootd_check_vo_acl(c->log, resolved, conf->vo_rules,
+                             ctx->vo_list) != NGX_OK) {
+        xrootd_log_access(ctx, c, "RMDIR", resolved, "-",
+                          0, kXR_NotAuthorized, "VO not authorized", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_RMDIR);
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized, "VO not authorized");
     }
 
     if (rmdir(resolved) != 0) {
@@ -713,6 +753,14 @@ xrootd_handle_mv(xrootd_ctx_t *ctx, ngx_connection_t *c,
         return xrootd_send_error(ctx, c, kXR_NotFound, "source not found");
     }
 
+    if (xrootd_check_vo_acl(c->log, src_resolved, conf->vo_rules,
+                             ctx->vo_list) != NGX_OK) {
+        xrootd_log_access(ctx, c, "MV", src_resolved, "-",
+                          0, kXR_NotAuthorized, "VO not authorized", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_MV);
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized, "VO not authorized");
+    }
+
     if (!xrootd_resolve_path_write(c->log, &conf->root, dst_buf,
                                     dst_resolved, sizeof(dst_resolved))) {
         xrootd_log_access(ctx, c, "MV", src_buf, "-",
@@ -720,6 +768,15 @@ xrootd_handle_mv(xrootd_ctx_t *ctx, ngx_connection_t *c,
         XROOTD_OP_ERR(ctx, XROOTD_OP_MV);
         return xrootd_send_error(ctx, c, kXR_NotFound,
                                  "invalid destination path");
+    }
+
+    if (xrootd_check_vo_acl(c->log, dst_resolved, conf->vo_rules,
+                             ctx->vo_list) != NGX_OK) {
+        xrootd_log_access(ctx, c, "MV", dst_resolved, "-",
+                          0, kXR_NotAuthorized, "VO not authorized for destination", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_MV);
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                 "VO not authorized for destination");
     }
 
     /* rename(2) performs the atomic namespace switch when source and dest share a filesystem. */
@@ -785,6 +842,14 @@ xrootd_handle_chmod(xrootd_ctx_t *ctx, ngx_connection_t *c,
                           0, kXR_NotFound, "path not found", 0);
         XROOTD_OP_ERR(ctx, XROOTD_OP_CHMOD);
         return xrootd_send_error(ctx, c, kXR_NotFound, "path not found");
+    }
+
+    if (xrootd_check_vo_acl(c->log, resolved, conf->vo_rules,
+                             ctx->vo_list) != NGX_OK) {
+        xrootd_log_access(ctx, c, "CHMOD", resolved, "-",
+                          0, kXR_NotAuthorized, "VO not authorized", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_CHMOD);
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized, "VO not authorized");
     }
 
     if (chmod(resolved, mode) != 0) {

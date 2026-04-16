@@ -32,6 +32,10 @@
 #include <openssl/param_build.h>
 #include <openssl/core_names.h>
 
+#if defined(XROOTD_HAVE_VOMS)
+#include <voms/voms_apic.h>
+#endif
+
 #include "xrootd_protocol.h"
 #include "ngx_xrootd_metrics.h"
 
@@ -146,6 +150,8 @@ typedef struct {
     ngx_flag_t logged_in;    /* kXR_login received */
     ngx_flag_t auth_done;    /* authentication completed */
     char       dn[512];      /* authenticated subject DN (GSI), or empty */
+    char       primary_vo[128];
+    char       vo_list[512];
 
     /* Open file table; index 0..XROOTD_MAX_FILES-1 is the handle number */
     xrootd_file_t  files[XROOTD_MAX_FILES];
@@ -183,6 +189,17 @@ typedef struct {
 #define XROOTD_AUTH_GSI    1   /* GSI/x509 authentication required       */
 
 typedef struct {
+    ngx_str_t  path;
+    ngx_str_t  vo;
+    char       resolved[PATH_MAX];
+} xrootd_vo_rule_t;
+
+typedef struct {
+    ngx_str_t  path;
+    char       resolved[PATH_MAX];
+} xrootd_group_rule_t;
+
+typedef struct {
     ngx_flag_t  enable;
     ngx_str_t   root;
     ngx_uint_t  auth;
@@ -191,6 +208,11 @@ typedef struct {
     ngx_str_t   certificate;
     ngx_str_t   certificate_key;
     ngx_str_t   trusted_ca;
+    ngx_str_t   vomsdir;
+    ngx_str_t   voms_cert_dir;
+
+    ngx_array_t *vo_rules;
+    ngx_array_t *group_rules;
 
     /* Loaded OpenSSL objects */
     X509        *gsi_cert;
@@ -224,6 +246,9 @@ char *ngx_stream_xrootd_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child
 char *ngx_stream_xrootd_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 ngx_int_t ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf);
 ngx_int_t ngx_xrootd_metrics_shm_init(ngx_shm_zone_t *shm_zone, void *data);
+char *xrootd_conf_set_require_vo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+char *xrootd_conf_set_inherit_parent_group(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
 
 /* ngx_xrootd_connection.c */
 void ngx_stream_xrootd_handler(ngx_stream_session_t *s);
@@ -300,6 +325,25 @@ ngx_int_t xrootd_send_pgwrite_status(xrootd_ctx_t *ctx,
 
 /* ngx_xrootd_path.c */
 size_t xrootd_sanitize_log_string(const char *in, char *out, size_t outsz);
+ngx_int_t xrootd_normalize_policy_path(ngx_pool_t *pool, const ngx_str_t *src,
+    ngx_str_t *dst);
+ngx_array_t *xrootd_merge_arrays(ngx_conf_t *cf, ngx_array_t *parent,
+    ngx_array_t *child, size_t element_size);
+ngx_int_t xrootd_finalize_vo_rules(ngx_log_t *log, const ngx_str_t *root,
+    ngx_array_t *rules);
+ngx_int_t xrootd_finalize_group_rules(ngx_log_t *log, const ngx_str_t *root,
+    ngx_array_t *rules);
+const xrootd_vo_rule_t *xrootd_find_vo_rule(const char *resolved_path,
+    ngx_array_t *rules);
+const xrootd_group_rule_t *xrootd_find_group_rule(const char *resolved_path,
+    ngx_array_t *rules);
+ngx_flag_t xrootd_vo_list_contains(const char *vo_list, const char *required_vo);
+ngx_int_t xrootd_check_vo_acl(ngx_log_t *log, const char *resolved_path,
+    ngx_array_t *vo_rules, const char *vo_list);
+ngx_int_t xrootd_apply_parent_group_policy_fd(ngx_log_t *log, int fd,
+    const char *path, ngx_array_t *rules);
+ngx_int_t xrootd_apply_parent_group_policy_path(ngx_log_t *log,
+    const char *path, ngx_array_t *rules);
 int  xrootd_resolve_path_noexist(ngx_log_t *log, const ngx_str_t *root,
     const char *reqpath, char *resolved, size_t resolvsz);
 int  xrootd_resolve_path(ngx_log_t *log, const ngx_str_t *root,
@@ -309,12 +353,21 @@ int  xrootd_resolve_path_write(ngx_log_t *log, const ngx_str_t *root,
 int  xrootd_extract_path(ngx_log_t *log, const u_char *payload,
     size_t payload_len, char *out, size_t outsz, ngx_flag_t strip_cgi);
 int  xrootd_mkdir_recursive(const char *path, mode_t mode);
+int  xrootd_mkdir_recursive_policy(const char *path, mode_t mode,
+    ngx_log_t *log, ngx_array_t *rules);
 void xrootd_strip_cgi(const char *in, char *out, size_t outsz);
 void xrootd_make_stat_body(const struct stat *st, ngx_flag_t is_vfs,
     char *out, size_t outsz);
 void xrootd_log_access(xrootd_ctx_t *ctx, ngx_connection_t *c,
     const char *verb, const char *path, const char *detail,
     ngx_uint_t xrd_ok, uint16_t errcode, const char *errmsg, size_t bytes);
+
+#if defined(XROOTD_HAVE_VOMS)
+ngx_int_t xrootd_extract_voms_info(ngx_log_t *log, X509 *leaf,
+    STACK_OF(X509) *chain, const ngx_str_t *vomsdir,
+    const ngx_str_t *cert_dir, char *primary_vo, size_t primary_vo_sz,
+    char *vo_list, size_t vo_list_sz);
+#endif
 
 /* ngx_xrootd_aio.c — AIO response builders (used by read/write handlers) */
 u_char *xrootd_build_read_response(xrootd_ctx_t *ctx, ngx_connection_t *c,

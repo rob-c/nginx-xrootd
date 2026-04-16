@@ -70,6 +70,8 @@
 #include <limits.h>
 #include <time.h>
 
+size_t xrootd_sanitize_log_string(const char *in, char *out, size_t outsz);
+
 /* Maximum path length we'll construct */
 #define WEBDAV_MAX_PATH   4096
 /* Maximum PUT body size (16 MiB) */
@@ -342,29 +344,192 @@ ngx_http_xrootd_webdav_postconfiguration(ngx_conf_t *cf)
 /* ------------------------------------------------------------------ */
 
 static ngx_int_t
+webdav_hex_value(u_char ch, u_char *value)
+{
+    if (ch >= '0' && ch <= '9') {
+        *value = (u_char) (ch - '0');
+        return NGX_OK;
+    }
+
+    if (ch >= 'a' && ch <= 'f') {
+        *value = (u_char) (ch - 'a' + 10);
+        return NGX_OK;
+    }
+
+    if (ch >= 'A' && ch <= 'F') {
+        *value = (u_char) (ch - 'A' + 10);
+        return NGX_OK;
+    }
+
+    return NGX_ERROR;
+}
+
+static ngx_inline u_char
+webdav_hex_digit(u_char value)
+{
+    return (value < 10) ? (u_char) ('0' + value)
+                        : (u_char) ('A' + (value - 10));
+}
+
+static void
+webdav_log_safe_path(ngx_log_t *log, ngx_uint_t level, ngx_err_t err,
+                     const char *prefix, const char *path)
+{
+    char safe_path[512];
+
+    xrootd_sanitize_log_string(path, safe_path, sizeof(safe_path));
+    ngx_log_error(level, log, err, "%s: \"%s\"", prefix, safe_path);
+}
+
+static int
+webdav_path_within_root(const char *root_canon, const char *path_canon)
+{
+    size_t root_len = strlen(root_canon);
+
+    if (strncmp(path_canon, root_canon, root_len) != 0) {
+        return 0;
+    }
+
+    return path_canon[root_len] == '\0' || path_canon[root_len] == '/';
+}
+
+static int
+webdav_path_component_forbidden(const char *comp, size_t comp_len)
+{
+    return (comp_len == 1 && comp[0] == '.')
+        || (comp_len == 2 && comp[0] == '.' && comp[1] == '.');
+}
+
+static int
+webdav_path_has_forbidden_components(const char *path)
+{
+    const char *scan = path;
+
+    while (*scan == '/') {
+        scan++;
+    }
+
+    while (*scan != '\0') {
+        const char *seg_end;
+        size_t      seg_len;
+
+        while (*scan == '/') {
+            scan++;
+        }
+        if (*scan == '\0') {
+            break;
+        }
+
+        seg_end = strchr(scan, '/');
+        seg_len = seg_end ? (size_t) (seg_end - scan) : strlen(scan);
+
+        if (webdav_path_component_forbidden(scan, seg_len)) {
+            return 1;
+        }
+
+        if (seg_end == NULL) {
+            break;
+        }
+
+        scan = seg_end + 1;
+    }
+
+    return 0;
+}
+
+static ngx_int_t
 webdav_urldecode(const u_char *src, size_t src_len, char *dst, size_t dst_sz)
 {
-    size_t      i = 0, j = 0;
-    unsigned    hi, lo;
+    size_t i = 0;
+    size_t j = 0;
+    u_char hi;
+    u_char lo;
+    u_char decoded;
 
-    while (i < src_len && j + 1 < dst_sz) {
-        if (src[i] == '%' && i + 2 < src_len) {
-            hi = src[i+1];
-            lo = src[i+2];
-            if (isxdigit(hi) && isxdigit(lo)) {
-                hi = hi >= 'a' ? hi - 'a' + 10 :
-                     hi >= 'A' ? hi - 'A' + 10 : hi - '0';
-                lo = lo >= 'a' ? lo - 'a' + 10 :
-                     lo >= 'A' ? lo - 'A' + 10 : lo - '0';
-                dst[j++] = (char)((hi << 4) | lo);
-                i += 3;
-                continue;
-            }
+    if (dst == NULL || dst_sz < 2) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    while (i < src_len) {
+        if (j + 1 >= dst_sz) {
+            return NGX_HTTP_REQUEST_URI_TOO_LARGE;
         }
+
+        if (src[i] == '%' && i + 2 < src_len
+            && webdav_hex_value(src[i + 1], &hi) == NGX_OK
+            && webdav_hex_value(src[i + 2], &lo) == NGX_OK)
+        {
+            decoded = (u_char) ((hi << 4) | lo);
+            if (decoded == '\0') {
+                return NGX_HTTP_BAD_REQUEST;
+            }
+
+            dst[j++] = (char) decoded;
+            i += 3;
+            continue;
+        }
+
         dst[j++] = (char) src[i++];
     }
+
     dst[j] = '\0';
-    return (i == src_len) ? NGX_OK : NGX_ERROR;
+    return NGX_OK;
+}
+
+static char *
+webdav_escape_xml_text(ngx_pool_t *pool, const char *src)
+{
+    const u_char *in;
+    u_char       *out;
+    u_char       *escaped;
+    size_t        src_len;
+
+    if (pool == NULL || src == NULL) {
+        return NULL;
+    }
+
+    src_len = strlen(src);
+    escaped = ngx_pnalloc(pool, src_len * 6 + 1);
+    if (escaped == NULL) {
+        return NULL;
+    }
+
+    in = (const u_char *) src;
+    out = escaped;
+
+    while (*in != '\0') {
+        switch (*in) {
+        case '&':
+            out = ngx_cpymem(out, "&amp;", sizeof("&amp;") - 1);
+            break;
+        case '<':
+            out = ngx_cpymem(out, "&lt;", sizeof("&lt;") - 1);
+            break;
+        case '>':
+            out = ngx_cpymem(out, "&gt;", sizeof("&gt;") - 1);
+            break;
+        case '"':
+            out = ngx_cpymem(out, "&quot;", sizeof("&quot;") - 1);
+            break;
+        case '\'':
+            out = ngx_cpymem(out, "&#39;", sizeof("&#39;") - 1);
+            break;
+        default:
+            if (*in < 0x20 || *in == 0x7f) {
+                *out++ = '%';
+                *out++ = webdav_hex_digit((u_char) (*in >> 4));
+                *out++ = webdav_hex_digit((u_char) (*in & 0x0f));
+            } else {
+                *out++ = *in;
+            }
+            break;
+        }
+
+        in++;
+    }
+
+    *out = '\0';
+    return (char *) escaped;
 }
 
 /* ------------------------------------------------------------------ */
@@ -382,7 +547,7 @@ webdav_resolve_path(ngx_http_request_t *r, const ngx_str_t *root,
     char   uri_decoded[WEBDAV_MAX_PATH];
     char   combined[PATH_MAX];
     char   resolved[PATH_MAX];
-    size_t rlen;
+    ngx_int_t rc;
 
     /* Canonicalize the configured root */
     if (root->len == 0 || root->len >= sizeof(root_buf)) {
@@ -400,9 +565,14 @@ webdav_resolve_path(ngx_http_request_t *r, const ngx_str_t *root,
     }
 
     /* URL-decode the URI path */
-    if (webdav_urldecode(r->uri.data, r->uri.len,
-                         uri_decoded, sizeof(uri_decoded)) != NGX_OK) {
-        return NGX_HTTP_BAD_REQUEST;
+    rc = webdav_urldecode(r->uri.data, r->uri.len,
+                          uri_decoded, sizeof(uri_decoded));
+    if (rc != NGX_OK) {
+        if (rc == NGX_HTTP_BAD_REQUEST) {
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                          "xrootd_webdav: rejecting URI with decoded NUL");
+        }
+        return rc;
     }
 
     /* Strip trailing slashes (MKCOL /dir/ should resolve same as /dir) */
@@ -413,14 +583,14 @@ webdav_resolve_path(ngx_http_request_t *r, const ngx_str_t *root,
         }
     }
 
-    /* Reject embedded NULs early */
-    if (strlen(uri_decoded) != ngx_strnlen((u_char *) uri_decoded,
-                                            sizeof(uri_decoded))) {
-        return NGX_HTTP_BAD_REQUEST;
+    if (webdav_path_has_forbidden_components(uri_decoded)) {
+        webdav_log_safe_path(r->connection->log, NGX_LOG_WARN, 0,
+                             "xrootd_webdav: path traversal attempt",
+                             uri_decoded);
+        return NGX_HTTP_FORBIDDEN;
     }
 
-    /* Construct: root_canon + "/" + uri_decoded */
-    rlen = strlen(root_canon);
+    /* Construct the on-disk target by appending the decoded URI to the root. */
     if ((size_t) snprintf(combined, sizeof(combined), "%s%s",
                           root_canon, uri_decoded) >= sizeof(combined)) {
         return NGX_HTTP_REQUEST_URI_TOO_LARGE;
@@ -455,10 +625,17 @@ webdav_resolve_path(ngx_http_request_t *r, const ngx_str_t *root,
             ngx_memcpy(filename, slash + 1, fname_len + 1);
 
             if (realpath(parent, parent_canon) == NULL) {
-                ngx_log_error(NGX_LOG_WARN, r->connection->log, errno,
-                              "xrootd_webdav: cannot resolve parent of \"%s\"",
-                              combined);
+                webdav_log_safe_path(r->connection->log, NGX_LOG_WARN, errno,
+                                     "xrootd_webdav: cannot resolve parent of",
+                                     combined);
                 return NGX_HTTP_NOT_FOUND;
+            }
+
+            if (!webdav_path_within_root(root_canon, parent_canon)) {
+                webdav_log_safe_path(r->connection->log, NGX_LOG_WARN, 0,
+                                     "xrootd_webdav: path traversal blocked",
+                                     parent_canon);
+                return NGX_HTTP_FORBIDDEN;
             }
 
             if ((size_t) snprintf(resolved, sizeof(resolved), "%s/%s",
@@ -466,19 +643,18 @@ webdav_resolve_path(ngx_http_request_t *r, const ngx_str_t *root,
                 return NGX_HTTP_REQUEST_URI_TOO_LARGE;
             }
         } else {
-            ngx_log_error(NGX_LOG_WARN, r->connection->log, errno,
-                          "xrootd_webdav: cannot resolve \"%s\"", combined);
+            webdav_log_safe_path(r->connection->log, NGX_LOG_WARN, errno,
+                                 "xrootd_webdav: cannot resolve",
+                                 combined);
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
     }
 
     /* Traverse-attack check: resolved path must remain under root */
-    if (strncmp(resolved, root_canon, rlen) != 0 ||
-        (resolved[rlen] != '/' && resolved[rlen] != '\0'))
-    {
-        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                      "xrootd_webdav: path traversal blocked: \"%s\"",
-                      resolved);
+    if (!webdav_path_within_root(root_canon, resolved)) {
+        webdav_log_safe_path(r->connection->log, NGX_LOG_WARN, 0,
+                             "xrootd_webdav: path traversal blocked",
+                             resolved);
         return NGX_HTTP_FORBIDDEN;
     }
 
@@ -619,8 +795,13 @@ webdav_verify_proxy_cert(ngx_http_request_t *r,
 
     ctx->verified = 1;
 
-    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                  "xrootd_webdav: GSI auth OK dn=\"%s\"", ctx->dn);
+    {
+        char dn_log[1024];
+
+        xrootd_sanitize_log_string(ctx->dn, dn_log, sizeof(dn_log));
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "xrootd_webdav: GSI auth OK dn=\"%s\"", dn_log);
+    }
 
 done:
     if (vctx)  X509_STORE_CTX_free(vctx);
@@ -918,8 +1099,8 @@ webdav_handle_get(ngx_http_request_t *r)
 
     fd = ngx_open_file(path, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
     if (fd == NGX_INVALID_FILE) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
-                      "xrootd_webdav: open(\"%s\") failed", path);
+        webdav_log_safe_path(r->connection->log, NGX_LOG_ERR, ngx_errno,
+                             "xrootd_webdav: open() failed for", path);
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
@@ -1022,8 +1203,9 @@ webdav_handle_put_body(ngx_http_request_t *r)
                        NGX_FILE_CREATE_OR_OPEN | NGX_FILE_TRUNCATE,
                        NGX_FILE_DEFAULT_ACCESS);
     if (fd == NGX_INVALID_FILE) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
-                      "xrootd_webdav: open(\"%s\") for write failed", path);
+        webdav_log_safe_path(r->connection->log, NGX_LOG_ERR, ngx_errno,
+                             "xrootd_webdav: open() for write failed for",
+                             path);
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
@@ -1043,8 +1225,10 @@ webdav_handle_put_body(ngx_http_request_t *r)
                     ssize_t rd = pread(buf->file->fd, tmp, chunk, off);
                     if (rd <= 0) break;
                     if (write(fd, tmp, (size_t) rd) != rd) {
-                        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
-                                      "xrootd_webdav: write to \"%s\" failed", path);
+                        webdav_log_safe_path(r->connection->log, NGX_LOG_ERR,
+                                             ngx_errno,
+                                             "xrootd_webdav: write() failed for",
+                                             path);
                         ngx_close_file(fd);
                         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
                         return;
@@ -1055,8 +1239,10 @@ webdav_handle_put_body(ngx_http_request_t *r)
             } else if (buf->pos < buf->last) {
                 n = write(fd, buf->pos, (size_t)(buf->last - buf->pos));
                 if (n < 0) {
-                    ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
-                                  "xrootd_webdav: write to \"%s\" failed", path);
+                    webdav_log_safe_path(r->connection->log, NGX_LOG_ERR,
+                                         ngx_errno,
+                                         "xrootd_webdav: write() failed for",
+                                         path);
                     ngx_close_file(fd);
                     ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
                     return;
@@ -1154,22 +1340,43 @@ static ngx_buf_t *
 propfind_append(ngx_pool_t *pool, ngx_chain_t **head, ngx_chain_t **tail,
                 const char *fmt, ...)
 {
-    va_list   ap;
-    char      tmp[2048];
-    size_t    n;
+    va_list      ap;
+    va_list      ap_copy;
+    char         tmp[2048];
+    char        *src;
+    int          n;
     ngx_buf_t    *b;
     ngx_chain_t  *lc;
 
     va_start(ap, fmt);
-    n = (size_t) vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_copy(ap_copy, ap);
+    n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
     va_end(ap);
 
-    if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
+    if (n < 0) {
+        va_end(ap_copy);
+        return NULL;
+    }
+
+    if ((size_t) n >= sizeof(tmp)) {
+        src = ngx_pnalloc(pool, (size_t) n + 1);
+        if (src == NULL) {
+            va_end(ap_copy);
+            return NULL;
+        }
+
+        (void) vsnprintf(src, (size_t) n + 1, fmt, ap_copy);
+    } else {
+        src = tmp;
+    }
+
+    va_end(ap_copy);
+
     if (n == 0) return (*tail ? (*tail)->buf : NULL);
 
-    b = ngx_create_temp_buf(pool, n);
+    b = ngx_create_temp_buf(pool, (size_t) n);
     if (b == NULL) return NULL;
-    ngx_memcpy(b->pos, tmp, n);
+    ngx_memcpy(b->pos, src, (size_t) n);
     b->last = b->pos + n;
 
     lc = ngx_alloc_chain_link(pool);
@@ -1192,14 +1399,21 @@ static ngx_int_t
 propfind_entry(ngx_pool_t *pool, ngx_chain_t **head, ngx_chain_t **tail,
                const char *href, struct stat *sb)
 {
-    char date_buf[64];
+    char  date_buf[64];
+    char *safe_href;
+
     webdav_http_date(sb->st_mtime, date_buf, sizeof(date_buf));
+
+    safe_href = webdav_escape_xml_text(pool, href);
+    if (safe_href == NULL) {
+        return NGX_ERROR;
+    }
 
     if (propfind_append(pool, head, tail,
             "<D:response>"
             "<D:href>%s</D:href>"
             "<D:propstat>"
-            "<D:prop>", href) == NULL) return NGX_ERROR;
+            "<D:prop>", safe_href) == NULL) return NGX_ERROR;
 
     if (S_ISDIR(sb->st_mode)) {
         if (propfind_append(pool, head, tail,
@@ -1316,11 +1530,17 @@ webdav_handle_propfind(ngx_http_request_t *r)
                     size_t blen = r->uri.len;
                     /* Ensure trailing slash on directory href */
                     if (blen == 0 || base[blen - 1] != '/') {
-                        snprintf(href, sizeof(href), "%.*s/%s",
-                                 (int) blen, base, de->d_name);
+                        if ((size_t) snprintf(href, sizeof(href), "%.*s/%s",
+                                              (int) blen, base, de->d_name)
+                            >= sizeof(href)) {
+                            continue;
+                        }
                     } else {
-                        snprintf(href, sizeof(href), "%.*s%s",
-                                 (int) blen, base, de->d_name);
+                        if ((size_t) snprintf(href, sizeof(href), "%.*s%s",
+                                              (int) blen, base, de->d_name)
+                            >= sizeof(href)) {
+                            continue;
+                        }
                     }
                 }
 

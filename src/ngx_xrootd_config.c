@@ -4,6 +4,92 @@
 /*  Configuration management                                            */
 /* ================================================================== */
 
+static char *
+xrootd_copy_conf_string(ngx_conf_t *cf, const ngx_str_t *src, ngx_str_t *dst)
+{
+    dst->data = ngx_pnalloc(cf->pool, src->len + 1);
+    if (dst->data == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_memcpy(dst->data, src->data, src->len);
+    dst->data[src->len] = '\0';
+    dst->len = src->len;
+    return NGX_CONF_OK;
+}
+
+char *
+xrootd_conf_set_require_vo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_stream_xrootd_srv_conf_t *xcf = conf;
+    ngx_str_t                    *value;
+    xrootd_vo_rule_t             *rule;
+
+    value = cf->args->elts;
+    (void) cmd;
+
+    if (xcf->vo_rules == NULL) {
+        xcf->vo_rules = ngx_array_create(cf->pool, 2, sizeof(xrootd_vo_rule_t));
+        if (xcf->vo_rules == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    rule = ngx_array_push(xcf->vo_rules);
+    if (rule == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_memzero(rule, sizeof(*rule));
+
+    if (xrootd_normalize_policy_path(cf->pool, &value[1], &rule->path) != NGX_OK) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "xrootd_require_vo: invalid path \"%V\"", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    if (xrootd_copy_conf_string(cf, &value[2], &rule->vo) != NGX_CONF_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
+char *
+xrootd_conf_set_inherit_parent_group(ngx_conf_t *cf, ngx_command_t *cmd,
+                                     void *conf)
+{
+    ngx_stream_xrootd_srv_conf_t *xcf = conf;
+    ngx_str_t                    *value;
+    xrootd_group_rule_t          *rule;
+
+    value = cf->args->elts;
+    (void) cmd;
+
+    if (xcf->group_rules == NULL) {
+        xcf->group_rules = ngx_array_create(cf->pool, 2,
+                                            sizeof(xrootd_group_rule_t));
+        if (xcf->group_rules == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    rule = ngx_array_push(xcf->group_rules);
+    if (rule == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_memzero(rule, sizeof(*rule));
+
+    if (xrootd_normalize_policy_path(cf->pool, &value[1], &rule->path) != NGX_OK) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "xrootd_inherit_parent_group: invalid path \"%V\"", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
 void *
 ngx_stream_xrootd_create_srv_conf(ngx_conf_t *cf)
 {
@@ -32,6 +118,8 @@ ngx_stream_xrootd_create_srv_conf(ngx_conf_t *cf)
     conf->gsi_key      = NULL;
     conf->gsi_store    = NULL;
     conf->gsi_ca_hash  = 0;
+    conf->vo_rules     = NULL;
+    conf->group_rules  = NULL;
     conf->access_log_fd = NGX_INVALID_FILE;
     conf->metrics_slot = -1;
 
@@ -43,6 +131,8 @@ ngx_stream_xrootd_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 {
     ngx_stream_xrootd_srv_conf_t *prev = parent;
     ngx_stream_xrootd_srv_conf_t *conf = child;
+    ngx_array_t                  *child_vo_rules;
+    ngx_array_t                  *child_group_rules;
 
     /*
      * Standard nginx inheritance rules: values set on the current server
@@ -56,7 +146,25 @@ ngx_stream_xrootd_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_str_value(conf->certificate,     prev->certificate,     "");
     ngx_conf_merge_str_value(conf->certificate_key, prev->certificate_key, "");
     ngx_conf_merge_str_value(conf->trusted_ca,      prev->trusted_ca,      "");
+    ngx_conf_merge_str_value(conf->vomsdir,         prev->vomsdir,         "");
+    ngx_conf_merge_str_value(conf->voms_cert_dir,   prev->voms_cert_dir,   "");
     ngx_conf_merge_str_value(conf->access_log,      prev->access_log,      "");
+
+    child_vo_rules = conf->vo_rules;
+    conf->vo_rules = xrootd_merge_arrays(cf, prev->vo_rules, child_vo_rules,
+                                         sizeof(xrootd_vo_rule_t));
+    if (conf->vo_rules == NULL && (prev->vo_rules != NULL || child_vo_rules != NULL)) {
+        return NGX_CONF_ERROR;
+    }
+
+    child_group_rules = conf->group_rules;
+    conf->group_rules = xrootd_merge_arrays(cf, prev->group_rules,
+                                            child_group_rules,
+                                            sizeof(xrootd_group_rule_t));
+    if (conf->group_rules == NULL
+        && (prev->group_rules != NULL || child_group_rules != NULL)) {
+        return NGX_CONF_ERROR;
+    }
 
     return NGX_CONF_OK;
 }
@@ -259,6 +367,52 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
         ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
             "xrootd: GSI auth configured — cert=%s ca_hash=%08x",
             xcf->certificate.data, xcf->gsi_ca_hash);
+    }
+
+    for (i = 0; i < cmcf->servers.nelts; i++) {
+        xcf = ngx_stream_conf_get_module_srv_conf(cscfp[i],
+                                                   ngx_stream_xrootd_module);
+
+        if (!xcf->enable) {
+            continue;
+        }
+
+        if (xcf->vo_rules != NULL && xcf->auth != XROOTD_AUTH_GSI) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "xrootd_require_vo requires xrootd_auth gsi");
+            return NGX_ERROR;
+        }
+
+#if !defined(XROOTD_HAVE_VOMS)
+        if (xcf->vo_rules != NULL) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "xrootd_require_vo requires nginx-xrootd to be built with libvomsapi");
+            return NGX_ERROR;
+        }
+#else
+        if (xcf->vo_rules != NULL) {
+            if (xcf->vomsdir.len == 0 || xcf->voms_cert_dir.len == 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "xrootd_require_vo requires xrootd_vomsdir and xrootd_voms_cert_dir");
+                return NGX_ERROR;
+            }
+        }
+#endif
+
+        if (xrootd_finalize_vo_rules(cf->log, &xcf->root, xcf->vo_rules) != NGX_OK) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "xrootd: failed to finalize xrootd_require_vo rules for root \"%V\"",
+                &xcf->root);
+            return NGX_ERROR;
+        }
+
+        if (xrootd_finalize_group_rules(cf->log, &xcf->root,
+                                        xcf->group_rules) != NGX_OK) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "xrootd: failed to finalize xrootd_inherit_parent_group rules for root \"%V\"",
+                &xcf->root);
+            return NGX_ERROR;
+        }
     }
 
     /* ---- Prometheus metrics shared memory ---- */

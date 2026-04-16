@@ -123,6 +123,34 @@ static ngx_command_t ngx_stream_xrootd_commands[] = {
       offsetof(ngx_stream_xrootd_srv_conf_t, trusted_ca),
       NULL },
 
+    { ngx_string("xrootd_vomsdir"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_xrootd_srv_conf_t, vomsdir),
+      NULL },
+
+    { ngx_string("xrootd_voms_cert_dir"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_xrootd_srv_conf_t, voms_cert_dir),
+      NULL },
+
+    { ngx_string("xrootd_require_vo"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE2,
+      xrootd_conf_set_require_vo,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("xrootd_inherit_parent_group"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      xrootd_conf_set_inherit_parent_group,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      0,
+      NULL },
+
     /* Write handlers still perform per-op auth checks; this only enables the feature. */
     { ngx_string("xrootd_allow_write"),
       NGX_STREAM_SRV_CONF | NGX_CONF_FLAG,

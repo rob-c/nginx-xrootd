@@ -96,6 +96,47 @@ xrootd_adler32_file(const char *path, ngx_log_t *log)
     return (B << 16) | A;
 }
 
+static ngx_flag_t
+xrootd_qconfig_append(char *resp, size_t resp_sz, size_t *pos,
+                      const char *fmt, ...)
+{
+    va_list ap;
+    int     n;
+    size_t  remaining;
+
+    if (resp == NULL || pos == NULL || *pos >= resp_sz) {
+        return 0;
+    }
+
+    remaining = resp_sz - *pos;
+
+    va_start(ap, fmt);
+    n = vsnprintf(resp + *pos, remaining, fmt, ap);
+    va_end(ap);
+
+    if (n < 0 || (size_t) n >= remaining) {
+        resp[*pos] = '\0';
+        return 0;
+    }
+
+    *pos += (size_t) n;
+    return 1;
+}
+
+static ngx_flag_t
+xrootd_dirlist_name_is_unsafe(const char *name)
+{
+    const u_char *p;
+
+    for (p = (const u_char *) name; *p != '\0'; p++) {
+        if (*p < 0x20 || *p == 0x7f) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 ngx_int_t
 xrootd_handle_query(xrootd_ctx_t *ctx, ngx_connection_t *c,
                     ngx_stream_xrootd_srv_conf_t *conf)
@@ -136,6 +177,15 @@ xrootd_handle_query(xrootd_ctx_t *ctx, ngx_connection_t *c,
                 XROOTD_OP_ERR(ctx, XROOTD_OP_QUERY_CKSUM);
                 return xrootd_send_error(ctx, c, kXR_NotFound,
                                          "file not found");
+            }
+
+            if (xrootd_check_vo_acl(c->log, resolved, conf->vo_rules,
+                                     ctx->vo_list) != NGX_OK) {
+                xrootd_log_access(ctx, c, "QUERY", resolved, "cksum",
+                                  0, kXR_NotAuthorized, "VO not authorized", 0);
+                XROOTD_OP_ERR(ctx, XROOTD_OP_QUERY_CKSUM);
+                return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                         "VO not authorized");
             }
 
             cksum = xrootd_adler32_file(resolved, c->log);
@@ -253,18 +303,22 @@ xrootd_handle_query(xrootd_ctx_t *ctx, ngx_connection_t *c,
             memcpy(key, p, keylen);
             key[keylen] = '\0';
 
-            int n;
             if (strcmp(key, "chksum") == 0) {
-                n = snprintf(resp + pos, sizeof(resp) - pos,
-                             "chksum=adler32\n");
+                if (!xrootd_qconfig_append(resp, sizeof(resp), &pos,
+                                           "chksum=adler32\n")) {
+                    break;
+                }
             } else if (strcmp(key, "readv") == 0) {
-                n = snprintf(resp + pos, sizeof(resp) - pos, "readv=1\n");
+                if (!xrootd_qconfig_append(resp, sizeof(resp), &pos,
+                                           "readv=1\n")) {
+                    break;
+                }
             } else {
-                n = snprintf(resp + pos, sizeof(resp) - pos, "%s=0\n", key);
+                if (!xrootd_qconfig_append(resp, sizeof(resp), &pos,
+                                           "%s=0\n", key)) {
+                    break;
+                }
             }
-            if (n > 0) pos += (size_t) n;
-            /* Stop cleanly if the fixed response buffer is nearly exhausted. */
-            if (pos >= sizeof(resp) - 1) break;
             p = nl ? nl + 1 : p + keylen;
         }
         if (pos == 0) {
@@ -326,6 +380,15 @@ xrootd_handle_stat(xrootd_ctx_t *ctx, ngx_connection_t *c,
             XROOTD_OP_ERR(ctx, XROOTD_OP_STAT);
             return xrootd_send_error(ctx, c, kXR_NotFound,
                                      "file not found");
+        }
+
+        if (xrootd_check_vo_acl(c->log, resolved, conf->vo_rules,
+                                 ctx->vo_list) != NGX_OK) {
+            xrootd_log_access(ctx, c, "STAT", resolved, "-",
+                              0, kXR_NotAuthorized, "VO not authorized", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_STAT);
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "VO not authorized");
         }
 
         if (stat(resolved, &st) != 0) {
@@ -477,6 +540,15 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
             return xrootd_send_error(ctx, c, kXR_NotFound, "file not found");
         }
 
+        if (xrootd_check_vo_acl(c->log, resolved, conf->vo_rules,
+                                 ctx->vo_list) != NGX_OK) {
+            xrootd_log_access(ctx, c, "OPEN", resolved, "rd",
+                              0, kXR_NotAuthorized, "VO not authorized", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_OPEN_RD);
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "VO not authorized");
+        }
+
         /* Reject opening a directory as a file */
         {
             struct stat st;
@@ -512,6 +584,15 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
             return xrootd_send_error(ctx, c, kXR_NotFound, "invalid path");
         }
 
+        if (xrootd_check_vo_acl(c->log, resolved, conf->vo_rules,
+                                 ctx->vo_list) != NGX_OK) {
+            xrootd_log_access(ctx, c, "OPEN", resolved, "wr",
+                              0, kXR_NotAuthorized, "VO not authorized", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_OPEN_WR);
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "VO not authorized");
+        }
+
         /* Create parent directories if kXR_mkpath is set */
         if (options & kXR_mkpath) {
             char  parent[PATH_MAX];
@@ -520,9 +601,9 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
             slash = strrchr(parent, '/');
             if (slash && slash > parent) {
                 *slash = '\0';
-                /* mode 0755 for new directories */
-                /* mkdir -p behavior is best-effort here; open() reports any real failure next. */
-                xrootd_mkdir_recursive(parent, 0755);
+                /* mode 0755 for new directories; propagate group policy */
+                xrootd_mkdir_recursive_policy(parent, 0755, c->log,
+                                              conf->group_rules);
             }
         }
     }
@@ -632,6 +713,12 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
     ngx_cpystrn((u_char *) ctx->files[idx].path,
                 (u_char *) resolved,
                 sizeof(ctx->files[idx].path));
+
+    /* Apply parent-group ownership/permissions to newly created files. */
+    if (is_write && conf->group_rules != NULL) {
+        xrootd_apply_parent_group_policy_fd(c->log, fd, resolved,
+                                            conf->group_rules);
+    }
 
     /*
      * If the client set kXR_retstat, include a stat string in the open
@@ -1221,6 +1308,14 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
         return xrootd_send_error(ctx, c, kXR_NotFound, "directory not found");
     }
 
+    if (xrootd_check_vo_acl(c->log, resolved, conf->vo_rules,
+                             ctx->vo_list) != NGX_OK) {
+        xrootd_log_access(ctx, c, "DIRLIST", resolved, "-",
+                          0, kXR_NotAuthorized, "VO not authorized", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_DIRLIST);
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized, "VO not authorized");
+    }
+
     dp = opendir(resolved);
     if (dp == NULL) {
         int err = errno;
@@ -1287,10 +1382,19 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
     while ((de = readdir(dp)) != NULL) {
         const char *name = de->d_name;
         size_t      nlen = strlen(name);
+        char        safe_name[256];
 
         /* Skip . and .. — XRootD clients do not expect them */
         if (name[0] == '.' && (name[1] == '\0' ||
             (name[1] == '.' && name[2] == '\0'))) {
+            continue;
+        }
+
+        if (xrootd_dirlist_name_is_unsafe(name)) {
+            xrootd_sanitize_log_string(name, safe_name, sizeof(safe_name));
+            ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                          "xrootd: dirlist skipping entry with control bytes \"%s\"",
+                          safe_name);
             continue;
         }
 
