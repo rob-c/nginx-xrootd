@@ -44,35 +44,62 @@
 /* Module directives                                                    */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Text values accepted by `xrootd_auth` in nginx.conf.
+ * nginx's enum setter walks this table until it hits ngx_null_string.
+ */
 static ngx_conf_enum_t xrootd_auth_modes[] = {
     { ngx_string("none"), XROOTD_AUTH_NONE },
     { ngx_string("gsi"),  XROOTD_AUTH_GSI  },
     { ngx_null_string,    0                }
 };
 
+/*
+ * Directive table for the stream module.
+ *
+ * Most entries use nginx's stock setters plus an offsetof() into
+ * ngx_stream_xrootd_srv_conf_t, so parsing writes config values directly into
+ * the per-server config struct created in ngx_stream_xrootd_create_srv_conf().
+ *
+ * Entry fields follow nginx's usual pattern:
+ *   1. directive name as it appears in nginx.conf
+ *   2. where the directive is legal and how many arguments it takes
+ *   3. setter callback
+ *   4. which config object the setter should write into
+ *   5. byte offset of the destination field inside that config object
+ *   6. optional extra data for the setter (for example enum tables)
+ */
 static ngx_command_t ngx_stream_xrootd_commands[] = {
 
     { ngx_string("xrootd"),
       NGX_STREAM_SRV_CONF | NGX_CONF_FLAG,
+      /* Custom setter because enabling the module also installs the handler. */
       ngx_stream_xrootd_enable,
+      /* Store the parsed flag in the per-server stream config. */
       NGX_STREAM_SRV_CONF_OFFSET,
       offsetof(ngx_stream_xrootd_srv_conf_t, enable),
       NULL },
 
+    /* Filesystem/export settings used by nearly every request handler. */
     { ngx_string("xrootd_root"),
       NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      /* Single string argument copied into srv_conf->root. */
       ngx_conf_set_str_slot,
       NGX_STREAM_SRV_CONF_OFFSET,
       offsetof(ngx_stream_xrootd_srv_conf_t, root),
       NULL },
 
+    /* Selects the login/auth flow the dispatcher advertises to clients. */
     { ngx_string("xrootd_auth"),
       NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      /* Maps "none" / "gsi" onto XROOTD_AUTH_* constants via xrootd_auth_modes. */
       ngx_conf_set_enum_slot,
       NGX_STREAM_SRV_CONF_OFFSET,
       offsetof(ngx_stream_xrootd_srv_conf_t, auth),
       xrootd_auth_modes },
 
+    /* The next three directives are only consumed when xrootd_auth=gsi. */
+    /* PEM file containing the server certificate presented during GSI auth. */
     { ngx_string("xrootd_certificate"),
       NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
@@ -80,6 +107,7 @@ static ngx_command_t ngx_stream_xrootd_commands[] = {
       offsetof(ngx_stream_xrootd_srv_conf_t, certificate),
       NULL },
 
+    /* Matching private key used to sign the GSI handshake. */
     { ngx_string("xrootd_certificate_key"),
       NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
@@ -87,6 +115,7 @@ static ngx_command_t ngx_stream_xrootd_commands[] = {
       offsetof(ngx_stream_xrootd_srv_conf_t, certificate_key),
       NULL },
 
+    /* Trust store used to verify client proxy certificates. */
     { ngx_string("xrootd_trusted_ca"),
       NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
@@ -94,29 +123,39 @@ static ngx_command_t ngx_stream_xrootd_commands[] = {
       offsetof(ngx_stream_xrootd_srv_conf_t, trusted_ca),
       NULL },
 
+    /* Write handlers still perform per-op auth checks; this only enables the feature. */
     { ngx_string("xrootd_allow_write"),
       NGX_STREAM_SRV_CONF | NGX_CONF_FLAG,
+      /* Standard boolean setter writing into srv_conf->allow_write. */
       ngx_conf_set_flag_slot,
       NGX_STREAM_SRV_CONF_OFFSET,
       offsetof(ngx_stream_xrootd_srv_conf_t, allow_write),
       NULL },
 
+    /* Optional observability and runtime-tuning directives. */
     { ngx_string("xrootd_access_log"),
       NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      /* Path to the module-specific access log, opened during postconfiguration. */
       ngx_conf_set_str_slot,
       NGX_STREAM_SRV_CONF_OFFSET,
       offsetof(ngx_stream_xrootd_srv_conf_t, access_log),
       NULL },
 
 #if (NGX_THREADS)
+    /*
+     * Async pread/pwrite support is only compiled when nginx itself was built
+     * with thread-pool support.
+     */
     { ngx_string("xrootd_thread_pool"),
       NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      /* Names an nginx thread_pool block to service async disk I/O. */
       ngx_conf_set_str_slot,
       NGX_STREAM_SRV_CONF_OFFSET,
       offsetof(ngx_stream_xrootd_srv_conf_t, thread_pool_name),
       NULL },
 #endif
 
+    /* Required terminator so nginx knows where the directive table ends. */
     ngx_null_command
 };
 
@@ -125,10 +164,15 @@ static ngx_command_t ngx_stream_xrootd_commands[] = {
 /* ------------------------------------------------------------------ */
 
 static ngx_stream_module_t ngx_stream_xrootd_module_ctx = {
+    /* No global parser rewrites are needed before nginx reads stream blocks. */
     NULL,                                 /* preconfiguration  */
+    /* Final validation and resource setup once all stream servers are parsed. */
     ngx_stream_xrootd_postconfiguration,  /* postconfiguration */
+    /* This module keeps no stream-wide main configuration object. */
     NULL,                                 /* create main conf  */
+  /* Therefore there is also nothing to normalize/validate at main-conf level. */
     NULL,                                 /* init main conf    */
+    /* Per-server config object allocation and parent/child merging hooks. */
     ngx_stream_xrootd_create_srv_conf,    /* create srv conf   */
     ngx_stream_xrootd_merge_srv_conf,     /* merge srv conf    */
 };
@@ -137,11 +181,17 @@ static ngx_stream_module_t ngx_stream_xrootd_module_ctx = {
 /* Module definition                                                    */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Static module descriptor consumed by nginx at startup. Once linked into the
+ * binary, this is how nginx discovers our directive table and lifecycle hooks.
+ * NGX_STREAM_MODULE tells nginx which subsystem owns the callbacks above.
+ */
 ngx_module_t ngx_stream_xrootd_module = {
-    NGX_MODULE_V1,
-    &ngx_stream_xrootd_module_ctx,
-    ngx_stream_xrootd_commands,
-    NGX_STREAM_MODULE,
+  NGX_MODULE_V1,
+  &ngx_stream_xrootd_module_ctx,
+  ngx_stream_xrootd_commands,
+  NGX_STREAM_MODULE,
+  /* No master/module init hooks beyond the stream-specific callbacks above. */
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
     NGX_MODULE_V1_PADDING
 };

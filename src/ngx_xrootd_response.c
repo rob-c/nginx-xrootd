@@ -8,6 +8,7 @@ void
 xrootd_build_resp_hdr(const u_char *streamid, uint16_t status,
                       uint32_t dlen, ServerResponseHdr *out)
 {
+    /* Every response echoes the request streamid and encodes fields in network order. */
     out->streamid[0] = streamid[0];
     out->streamid[1] = streamid[1];
     out->status      = htons(status);
@@ -20,6 +21,7 @@ xrootd_build_resp_hdr(const u_char *streamid, uint16_t status,
 static uint32_t
 xrootd_crc32c(const void *buf, size_t len)
 {
+    /* Precomputed Castagnoli table indexed by the next low byte of the CRC state. */
     static const uint32_t tbl[256] = {
         0x00000000u, 0xF26B8303u, 0xE13B70F7u, 0x1350F3F4u,
         0xC79A971Fu, 0x35F1141Cu, 0x26A1E7E8u, 0xD4CA64EBu,
@@ -90,6 +92,10 @@ xrootd_crc32c(const void *buf, size_t len)
     const uint8_t *p   = (const uint8_t *) buf;
     uint32_t       crc = 0xFFFFFFFFu;
 
+    /*
+     * Table-driven software fallback; used for pgwrite status framing only.
+     * The implementation follows the standard reflected CRC32c update scheme.
+     */
     while (len--) {
         crc = (crc >> 8) ^ tbl[(crc ^ *p++) & 0xFF];
     }
@@ -105,6 +111,12 @@ xrootd_send_pgwrite_status(xrootd_ctx_t *ctx, ngx_connection_t *c,
 {
     ServerStatusResponse_pgWrite *rsp;
     uint32_t crc;
+
+    /*
+     * The CRC32c covers everything in the Status body after crc32c itself,
+     * plus the trailing pgwrite-specific payload. This matches the XRootD
+     * kXR_status framing rules for paged-write acknowledgements.
+     */
     size_t   crc_len = sizeof(rsp->bdy) - sizeof(rsp->bdy.crc32c)
                        + sizeof(rsp->pgw);
 
@@ -113,20 +125,24 @@ xrootd_send_pgwrite_status(xrootd_ctx_t *ctx, ngx_connection_t *c,
         return NGX_ERROR;
     }
 
+    /* Build the outer response header first: status=kXR_status and a 24-byte body. */
     rsp->hdr.streamid[0] = ctx->cur_streamid[0];
     rsp->hdr.streamid[1] = ctx->cur_streamid[1];
     rsp->hdr.status      = htons(kXR_status);
     rsp->hdr.dlen        = htonl((uint32_t)(sizeof(rsp->bdy) + sizeof(rsp->pgw)));
 
+    /* requestid is encoded relative to kXR_1stRequest inside the status body. */
     rsp->bdy.streamID[0] = ctx->cur_streamid[0];
     rsp->bdy.streamID[1] = ctx->cur_streamid[1];
     rsp->bdy.requestid   = (kXR_char)(kXR_pgwrite - kXR_1stRequest);
-    rsp->bdy.resptype    = 0;
+    rsp->bdy.resptype    = 0;  /* final result, not a partial bad-page report */
     ngx_memzero(rsp->bdy.reserved, sizeof(rsp->bdy.reserved));
-    rsp->bdy.dlen        = htonl(0);
+    rsp->bdy.dlen        = htonl(0);  /* no bad-page list follows on success */
 
+    /* The payload echoes the last written file offset on success. */
     rsp->pgw.offset = (kXR_int64) htobe64((uint64_t) write_offset);
 
+    /* crc32c is stored in network order like the rest of the status body. */
     crc = xrootd_crc32c(&rsp->bdy.streamID[0], crc_len);
     rsp->bdy.crc32c = htonl(crc);
 
@@ -140,6 +156,7 @@ ngx_int_t
 xrootd_send_ok(xrootd_ctx_t *ctx, ngx_connection_t *c,
                const void *body, uint32_t bodylen)
 {
+    /* Allocate one contiguous buffer so header and optional body can be queued together. */
     size_t    total = XRD_RESPONSE_HDR_LEN + bodylen;
     u_char   *buf   = ngx_palloc(c->pool, total);
 
@@ -147,13 +164,16 @@ xrootd_send_ok(xrootd_ctx_t *ctx, ngx_connection_t *c,
         return NGX_ERROR;
     }
 
+    /* Common helper for simple success replies with an optional inline body. */
     xrootd_build_resp_hdr(ctx->cur_streamid, kXR_ok, bodylen,
                            (ServerResponseHdr *) buf);
 
     if (bodylen > 0 && body != NULL) {
+        /* Body bytes immediately follow the fixed 8-byte response header. */
         ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN, body, bodylen);
     }
 
+    /* queue_response may send synchronously or retain the buffer until write-ready. */
     return xrootd_queue_response(ctx, c, buf, total);
 }
 
@@ -167,6 +187,8 @@ xrootd_send_error(xrootd_ctx_t *ctx, ngx_connection_t *c,
     size_t   msglen, bodylen, total;
     u_char  *buf;
 
+    /* kXR_error bodies are [errnum:4B BE][errmsg:NUL-terminated text]. */
+    /* The trailing NUL matters because several XRootD clients treat the text as a C string. */
     msglen  = strlen(msg) + 1;
     bodylen = sizeof(kXR_int32) + msglen;
     total   = XRD_RESPONSE_HDR_LEN + bodylen;
@@ -179,10 +201,12 @@ xrootd_send_error(xrootd_ctx_t *ctx, ngx_connection_t *c,
     xrootd_build_resp_hdr(ctx->cur_streamid, kXR_error, (uint32_t) bodylen,
                            (ServerResponseHdr *) buf);
 
+    /* Keep the numeric protocol error code and human-readable text together. */
     uint32_t ecode = htonl(errcode);
     ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN, &ecode, sizeof(ecode));
     ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN + sizeof(ecode), msg, msglen);
 
+    /* Keep a debug trace of the exact protocol error sent on the wire. */
     ngx_log_debug2(NGX_LOG_DEBUG_STREAM, c->log, 0,
                    "xrootd: sending error %d: %s", (int) errcode, msg);
 

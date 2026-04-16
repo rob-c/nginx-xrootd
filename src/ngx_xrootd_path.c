@@ -1,5 +1,170 @@
 #include "ngx_xrootd_module.h"
 
+static ngx_inline u_char
+xrootd_hex_digit(u_char value)
+{
+    return (value < 10) ? (u_char) ('0' + value)
+                        : (u_char) ('A' + (value - 10));
+}
+
+size_t
+xrootd_sanitize_log_string(const char *in, char *out, size_t outsz)
+{
+    const u_char *src;
+    size_t        written = 0;
+    u_char        ch;
+
+    if (out == NULL || outsz == 0) {
+        return 0;
+    }
+
+    src = (const u_char *) ((in != NULL) ? in : "-");
+
+    while (*src != '\0' && written + 1 < outsz) {
+        ch = *src++;
+
+        /* Keep logs single-line and quote-safe by escaping whitespace/control bytes. */
+        if (ch >= 0x21 && ch <= 0x7e && ch != '"' && ch != '\\') {
+            out[written++] = (char) ch;
+            continue;
+        }
+
+        if (written + 4 >= outsz) {
+            break;
+        }
+
+        out[written++] = '\\';
+        out[written++] = 'x';
+        out[written++] = (char) xrootd_hex_digit((u_char) (ch >> 4));
+        out[written++] = (char) xrootd_hex_digit((u_char) (ch & 0x0f));
+    }
+
+    out[written] = '\0';
+    return written;
+}
+
+static void
+xrootd_log_path_warning(ngx_log_t *log, const char *prefix, const char *path)
+{
+    char safe_path[512];
+
+    xrootd_sanitize_log_string(path, safe_path, sizeof(safe_path));
+    ngx_log_error(NGX_LOG_WARN, log, 0, "%s: %s", prefix, safe_path);
+}
+
+/*
+ * Canonicalize the configured export root once per resolution attempt so all
+ * subsequent prefix checks compare normalized absolute paths.
+ */
+static int
+xrootd_get_canonical_root(ngx_log_t *log, const ngx_str_t *root,
+                          char *root_canon, size_t root_canon_sz)
+{
+    char root_buf[PATH_MAX];
+
+    /* Convert nginx's length-tracked ngx_str_t into a temporary C string first. */
+    if (root == NULL || root->len == 0 || root->len >= sizeof(root_buf)) {
+        return 0;
+    }
+
+    ngx_memcpy(root_buf, root->data, root->len);
+    root_buf[root->len] = '\0';
+
+    if (realpath(root_buf, root_canon) == NULL) {
+        ngx_log_error(NGX_LOG_WARN, log, errno,
+                      "xrootd: cannot canonicalize root \"%s\"", root_buf);
+        return 0;
+    }
+
+    /* Guard against callers providing a destination buffer too small for the result. */
+    if (ngx_strnlen((u_char *) root_canon, root_canon_sz) >= root_canon_sz) {
+        return 0;
+    }
+
+    return 1;
+}
+
+/*
+ * Accept either the root itself or any descendant path under it.  A plain
+ * prefix comparison is not enough because "/data/root2" must not match
+ * "/data/root".
+ */
+static int
+xrootd_path_within_root(const char *root_canon, const char *path_canon)
+{
+    size_t root_len = strlen(root_canon);
+
+    if (strncmp(path_canon, root_canon, root_len) != 0) {
+        return 0;
+    }
+
+    return path_canon[root_len] == '\0' || path_canon[root_len] == '/';
+}
+
+/* Reject single-dot and dot-dot path components before touching the FS. */
+static int
+xrootd_path_component_forbidden(const char *comp, size_t comp_len)
+{
+    return (comp_len == 1 && comp[0] == '.')
+        || (comp_len == 2 && comp[0] == '.' && comp[1] == '.');
+}
+
+/*
+ * Copy an on-the-wire path payload into a C string after applying the XRootD
+ * conventions used by real clients:
+ *   - a single trailing NUL terminator is allowed inside dlen
+ *   - embedded NUL bytes are rejected
+ *   - CGI metadata suffixes can be stripped for ops that treat them as hints
+ */
+int
+xrootd_extract_path(ngx_log_t *log, const u_char *payload, size_t payload_len,
+                    char *out, size_t outsz, ngx_flag_t strip_cgi)
+{
+    const u_char *nul;
+    const u_char *qmark;
+    size_t        copy_len;
+
+    if (payload == NULL || payload_len == 0 || out == NULL || outsz < 2) {
+        return 0;
+    }
+
+    if (payload_len > XROOTD_MAX_PATH) {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "xrootd: path payload too long (%uz bytes)", payload_len);
+        return 0;
+    }
+
+    nul = memchr(payload, '\0', payload_len);
+    if (nul != NULL) {
+        /* Real XRootD clients often include the terminating NUL in dlen. */
+        if (nul != payload + payload_len - 1) {
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                          "xrootd: rejecting path payload with embedded NUL");
+            return 0;
+        }
+        payload_len--;
+    }
+
+    copy_len = payload_len;
+    if (strip_cgi) {
+        /* Ignore client-side metadata such as ?oss.asize=... during lookup. */
+        qmark = memchr(payload, '?', payload_len);
+        if (qmark != NULL) {
+            copy_len = (size_t) (qmark - payload);
+        }
+    }
+
+    if (copy_len == 0 || copy_len >= outsz) {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "xrootd: invalid path payload length (%uz bytes)", copy_len);
+        return 0;
+    }
+
+    ngx_memcpy(out, payload, copy_len);
+    out[copy_len] = '\0';
+    return 1;
+}
+
 /* ================================================================== */
 /*  Path resolution helpers                                             */
 /* ================================================================== */
@@ -16,11 +181,15 @@ int
 xrootd_resolve_path_noexist(ngx_log_t *log, const ngx_str_t *root,
                               const char *reqpath, char *resolved, size_t resolvsz)
 {
-    char        combined[PATH_MAX * 2];
+    char        root_canon[PATH_MAX];
+    char        current[PATH_MAX];
+    char        candidate[PATH_MAX];
+    struct stat st;
     const char *p;
     int         n;
 
     while (*reqpath == '/') {
+        /* Treat client paths as root-relative even if they include repeated leading '/'. */
         reqpath++;
     }
 
@@ -28,34 +197,74 @@ xrootd_resolve_path_noexist(ngx_log_t *log, const ngx_str_t *root,
         return 0;
     }
 
+    if (!xrootd_get_canonical_root(log, root, root_canon, sizeof(root_canon))) {
+        return 0;
+    }
+
+    ngx_cpystrn((u_char *) current, (u_char *) root_canon, sizeof(current));
+
     p = reqpath;
     while (*p) {
-        const char *seg_end = strchr(p, '/');
-        size_t      seg_len = seg_end ? (size_t)(seg_end - p) : strlen(p);
+        const char *seg_end;
+        size_t      seg_len;
 
-        if (seg_len == 2 && p[0] == '.' && p[1] == '.') {
-            ngx_log_error(NGX_LOG_WARN, log, 0,
-                          "xrootd: path traversal attempt: %s", reqpath);
+        /* Skip duplicate separators between path components. */
+        while (*p == '/') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+
+        seg_end = strchr(p, '/');
+        seg_len = seg_end ? (size_t)(seg_end - p) : strlen(p);
+
+        if (xrootd_path_component_forbidden(p, seg_len)) {
+            xrootd_log_path_warning(log, "xrootd: path traversal attempt", reqpath);
             return 0;
         }
+
+        /* Build the next path prefix one component at a time. */
+        n = snprintf(candidate, sizeof(candidate), "%s/%.*s",
+                     current, (int) seg_len, p);
+        if (n < 0 || (size_t) n >= sizeof(candidate)) {
+            ngx_log_error(NGX_LOG_WARN, log, 0, "xrootd: path too long");
+            return 0;
+        }
+
+        if (lstat(candidate, &st) == 0) {
+            /* Existing prefixes may be symlinks; canonicalize and re-check. */
+            if (realpath(candidate, current) == NULL) {
+                return 0;
+            }
+            if (!xrootd_path_within_root(root_canon, current)) {
+                xrootd_log_path_warning(log, "xrootd: path traversal attempt", current);
+                return 0;
+            }
+
+        } else if (errno == ENOENT) {
+            /*
+             * Missing suffixes are fine for mkdir -p / create-style requests.
+             * From this point on we append lexically because there is nothing
+             * on disk yet that realpath() could canonicalize.
+             */
+            ngx_cpystrn((u_char *) current, (u_char *) candidate, sizeof(current));
+
+        } else {
+            return 0;
+        }
+
         if (seg_end == NULL) {
             break;
         }
         p = seg_end + 1;
     }
 
-    n = snprintf(combined, sizeof(combined), "%.*s/%s",
-                 (int) root->len, (char *) root->data, reqpath);
-    if (n < 0 || (size_t) n >= sizeof(combined)) {
-        ngx_log_error(NGX_LOG_WARN, log, 0, "xrootd: path too long");
+    n = snprintf(resolved, resolvsz, "%s", current);
+    if (n < 0 || (size_t) n >= resolvsz) {
         return 0;
     }
 
-    if ((size_t) n >= resolvsz) {
-        return 0;
-    }
-
-    ngx_cpystrn((u_char *) resolved, (u_char *) combined, resolvsz);
     return 1;
 }
 
@@ -73,14 +282,48 @@ xrootd_resolve_path(ngx_log_t *log, const ngx_str_t *root,
 {
     char combined[PATH_MAX * 2];
     char canonical[PATH_MAX];
+    char root_canon[PATH_MAX];
+    const char *p = reqpath;
     int  n;
 
-    while (*reqpath == '/') {
-        reqpath++;
+    if (!xrootd_get_canonical_root(log, root, root_canon, sizeof(root_canon))) {
+        return 0;
+    }
+
+    while (*p == '/') {
+        /* Normalize client requests to a root-relative form. */
+        p++;
+    }
+
+    if (*p == '\0') {
+        /* A request for "/" resolves to the canonical export root itself. */
+        n = snprintf(resolved, resolvsz, "%s", root_canon);
+        return (n >= 0 && (size_t) n < resolvsz);
+    }
+
+    {
+        const char *scan = p;
+        while (*scan) {
+            const char *seg_end = strchr(scan, '/');
+            size_t      seg_len = seg_end ? (size_t) (seg_end - scan) : strlen(scan);
+
+            /* Fast reject before any realpath() call normalizes the request. */
+            if (xrootd_path_component_forbidden(scan, seg_len)) {
+                xrootd_log_path_warning(log, "xrootd: path traversal attempt", reqpath);
+                return 0;
+            }
+
+            if (seg_end == NULL) {
+                break;
+            }
+
+            /* Continue scanning the lexical request one component at a time. */
+            scan = seg_end + 1;
+        }
     }
 
     n = snprintf(combined, sizeof(combined), "%.*s/%s",
-                 (int) root->len, (char *) root->data, reqpath);
+                 (int) strlen(root_canon), root_canon, p);
 
     if (n < 0 || (size_t) n >= sizeof(combined)) {
         ngx_log_error(NGX_LOG_WARN, log, 0, "xrootd: path too long");
@@ -91,15 +334,9 @@ xrootd_resolve_path(ngx_log_t *log, const ngx_str_t *root,
         return 0;
     }
 
-    if (strncmp(canonical, (char *) root->data, root->len) != 0) {
-        ngx_log_error(NGX_LOG_WARN, log, 0,
-                      "xrootd: path traversal attempt: %s", canonical);
-        return 0;
-    }
-
-    if (canonical[root->len] != '\0' && canonical[root->len] != '/') {
-        ngx_log_error(NGX_LOG_WARN, log, 0,
-                      "xrootd: path traversal attempt: %s", canonical);
+    /* Canonical target must still live under the canonical export root. */
+    if (!xrootd_path_within_root(root_canon, canonical)) {
+        xrootd_log_path_warning(log, "xrootd: path traversal attempt", canonical);
         return 0;
     }
 
@@ -123,19 +360,30 @@ int
 xrootd_resolve_path_write(ngx_log_t *log, const ngx_str_t *root,
                            const char *reqpath, char *resolved, size_t resolvsz)
 {
+    char  root_canon[PATH_MAX];
     char  combined[PATH_MAX * 2];
     char  parent_buf[PATH_MAX * 2];
     char  parent_canon[PATH_MAX];
     char *slash;
     const char *base;
+    size_t base_len;
     int   n;
 
+    if (!xrootd_get_canonical_root(log, root, root_canon, sizeof(root_canon))) {
+        return 0;
+    }
+
     while (*reqpath == '/') {
+        /* Collapse client-leading slashes before splitting parent vs basename. */
         reqpath++;
     }
 
+    if (*reqpath == '\0') {
+        return 0;
+    }
+
     n = snprintf(combined, sizeof(combined), "%.*s/%s",
-                 (int) root->len, (char *) root->data, reqpath);
+                 (int) strlen(root_canon), root_canon, reqpath);
     if (n < 0 || (size_t) n >= sizeof(combined)) {
         ngx_log_error(NGX_LOG_WARN, log, 0, "xrootd: path too long");
         return 0;
@@ -153,18 +401,21 @@ xrootd_resolve_path_write(ngx_log_t *log, const ngx_str_t *root,
         return 0;
     }
 
+    base_len = strlen(base);
+    /* The final component may not exist yet, but it still cannot be . or .. */
+    if (xrootd_path_component_forbidden(base, base_len)) {
+        xrootd_log_path_warning(log, "xrootd: path traversal attempt", reqpath);
+        return 0;
+    }
+
+    /* Canonicalize only the existing parent; the leaf may be created next. */
     if (realpath(parent_buf, parent_canon) == NULL) {
         return 0;
     }
 
-    if (strncmp(parent_canon, (char *) root->data, root->len) != 0) {
-        ngx_log_error(NGX_LOG_WARN, log, 0,
-                      "xrootd: path traversal attempt in write: %s", parent_canon);
-        return 0;
-    }
-    if (parent_canon[root->len] != '\0' && parent_canon[root->len] != '/') {
-        ngx_log_error(NGX_LOG_WARN, log, 0,
-                      "xrootd: path traversal attempt in write: %s", parent_canon);
+    /* Only the parent must already exist; the final leaf may be created next. */
+    if (!xrootd_path_within_root(root_canon, parent_canon)) {
+        xrootd_log_path_warning(log, "xrootd: path traversal attempt in write", parent_canon);
         return 0;
     }
 
@@ -198,14 +449,17 @@ xrootd_mkdir_recursive(const char *path, mode_t mode)
 
     for (p = tmp + 1; *p; p++) {
         if (*p == '/') {
+            /* Temporarily cut the string here so mkdir() sees the current prefix only. */
             *p = '\0';
             if (mkdir(tmp, mode) != 0 && errno != EEXIST) {
                 return -1;
             }
+            /* Restore the separator and continue with the next deeper component. */
             *p = '/';
         }
     }
 
+    /* Final mkdir handles the full requested path after all parent prefixes. */
     if (mkdir(tmp, mode) != 0 && errno != EEXIST) {
         return -1;
     }
@@ -222,6 +476,7 @@ xrootd_strip_cgi(const char *in, char *out, size_t outsz)
     const char *q = strchr(in, '?');
     size_t      len;
 
+    /* Everything after '?' is client-side metadata, not part of the filesystem path. */
     if (q != NULL) {
         len = (size_t)(q - in);
     } else {
@@ -248,6 +503,7 @@ xrootd_make_stat_body(const struct stat *st, ngx_flag_t is_vfs,
     int flags = 0;
 
     if (is_vfs) {
+        /* VFS replies use capacity-style information instead of inode/path metadata. */
         snprintf(out, outsz, "0 %lld %d %ld",
                  (long long) st->st_blocks * 512,
                  kXR_readable,
@@ -261,6 +517,7 @@ xrootd_make_stat_body(const struct stat *st, ngx_flag_t is_vfs,
         flags |= kXR_other;
     }
 
+    /* XRootD stat flags are derived from POSIX mode bits and file type. */
     if (st->st_mode & (S_IRUSR | S_IRGRP | S_IROTH)) {
         flags |= kXR_readable;
     }
@@ -283,10 +540,16 @@ xrootd_log_access(xrootd_ctx_t *ctx, ngx_connection_t *c,
 {
     ngx_stream_xrootd_srv_conf_t  *conf;
     ngx_msec_int_t                 duration_ms;
-    char                           line[2048];
+    char                           line[4096];
     int                            n;
     const char                    *authmethod, *identity;
     char                           client_ip[INET6_ADDRSTRLEN + 8];
+    char                           safe_client_ip[128];
+    char                           safe_identity[1024];
+    char                           safe_verb[64];
+    char                           safe_path[1024];
+    char                           safe_detail[512];
+    char                           safe_errmsg[1024];
     ngx_time_t                    *tp;
     struct tm                      tm;
     char                           timebuf[64];
@@ -298,6 +561,7 @@ xrootd_log_access(xrootd_ctx_t *ctx, ngx_connection_t *c,
         return;
     }
 
+    /* Snapshot the peer address into a local C string for the log line builder. */
     if (c->addr_text.len > 0 && c->addr_text.len < sizeof(client_ip)) {
         ngx_memcpy(client_ip, c->addr_text.data, c->addr_text.len);
         client_ip[c->addr_text.len] = '\0';
@@ -323,36 +587,44 @@ xrootd_log_access(xrootd_ctx_t *ctx, ngx_connection_t *c,
         duration_ms = 0;
     }
 
+    /* If the caller omitted text for a failed op, at least record the numeric code. */
     if (!xrd_ok && errmsg == NULL) {
         snprintf(errbuf, sizeof(errbuf), "code:%u", (unsigned) errcode);
         errmsg = errbuf;
     }
 
+    xrootd_sanitize_log_string(client_ip, safe_client_ip, sizeof(safe_client_ip));
+    xrootd_sanitize_log_string(identity, safe_identity, sizeof(safe_identity));
+    xrootd_sanitize_log_string(verb ? verb : "-", safe_verb, sizeof(safe_verb));
+    xrootd_sanitize_log_string(path ? path : "-", safe_path, sizeof(safe_path));
+    xrootd_sanitize_log_string(detail ? detail : "-", safe_detail, sizeof(safe_detail));
+    xrootd_sanitize_log_string(errmsg ? errmsg : "-", safe_errmsg, sizeof(safe_errmsg));
+
     if (xrd_ok) {
         n = snprintf(line, sizeof(line),
             "%s %s \"%s\" [%s] \"%s %s %s\" OK %zu %dms\n",
-            client_ip,
+            safe_client_ip,
             authmethod,
-            identity,
+            safe_identity,
             timebuf,
-            verb,
-            path   ? path   : "-",
-            detail ? detail : "-",
+            safe_verb,
+            safe_path,
+            safe_detail,
             bytes,
             (int) duration_ms);
     } else {
         n = snprintf(line, sizeof(line),
             "%s %s \"%s\" [%s] \"%s %s %s\" ERR %zu %dms \"%s\"\n",
-            client_ip,
+            safe_client_ip,
             authmethod,
-            identity,
+            safe_identity,
             timebuf,
-            verb,
-            path   ? path   : "-",
-            detail ? detail : "-",
+            safe_verb,
+            safe_path,
+            safe_detail,
             bytes,
             (int) duration_ms,
-            errmsg);
+            safe_errmsg);
     }
 
     if (n > 0 && (size_t) n < sizeof(line)) {

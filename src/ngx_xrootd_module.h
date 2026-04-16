@@ -299,12 +299,15 @@ ngx_int_t xrootd_send_pgwrite_status(xrootd_ctx_t *ctx,
     ngx_connection_t *c, int64_t write_offset);
 
 /* ngx_xrootd_path.c */
+size_t xrootd_sanitize_log_string(const char *in, char *out, size_t outsz);
 int  xrootd_resolve_path_noexist(ngx_log_t *log, const ngx_str_t *root,
     const char *reqpath, char *resolved, size_t resolvsz);
 int  xrootd_resolve_path(ngx_log_t *log, const ngx_str_t *root,
     const char *reqpath, char *resolved, size_t resolvsz);
 int  xrootd_resolve_path_write(ngx_log_t *log, const ngx_str_t *root,
     const char *reqpath, char *resolved, size_t resolvsz);
+int  xrootd_extract_path(ngx_log_t *log, const u_char *payload,
+    size_t payload_len, char *out, size_t outsz, ngx_flag_t strip_cgi);
 int  xrootd_mkdir_recursive(const char *path, mode_t mode);
 void xrootd_strip_cgi(const char *in, char *out, size_t outsz);
 void xrootd_make_stat_body(const struct stat *st, ngx_flag_t is_vfs,

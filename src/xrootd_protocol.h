@@ -22,6 +22,10 @@
 /* Primitive types (matching XProtocol.hh)                             */
 /* ------------------------------------------------------------------ */
 
+/*
+ * These aliases mirror the upstream protocol header names so the request and
+ * response structs below can stay visually close to the published spec.
+ */
 typedef uint8_t   kXR_char;
 typedef uint16_t  kXR_unt16;
 typedef uint32_t  kXR_unt32;
@@ -48,6 +52,10 @@ typedef int64_t   kXR_int64;
 /* Fixed wire sizes                                                     */
 /* ------------------------------------------------------------------ */
 
+/*
+ * These sizes are used throughout the parser when advancing between the fixed
+ * header and the optional payload that follows it.
+ */
 #define XRD_HANDSHAKE_LEN       20     /* client → server, initial hello */
 #define XRD_HANDSHAKE_RSP_LEN   12     /* server → client, initial hello */
 #define XRD_REQUEST_HDR_LEN     24     /* every request starts with this */
@@ -59,6 +67,7 @@ typedef int64_t   kXR_int64;
 /* Request IDs (kXR_*)                                                  */
 /* ------------------------------------------------------------------ */
 
+/* Numeric opcodes carried in ClientRequestHdr.requestid. */
 #define kXR_auth        3000
 #define kXR_query       3001
 #define kXR_chmod       3002
@@ -232,6 +241,10 @@ typedef int64_t   kXR_int64;
 /* All integers are network byte order; use htonl/ntohl to access.     */
 /* ------------------------------------------------------------------ */
 
+/*
+ * The protocol structs must match the on-the-wire byte layout exactly; any
+ * compiler-inserted padding would corrupt request parsing immediately.
+ */
 #pragma pack(push, 1)
 
 /*
@@ -276,6 +289,7 @@ typedef struct {
     kXR_char   streamid[2];  /* client-chosen, echoed in response */
     kXR_unt16  requestid;    /* one of the kXR_* constants        */
     kXR_char   body[16];     /* request-specific parameters       */
+    /* Number of payload bytes immediately following this 24-byte header. */
     kXR_int32  dlen;         /* payload length following header   */
 } ClientRequestHdr;          /* 24 bytes; payload follows inline  */
 
@@ -286,6 +300,7 @@ typedef struct {
 typedef struct {
     kXR_char   streamid[2];  /* echoed from request */
     kXR_unt16  status;       /* kXR_ok / kXR_error / ... */
+    /* Number of response-body bytes following the 8-byte response header. */
     kXR_int32  dlen;         /* response body length */
 } ServerResponseHdr;         /* 8 bytes; body follows inline */
 
@@ -376,6 +391,7 @@ typedef struct {
     kXR_unt16  optiont;      /* extended open flags */
     kXR_char   reserved[6];
     kXR_char   fhtemplt[4];  /* file handle template (usually 0) */
+    /* Path bytes follow the header; many clients include a trailing NUL in dlen. */
     kXR_int32  dlen;         /* length of path payload */
     /* null-terminated path follows as payload */
 } ClientOpenRequest;         /* 24 bytes */
@@ -411,13 +427,14 @@ typedef struct {
     kXR_char   options;      /* kXR_vfs or 0 */
     kXR_char   reserved[7];
     kXR_unt32  wants;        /* 0 */
+    /* Either this handle is set, or dlen points at a path payload, but not both. */
     kXR_char   fhandle[4];   /* 0 if path-based stat, else open handle */
     kXR_int32  dlen;         /* path length (0 if using fhandle) */
     /* null-terminated path follows as payload */
 } ClientStatRequest;         /* 24 bytes */
 /*
  * Response body: ASCII string (null-terminated):
- *   "<id> <flags> <size> <modtime>"
+ *   "<id> <size> <flags> <modtime>"
  * e.g. "1234567 16 65536 1700000000"
  */
 
@@ -486,6 +503,7 @@ typedef struct {
     kXR_char  pathid;       /* path ID (0 = primary) */
     kXR_char  reqflags;     /* kXR_pgRetry (0x01) or 0 */
     kXR_char  reserved[2];
+    /* Total bytes of interleaved data+CRC payload, not just pure file data. */
     kXR_int32 dlen;         /* total payload length (pages + checksums) */
     /* payload: interleaved page data and 4-byte CRC32 checksums */
 } ClientPgWriteRequest;     /* 24 bytes */
@@ -527,6 +545,7 @@ typedef struct {
     kXR_char   fhandle[4];   /* file handle (if dlen==0) */
     kXR_int64  offset;       /* target file length */
     kXR_char   reserved[4];
+    /* Handle-based truncate uses dlen=0; path-based truncate supplies a path. */
     kXR_int32  dlen;         /* path length (if path-based), or 0 for handle-based */
     /* null-terminated path follows as payload when dlen > 0 */
 } ClientTruncateRequest;     /* 24 bytes */
@@ -580,6 +599,7 @@ typedef struct {
     kXR_char   streamid[2];
     kXR_unt16  requestid;    /* kXR_mv */
     kXR_char   reserved[14];
+    /* Length of the first path so the receiver can split src and dst safely. */
     kXR_int16  arg1len;      /* byte length of source path in payload */
     kXR_int32  dlen;         /* total payload length (src + '\0' + dst) */
     /* payload: source path (arg1len bytes, null-terminated) followed
@@ -607,6 +627,8 @@ typedef struct {
  * Each entry in the kXR_readv request payload describes one read segment.
  * The response body is the same structure (with actual rlen filled in)
  * followed immediately by rlen bytes of file data, repeated N times.
+ * The server therefore has to preserve the per-segment headers while filling
+ * in the data area behind them.
  *
  * Wire sizes (all big-endian):
  *   fhandle  4 bytes  open file handle (same as kXR_open response)
@@ -631,6 +653,7 @@ typedef struct {
     kXR_unt16  requestid;   /* kXR_readv */
     kXR_char   reserved[15];
     kXR_char   pathid;      /* 0 for primary path */
+    /* Payload is a packed array of readahead_list entries. */
     kXR_int32  dlen;        /* N * sizeof(readahead_list) */
     /* payload: N readahead_list structs */
 } ClientReadVRequest;       /* 24 bytes */
@@ -662,6 +685,7 @@ typedef struct {
     kXR_unt16  requestid;   /* kXR_query */
     kXR_unt16  infotype;    /* one of kXR_Q* above                       */
     kXR_char   reserved1[2];
+    /* Handle is used for handle-based queries; otherwise dlen supplies a path. */
     kXR_char   fhandle[4];  /* open file handle (for handle-based queries) */
     kXR_char   reserved2[8];
     kXR_int32  dlen;        /* path length (0 for handle-based queries)  */
@@ -685,6 +709,7 @@ typedef struct {
 
 typedef struct {
     kXR_int32  errnum;         /* one of kXR_* error codes above */
+    /* errmsg is variable-length storage beginning here, including the trailing NUL. */
     char       errmsg[1];      /* null-terminated, variable length */
 } ServerErrorBody;
 
@@ -694,6 +719,7 @@ typedef struct {
 
 typedef struct {
     kXR_int32  port;
+    /* host bytes start here and continue until the terminating NUL. */
     char       host[1];        /* null-terminated hostname */
 } ServerRedirectBody;
 
@@ -722,6 +748,8 @@ typedef struct {
  * XrdSutBucket type codes (kXRS_*).
  * Every bucket on the wire is [type:4B BE][len:4B BE][data:len].
  * A bucket with type=kXRS_none signals end-of-message.
+ * Parsing therefore runs as a length-delimited loop until the terminator is
+ * seen or the enclosing auth payload is exhausted.
  */
 #define kXRS_none           0       /* terminator bucket                 */
 #define kXRS_inactive       1       /* skipped during serialisation      */

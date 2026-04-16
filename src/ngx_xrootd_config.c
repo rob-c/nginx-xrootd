@@ -9,11 +9,22 @@ ngx_stream_xrootd_create_srv_conf(ngx_conf_t *cf)
 {
     ngx_stream_xrootd_srv_conf_t *conf;
 
+    /*
+     * nginx allocates one per-server config object during parsing and then
+     * merges parent/child scopes later. Start everything in an explicit
+     * "unset" or NULL state so the merge step can tell whether a directive
+     * was omitted or configured intentionally.
+     */
     conf = ngx_pcalloc(cf->pool, sizeof(ngx_stream_xrootd_srv_conf_t));
     if (conf == NULL) {
         return NULL;
     }
 
+    /*
+     * Scalar fields use nginx's UNSET sentinels when they participate in merge
+     * logic; runtime-only objects start out NULL/invalid and are created later
+     * during postconfiguration once parsing has finished.
+     */
     conf->enable       = NGX_CONF_UNSET;
     conf->auth         = NGX_CONF_UNSET_UINT;
     conf->allow_write  = NGX_CONF_UNSET;
@@ -33,6 +44,11 @@ ngx_stream_xrootd_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_stream_xrootd_srv_conf_t *prev = parent;
     ngx_stream_xrootd_srv_conf_t *conf = child;
 
+    /*
+     * Standard nginx inheritance rules: values set on the current server
+     * override the parent, otherwise we fall back to the parent or the hard
+     * coded module default.
+     */
     ngx_conf_merge_value(conf->enable,      prev->enable,      0);
     ngx_conf_merge_str_value(conf->root,    prev->root,        "/");
     ngx_conf_merge_uint_value(conf->auth,   prev->auth,        XROOTD_AUTH_NONE);
@@ -60,10 +76,15 @@ ngx_stream_xrootd_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return rv;
     }
 
+    /* Explicit `xrootd off;` leaves the server block as a normal stream server. */
     if (!xcf->enable) {
         return NGX_CONF_OK;
     }
 
+    /*
+     * The stream core owns the accept loop; enabling the directive swaps in
+     * our session handler for this server block.
+     */
     cscf = ngx_stream_conf_get_module_srv_conf(cf, ngx_stream_core_module);
     cscf->handler = ngx_stream_xrootd_handler;
 
@@ -85,6 +106,16 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
     cmcf  = ngx_stream_conf_get_module_main_conf(cf, ngx_stream_core_module);
     cscfp = cmcf->servers.elts;
 
+    /*
+     * First pass over enabled servers:
+     *   1. open any per-server access log
+     *   2. load GSI server credentials when auth=gsi
+     *
+     * This happens after parsing is complete so inherited values are already
+     * resolved and we only initialize resources for active server blocks.
+     * Each later pass depends on state established here, so the ordering is
+     * deliberate rather than just a convenience loop split.
+     */
     for (i = 0; i < cmcf->servers.nelts; i++) {
         xcf = ngx_stream_conf_get_module_srv_conf(cscfp[i], ngx_stream_xrootd_module);
 
@@ -92,7 +123,11 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
             continue;
         }
 
-        /* Open the access log for this server block */
+        /*
+         * Access log handling mirrors nginx conventions: empty means disabled by
+         * default, the literal string "off" suppresses logging explicitly, and
+         * any other value is treated as the path to append to.
+         */
         if (xcf->access_log.len > 0
             && ngx_strcmp(xcf->access_log.data, (u_char *) "off") != 0)
         {
@@ -114,9 +149,11 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
         }
 
         if (xcf->auth != XROOTD_AUTH_GSI) {
+            /* Non-GSI servers skip all OpenSSL/X509 setup in this pass. */
             continue;
         }
 
+        /* GSI mode is only meaningful when all three trust inputs are present. */
         if (xcf->certificate.len == 0 || xcf->certificate_key.len == 0
             || xcf->trusted_ca.len == 0)
         {
@@ -170,6 +207,11 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
             X509  *ca;
             X509_LOOKUP *lookup;
 
+            /*
+             * Verification context used later during kXR_auth. Proxy certs are
+             * allowed explicitly because grid credentials are RFC 3820 proxies,
+             * not just end-entity certs.
+             */
             xcf->gsi_store = X509_STORE_new();
             if (xcf->gsi_store == NULL) {
                 return NGX_ERROR;
@@ -183,6 +225,11 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
             if (lookup == NULL) {
                 return NGX_ERROR;
             }
+
+            /*
+             * The CA bundle is loaded into the store once here and then reused
+             * by every GSI login handled by this listener.
+             */
             if (!X509_LOOKUP_load_file(lookup,
                                        (char *) xcf->trusted_ca.data,
                                        X509_FILETYPE_PEM))
@@ -199,6 +246,10 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
                 ca = PEM_read_X509(fp, NULL, NULL, NULL);
                 fclose(fp);
                 if (ca) {
+                    /*
+                     * The protocol advertises the issuer hash during the GSI
+                     * bootstrap so clients can confirm which CA the server wants.
+                     */
                     xcf->gsi_ca_hash = (uint32_t) X509_subject_name_hash(ca);
                     X509_free(ca);
                 }
@@ -216,6 +267,13 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
         size_t      zone_size;
         ngx_uint_t  slot = 0;
 
+        /*
+         * One shared zone is used for all enabled server blocks. Each server is
+         * assigned a small integer slot; live connections cache that slot and
+         * update counters lock-free via atomics.
+         */
+
+        /* Extra page headroom follows a common nginx shared-memory sizing pattern. */
         zone_size = sizeof(ngx_xrootd_metrics_t) + ngx_pagesize;
         ngx_xrootd_shm_zone = ngx_shared_memory_add(cf, &zone_name,
                                                       zone_size,
@@ -223,15 +281,21 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
         if (ngx_xrootd_shm_zone == NULL) {
             return NGX_ERROR;
         }
+
+        /* init() will either zero a new mapping or hand back an existing one. */
         ngx_xrootd_shm_zone->init = ngx_xrootd_metrics_shm_init;
+        /* Non-NULL sentinel tells the init callback this is the first setup. */
         ngx_xrootd_shm_zone->data = (void *) 1;
 
+        /* Second pass: assign deterministic metrics slots to enabled listeners. */
         for (i = 0; i < cmcf->servers.nelts; i++) {
             xcf = ngx_stream_conf_get_module_srv_conf(cscfp[i],
                                                        ngx_stream_xrootd_module);
             if (!xcf->enable || slot >= XROOTD_METRICS_MAX_SERVERS) {
                 continue;
             }
+
+            /* Slot numbers become stable label sources for the HTTP metrics exporter. */
             xcf->metrics_slot = (ngx_int_t) slot++;
         }
     }
@@ -240,6 +304,12 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
     {
         static ngx_str_t default_pool_name = ngx_string("default");
 
+        /*
+         * Third pass: resolve each enabled server's thread-pool name to the
+         * concrete pool object created by nginx's top-level thread_pool config.
+         * This is kept separate from the GSI/metrics passes because it depends
+         * only on the final merged config and does not mutate shared structures.
+         */
         for (i = 0; i < cmcf->servers.nelts; i++) {
             ngx_str_t *pool_name;
 
@@ -249,6 +319,7 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
                 continue;
             }
 
+            /* Empty name means "use nginx's default thread pool". */
             pool_name = (xcf->thread_pool_name.len > 0)
                         ? &xcf->thread_pool_name
                         : &default_pool_name;
@@ -280,12 +351,19 @@ ngx_xrootd_metrics_shm_init(ngx_shm_zone_t *shm_zone, void *data)
     ngx_xrootd_metrics_t *shm;
 
     if (data) {
+        /*
+         * nginx is reusing an existing shared zone across a reload; preserve
+         * live counters instead of wiping them on every config reload.
+         */
         shm_zone->data = data;
         return NGX_OK;
     }
 
+    /* First initialization: zero the freshly mapped shared memory region. */
     shm = (ngx_xrootd_metrics_t *) shm_zone->shm.addr;
     ngx_memzero(shm, sizeof(*shm));
+
+    /* Save the typed pointer so request paths do not have to recast repeatedly. */
     shm_zone->data = shm;
     return NGX_OK;
 }

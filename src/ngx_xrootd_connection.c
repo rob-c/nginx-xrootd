@@ -11,6 +11,7 @@ ngx_stream_xrootd_handler(ngx_stream_session_t *s)
     xrootd_ctx_t      *ctx;
     int                i;
 
+    /* One per-connection context carries protocol state for the session lifetime. */
     ctx = ngx_pcalloc(c->pool, sizeof(xrootd_ctx_t));
     if (ctx == NULL) {
         ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
@@ -18,15 +19,22 @@ ngx_stream_xrootd_handler(ngx_stream_session_t *s)
     }
 
     ctx->session = s;
+    /* Every connection begins before any protocol framing has been negotiated. */
     ctx->state   = XRD_ST_HANDSHAKE;
     ctx->hdr_pos = 0;
 
+    /* Mark every handle slot free before the first open request arrives. */
     for (i = 0; i < XROOTD_MAX_FILES; i++) {
         ctx->files[i].fd = -1;
     }
 
     {
         uint32_t parts[4];
+        /*
+         * Session IDs only need to be unique per process lifetime, not secret.
+         * Mix together coarse time, worker pid, connection address identity,
+         * and nginx's PRNG so concurrent sessions are unlikely to collide.
+         */
         parts[0] = (uint32_t) ngx_time();
         parts[1] = (uint32_t) ngx_pid;
         parts[2] = (uint32_t) (uintptr_t) c;
@@ -40,6 +48,11 @@ ngx_stream_xrootd_handler(ngx_stream_session_t *s)
     {
         ngx_stream_xrootd_srv_conf_t *mconf;
         mconf = ngx_stream_get_module_srv_conf(s, ngx_stream_xrootd_module);
+
+        /*
+         * metrics_slot is assigned at config time; here we translate it to the
+         * shared-memory row the connection will update for its lifetime.
+         */
         if (mconf->metrics_slot >= 0 && ngx_xrootd_shm_zone != NULL
             && ngx_xrootd_shm_zone->data != NULL
             && ngx_xrootd_shm_zone->data != (void *) 1)
@@ -49,8 +62,13 @@ ngx_stream_xrootd_handler(ngx_stream_session_t *s)
             ctx->metrics = srv;
 
             if (!srv->in_use) {
+                /*
+                 * Lazily stamp listener metadata the first time any connection
+                 * lands on this slot. Later connections only update counters.
+                 */
                 srv->in_use = 1;
                 ngx_cpystrn((u_char *) srv->auth,
+                            /* Export auth mode as a stable low-cardinality label. */
                             (u_char *) (mconf->auth == 1 ? "gsi" : "anon"),
                             sizeof(srv->auth));
                 if (c->local_sockaddr) {
@@ -67,14 +85,17 @@ ngx_stream_xrootd_handler(ngx_stream_session_t *s)
                 }
             }
 
+            /* `total` is monotonic; `active` is the live connection gauge. */
             ngx_atomic_fetch_add(&srv->connections_total, 1);
             ngx_atomic_fetch_add(&srv->connections_active, 1);
         }
     }
 
+    /* After setup, all future progress happens through the read/write event handlers. */
     c->read->handler  = ngx_stream_xrootd_recv;
     c->write->handler = ngx_stream_xrootd_send;
 
+    /* Kick the state machine once immediately so already-buffered bytes are consumed. */
     ngx_stream_xrootd_recv(c->read);
 }
 
@@ -100,6 +121,7 @@ ngx_stream_xrootd_recv(ngx_event_t *rev)
     if (rev->timedout) {
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
                       "xrootd: client connection timed out");
+        /* Timeout teardown follows the same accounting path as any other loss. */
         xrootd_on_disconnect(ctx, c);
         xrootd_close_all_files(ctx);
         ngx_stream_finalize_session(s, NGX_STREAM_OK);
@@ -108,11 +130,20 @@ ngx_stream_xrootd_recv(ngx_event_t *rev)
 
     for (;;) {
 
+        /*
+         * Drain as much input as we can in one callback until we either block,
+         * hand ownership to the write side, or park on an async file operation.
+         * This keeps latency down for pipelined clients that already have the
+         * next request waiting in the socket buffer.
+         */
+
         if (ctx->state == XRD_ST_SENDING) {
+            /* Stop parsing new requests until the current response is flushed. */
             return;
         }
 
         if (ctx->state == XRD_ST_AIO) {
+            /* A worker thread owns the request; just keep the read event armed. */
             if (ngx_handle_read_event(rev, 0) != NGX_OK) {
                 goto fatal;
             }
@@ -122,27 +153,39 @@ ngx_stream_xrootd_recv(ngx_event_t *rev)
         u_char *dest;
         size_t  need, avail;
 
+        /* Recompute target buffer and remaining byte count from the current state. */
+
         if (ctx->state == XRD_ST_HANDSHAKE) {
+            /* Initial 20-byte hello before any framed requests exist. */
             dest  = ctx->hdr_buf + ctx->hdr_pos;
             need  = XRD_HANDSHAKE_LEN - ctx->hdr_pos;
 
         } else if (ctx->state == XRD_ST_REQ_HEADER) {
+            /* Every normal XRootD request starts with one fixed 24-byte header. */
             dest  = ctx->hdr_buf + ctx->hdr_pos;
             need  = XRD_REQUEST_HDR_LEN - ctx->hdr_pos;
 
         } else {
+            /* Payload bytes are accumulated into the pool buffer allocated from dlen. */
             dest  = ctx->payload + ctx->payload_pos;
             need  = ctx->cur_dlen - ctx->payload_pos;
         }
 
         if (need == 0) {
+            /* Exact-size frame already assembled; process it without another recv(). */
             goto process;
         }
 
+        /*
+         * Ask the socket for exactly the remaining bytes needed for the current
+         * frame fragment. The state machine tracks any short read explicitly.
+         */
+        /* Ignore any stale "available" hint and ask recv() directly. */
         rev->available = -1;
         n = c->recv(c, dest, need);
 
         if (n == NGX_AGAIN) {
+            /* Socket input is drained for now; wait until nginx marks it readable again. */
             ngx_log_error(NGX_LOG_INFO, c->log, 0,
                           "xrootd: recv AGAIN st=%d hdr_pos=%uz avail=%d"
                           " ready=%d active=%d",
@@ -157,6 +200,7 @@ ngx_stream_xrootd_recv(ngx_event_t *rev)
         if (n == NGX_ERROR || n == 0) {
             ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
                            "xrootd: client disconnected");
+            /* EOF and hard recv failure both translate to connection teardown. */
             xrootd_on_disconnect(ctx, c);
             xrootd_close_all_files(ctx);
             ngx_stream_finalize_session(s, NGX_STREAM_OK);
@@ -166,24 +210,29 @@ ngx_stream_xrootd_recv(ngx_event_t *rev)
         avail = (size_t) n;
 
         if (ctx->state == XRD_ST_HANDSHAKE) {
+            /* Handshake bytes accumulate in the same hdr_buf used for later headers. */
             ctx->hdr_pos += avail;
         } else if (ctx->state == XRD_ST_REQ_HEADER) {
             ctx->hdr_pos += avail;
         } else {
+            /* Payload state tracks a separate cursor because payload can be much larger. */
             ctx->payload_pos += avail;
         }
 
         if (avail < need) {
+            /* Partial frame: stay in the same state and wait for more bytes. */
             continue;
         }
 
 process:
+    /* The current handshake/header/payload frame is complete; act on it now. */
         if (ctx->state == XRD_ST_HANDSHAKE) {
 
             rc = xrootd_process_handshake(ctx, c);
             if (rc != NGX_OK) {
                 goto fatal;
             }
+            /* Handshake succeeded; all further traffic is 24-byte request headers. */
             ctx->state   = XRD_ST_REQ_HEADER;
             ctx->hdr_pos = 0;
 
@@ -191,6 +240,7 @@ process:
 
             ClientRequestHdr *hdr = (ClientRequestHdr *) ctx->hdr_buf;
 
+            /* Cache the parsed header in host order for the downstream handlers. */
             ctx->cur_streamid[0] = hdr->streamid[0];
             ctx->cur_streamid[1] = hdr->streamid[1];
             ctx->cur_reqid       = ntohs(hdr->requestid);
@@ -206,6 +256,11 @@ process:
 
             {
                 uint32_t max_pl;
+                /*
+                 * Bound allocations per opcode before any payload buffer is
+                 * created. Small metadata requests get a tight path-sized cap,
+                 * while the write-family opcodes are allowed much larger bodies.
+                 */
                 if (ctx->cur_reqid == kXR_pgwrite ||
                     ctx->cur_reqid == kXR_write   ||
                     ctx->cur_reqid == kXR_writev) {
@@ -216,6 +271,7 @@ process:
                     max_pl = XROOTD_MAX_PATH + 64;
                 }
                 if (ctx->cur_dlen > max_pl) {
+                    /* Oversized payloads are treated as fatal protocol abuse. */
                     ngx_log_error(NGX_LOG_WARN, c->log, 0,
                                   "xrootd: payload too large (%uz), closing",
                                   (size_t) ctx->cur_dlen);
@@ -224,17 +280,26 @@ process:
             }
 
             if (ctx->cur_dlen > 0) {
+                /*
+                 * Allocate one extra byte so path-style handlers can safely treat
+                 * the payload as a C string after validation. dlen remains the
+                 * authoritative byte count for binary-safe parsing.
+                 */
                 ctx->payload = ngx_palloc(c->pool, ctx->cur_dlen + 1);
                 if (ctx->payload == NULL) {
                     goto fatal;
                 }
+                /* The spare byte is for local convenience only, never sent back on the wire. */
                 ctx->payload[ctx->cur_dlen] = '\0';
                 ctx->payload_pos = 0;
                 ctx->state       = XRD_ST_REQ_PAYLOAD;
                 ctx->hdr_pos     = 0;
+                /* Loop back immediately in case the payload bytes are already waiting. */
                 continue;
             }
 
+            /* Zero-length requests can be dispatched immediately from the header. */
+            /* `payload = NULL` lets handlers distinguish header-only requests cheaply. */
             ctx->payload = NULL;
             rc = xrootd_dispatch(ctx, c, conf);
             if (rc == NGX_ERROR) {
@@ -242,17 +307,21 @@ process:
             }
 
             if (ctx->state == XRD_ST_AIO) {
+                /* The handler posted background work; the completion callback resumes. */
                 if (ngx_handle_read_event(rev, 0) != NGX_OK) {
                     goto fatal;
                 }
                 return;
             }
             if (ctx->state != XRD_ST_SENDING) {
+                /* Most handlers complete synchronously and return to header parsing. */
                 ctx->state   = XRD_ST_REQ_HEADER;
                 ctx->hdr_pos = 0;
             }
 
         } else {
+            /* Full payload is buffered; hand off to the request-specific handler. */
+            /* Default back to header parsing unless the handler deliberately overrides state. */
             ctx->state = XRD_ST_REQ_HEADER;
             ctx->hdr_pos = 0;
 
@@ -262,8 +331,11 @@ process:
             }
 
             if (ctx->state == XRD_ST_SENDING) {
+                /* Large or EAGAIN-limited replies resume from the write handler. */
                 return;
             }
+
+            /* Otherwise the handler completed synchronously and the loop keeps draining. */
         }
     }
 
@@ -298,6 +370,7 @@ ngx_stream_xrootd_send(ngx_event_t *wev)
         return;
     }
 
+    /* Try to finish any queued response body before parsing more client input. */
     rc = xrootd_flush_pending(ctx, c);
     if (rc == NGX_ERROR) {
         xrootd_on_disconnect(ctx, c);
@@ -311,6 +384,7 @@ ngx_stream_xrootd_send(ngx_event_t *wev)
     }
 
     if (ctx->state != XRD_ST_SENDING) {
+        /* Stray writable event after the state already moved on; ignore it. */
         ngx_log_error(NGX_LOG_INFO, c->log, 0,
                       "xrootd: send_done (state=%d, no recv) avail=%d ready=%d active=%d",
                       (int)ctx->state,
@@ -324,6 +398,7 @@ ngx_stream_xrootd_send(ngx_event_t *wev)
     ngx_log_error(NGX_LOG_INFO, c->log, 0,
                   "xrootd: send_done avail=%d ready=%d active=%d",
                   c->read->available, (int)c->read->ready, (int)c->read->active);
+    /* Continue draining any bytes the client already pipelined behind this reply. */
     ngx_stream_xrootd_recv(c->read);
 }
 
@@ -337,20 +412,31 @@ xrootd_queue_response_base(xrootd_ctx_t *ctx, ngx_connection_t *c,
 {
     ssize_t n;
 
+    /*
+     * Try to satisfy the response synchronously first; only fall back to the
+     * write event path when the socket refuses more bytes.
+     */
     while (len > 0) {
+        /* Optimistic fast path: write directly until the socket would block. */
         n = c->send(c, buf, len);
         if (n > 0) {
+            /* Advance over the bytes the kernel accepted this round. */
             buf += n;
             len -= (size_t) n;
             continue;
         }
         if (n == NGX_AGAIN) {
+            /*
+             * Preserve the unsent suffix; buf may already point into the middle
+             * of a larger allocation, so `base` remembers what must be freed.
+             */
             ctx->wbuf      = buf;
             ctx->wbuf_len  = len;
             ctx->wbuf_pos  = 0;
             ctx->wbuf_base = base;
             ctx->state     = XRD_ST_SENDING;
 
+            /* Ask nginx to wake the write handler once the socket is writable again. */
             if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
                 return NGX_ERROR;
             }
@@ -365,6 +451,7 @@ ngx_int_t
 xrootd_queue_response(xrootd_ctx_t *ctx, ngx_connection_t *c,
                       u_char *buf, size_t len)
 {
+    /* Simple wrapper for the common case where `buf` is itself the pool base. */
     return xrootd_queue_response_base(ctx, c, buf, len, NULL);
 }
 
@@ -374,13 +461,16 @@ xrootd_flush_pending(xrootd_ctx_t *ctx, ngx_connection_t *c)
     ssize_t n;
 
     while (ctx->wbuf_pos < ctx->wbuf_len) {
+        /* Resume exactly where the previous short write stopped. */
         n = c->send(c, ctx->wbuf + ctx->wbuf_pos,
                     ctx->wbuf_len - ctx->wbuf_pos);
         if (n > 0) {
+            /* Advance the cursor until either all bytes are sent or the socket blocks again. */
             ctx->wbuf_pos += (size_t) n;
             continue;
         }
         if (n == NGX_AGAIN) {
+            /* Still blocked; keep the remaining suffix and wait for the next write event. */
             if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
                 return NGX_ERROR;
             }
@@ -390,9 +480,12 @@ xrootd_flush_pending(xrootd_ctx_t *ctx, ngx_connection_t *c)
     }
 
     if (ctx->wbuf_base) {
+        /* Some callers keep a separate base pointer because wbuf may be advanced. */
         ngx_pfree(c->pool, ctx->wbuf_base);
         ctx->wbuf_base = NULL;
     }
+
+    /* Clear the pending-send bookkeeping before returning control to recv(). */
     ctx->wbuf     = NULL;
     ctx->wbuf_len = 0;
     ctx->wbuf_pos = 0;
@@ -407,6 +500,10 @@ int
 xrootd_alloc_fhandle(xrootd_ctx_t *ctx)
 {
     int i;
+    /*
+     * Small fixed table: a linear scan is simpler than free-list bookkeeping,
+     * and the returned index is later encoded into the 4-byte opaque handle.
+     */
     for (i = 0; i < XROOTD_MAX_FILES; i++) {
         if (ctx->files[i].fd < 0) {
             return i;
@@ -419,6 +516,7 @@ void
 xrootd_free_fhandle(xrootd_ctx_t *ctx, int idx)
 {
     if (idx >= 0 && idx < XROOTD_MAX_FILES && ctx->files[idx].fd >= 0) {
+        /* Close first, then mark the slot reusable for future opens. */
         close(ctx->files[idx].fd);
         ctx->files[idx].fd      = -1;
         ctx->files[idx].path[0] = '\0';
@@ -429,6 +527,7 @@ void
 xrootd_close_all_files(xrootd_ctx_t *ctx)
 {
     int i;
+    /* Called on teardown paths, so keep it idempotent and brute-force simple. */
     for (i = 0; i < XROOTD_MAX_FILES; i++) {
         xrootd_free_fhandle(ctx, i);
     }
@@ -444,9 +543,15 @@ xrootd_on_disconnect(xrootd_ctx_t *ctx, ngx_connection_t *c)
     int        i;
     ngx_msec_t now = ngx_current_msec;
 
+    /* Async completion handlers consult this before touching session state. */
     ctx->destroyed = 1;
 
     if (ctx->metrics) {
+        /*
+         * Publish aggregate byte counters once when the session actually ends.
+         * From the server's perspective, uploaded bytes are RX and downloaded
+         * bytes are TX, hence the written/read counter mapping below.
+         */
         ngx_atomic_fetch_add(&ctx->metrics->connections_active, (ngx_atomic_int_t) -1);
         ngx_atomic_fetch_add(&ctx->metrics->bytes_rx_total,
                              (ngx_atomic_int_t) ctx->session_bytes_written);
@@ -454,11 +559,13 @@ xrootd_on_disconnect(xrootd_ctx_t *ctx, ngx_connection_t *c)
                              (ngx_atomic_int_t) ctx->session_bytes);
     }
 
+    /* Walk every still-open handle because clients may drop the TCP session mid-transfer. */
     for (i = 0; i < XROOTD_MAX_FILES; i++) {
         if (ctx->files[i].fd < 0) {
             continue;
         }
 
+        /* Reuse the standard CLOSE log format for any handles left open on loss. */
         ctx->req_start = ctx->files[i].open_time;
 
         {
@@ -468,6 +575,7 @@ xrootd_on_disconnect(xrootd_ctx_t *ctx, ngx_connection_t *c)
                             : ctx->files[i].bytes_read;
             ngx_msec_t dur = now - ctx->files[i].open_time;
 
+            /* Summarize interrupted handle throughput using the same close log shape. */
             if (btotal > 0 && dur > 0) {
                 double mbps = (double) btotal / (double) dur / 1000.0;
                 snprintf(detail, sizeof(detail), "interrupted %.2fMB/s", mbps);
@@ -481,6 +589,7 @@ xrootd_on_disconnect(xrootd_ctx_t *ctx, ngx_connection_t *c)
     }
 
     if (!ctx->logged_in) {
+        /* Pre-login disconnects never established a session identity worth summarizing. */
         return;
     }
 
@@ -489,9 +598,11 @@ xrootd_on_disconnect(xrootd_ctx_t *ctx, ngx_connection_t *c)
         ngx_msec_t sess_dur = now - ctx->session_start;
         size_t     total    = ctx->session_bytes + ctx->session_bytes_written;
 
+        /* Derive a coarse end-of-session throughput summary for the access log. */
         if (total > 0 && sess_dur > 0) {
             double mbps = (double) total / (double) sess_dur / 1000.0;
             if (ctx->session_bytes_written > 0) {
+                /* Log bidirectional throughput separately when uploads happened. */
                 snprintf(detail, sizeof(detail),
                          "rx=%.2fMB/s tx=%.2fMB/s",
                          (double) ctx->session_bytes / (double) sess_dur / 1000.0,

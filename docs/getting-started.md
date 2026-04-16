@@ -97,6 +97,8 @@ mkdir -p /data
 sudo /usr/local/nginx/sbin/nginx
 ```
 
+If you rebuild nginx with a modified version of this module, do a full stop/start of the rebuilt binary. A plain `nginx -s reload` only reloads configuration for the already-running master process; it does not switch the process over to a newly rebuilt executable.
+
 Check the error log if anything goes wrong:
 
 ```bash
@@ -122,6 +124,8 @@ xrdfs localhost:1094 ls /
 # Stat a file
 xrdfs localhost:1094 stat /test.txt
 ```
+
+If your local `xrdfs` build does not support `ping`, use `xrdfs ... ls /` as the simplest readiness check. That is the case for the 5.9.2 client packages used in this repository's test environment.
 
 If `xrdcp` exits with status 0 and prints no errors, you have a working XRootD server.
 
@@ -180,6 +184,8 @@ Run with `--debug` for verbose output:
 ```bash
 xrdcp --debug 2 /tmp/test.txt root://localhost:1094//test.txt
 ```
+
+When repeating upload tests against the same destination path, prefer `xrdcp -f` so the client overwrites the target instead of failing early on an already-existing file.
 
 **Error log shows "xrootd: thread pool 'default' not found":**
 Add `thread_pool default threads=4 max_queue=65536;` at the top level of `nginx.conf` (outside `stream {}`), or compile with `--with-threads`.

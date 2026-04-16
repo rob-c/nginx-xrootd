@@ -18,6 +18,7 @@ xrootd_handle_write(xrootd_ctx_t *ctx, ngx_connection_t *c)
     ssize_t nwritten;
     char    write_detail[64];
 
+    /* The first byte of the 4-byte opaque handle is our internal slot index. */
     if (idx < 0 || idx >= XROOTD_MAX_FILES || ctx->files[idx].fd < 0) {
         xrootd_log_access(ctx, c, "WRITE", "-", "-",
                           0, kXR_FileNotOpen, "invalid file handle", 0);
@@ -35,6 +36,7 @@ xrootd_handle_write(xrootd_ctx_t *ctx, ngx_connection_t *c)
     }
 
     if (wlen == 0) {
+        /* Zero-length writes are valid no-ops that still count as successful requests. */
         XROOTD_OP_OK(ctx, XROOTD_OP_WRITE);
         return xrootd_send_ok(ctx, c, NULL, 0);
     }
@@ -60,6 +62,7 @@ xrootd_handle_write(xrootd_ctx_t *ctx, ngx_connection_t *c)
         t->is_pgwrite      = 0;
         t->nwritten        = -1;
         t->io_errno        = 0;
+        /* Keep the request payload alive until the completion handler runs. */
         t->payload_to_free = ctx->payload;   /* freed in done handler */
         t->streamid[0]     = ctx->cur_streamid[0];
         t->streamid[1]     = ctx->cur_streamid[1];
@@ -75,6 +78,7 @@ xrootd_handle_write(xrootd_ctx_t *ctx, ngx_connection_t *c)
             goto sync_write;
         }
 
+        /* Completion callback will restore streamid/state and send the final reply. */
         ctx->state = XRD_ST_AIO;
         return NGX_OK;
     }
@@ -82,10 +86,12 @@ xrootd_handle_write(xrootd_ctx_t *ctx, ngx_connection_t *c)
 sync_write:
 #endif /* NGX_THREADS */
 
+    /* Synchronous fallback writes the request payload directly from the recv buffer. */
     nwritten = pwrite(ctx->files[idx].fd,
                       ctx->payload ? ctx->payload : (u_char *) "",
                       wlen, (off_t) offset);
 
+    /* Access log detail format for writes is "<offset>+<requested-bytes>". */
     snprintf(write_detail, sizeof(write_detail), "%lld+%zu",
              (long long) offset, wlen);
 
@@ -166,6 +172,7 @@ xrootd_handle_pgwrite(xrootd_ctx_t *ctx, ngx_connection_t *c)
     }
 
     if (payload == NULL || dlen == 0) {
+        /* Empty pgwrite is treated like a successful zero-byte write. */
         XROOTD_OP_OK(ctx, XROOTD_OP_WRITE);
         return xrootd_send_ok(ctx, c, NULL, 0);
     }
@@ -190,6 +197,7 @@ xrootd_handle_pgwrite(xrootd_ctx_t *ctx, ngx_connection_t *c)
         dst = flat;
 
         while (rem > XRD_PGWRITE_CKSZ) {
+            /* Skip the per-page CRC field, then copy only the page data bytes forward. */
             src += XRD_PGWRITE_CKSZ;
             rem -= XRD_PGWRITE_CKSZ;
             page_data = (rem >= XRD_PGWRITE_PAGESZ) ? XRD_PGWRITE_PAGESZ : rem;
@@ -221,6 +229,7 @@ xrootd_handle_pgwrite(xrootd_ctx_t *ctx, ngx_connection_t *c)
             t->is_pgwrite      = 1;
             t->nwritten        = -1;
             t->io_errno        = 0;
+            /* The flattened buffer belongs to the async write until completion. */
             t->payload_to_free = flat;   /* freed in done handler */
             t->streamid[0]     = ctx->cur_streamid[0];
             t->streamid[1]     = ctx->cur_streamid[1];
@@ -231,6 +240,7 @@ xrootd_handle_pgwrite(xrootd_ctx_t *ctx, ngx_connection_t *c)
             task->event.data    = task;
 
             if (ngx_thread_task_post(conf->thread_pool, task) == NGX_OK) {
+                /* Async completion sends the mandatory kXR_status pgwrite reply. */
                 ctx->state = XRD_ST_AIO;
                 return NGX_OK;
             }
@@ -246,6 +256,7 @@ xrootd_handle_pgwrite(xrootd_ctx_t *ctx, ngx_connection_t *c)
         rem = flat_sz;
 
         while (rem > 0) {
+            /* Preserve page-sized progress so the final status can report the end offset. */
             page_data = (rem >= XRD_PGWRITE_PAGESZ) ? XRD_PGWRITE_PAGESZ : rem;
             nw = pwrite(ctx->files[idx].fd, src, page_data, (off_t) write_offset);
             if (nw < 0) {
@@ -270,6 +281,7 @@ xrootd_handle_pgwrite(xrootd_ctx_t *ctx, ngx_connection_t *c)
             rem           -= page_data;
         }
 
+        /* pgwrite accounting uses the same write counters as plain kXR_write. */
         ctx->files[idx].bytes_written += total_written;
         ctx->session_bytes_written    += total_written;
 
@@ -340,17 +352,30 @@ xrootd_handle_truncate(xrootd_ctx_t *ctx, ngx_connection_t *c,
     if (ctx->cur_dlen > 0) {
         /* Path-based truncate */
         char resolved[PATH_MAX];
+        char reqpath[XROOTD_MAX_PATH + 1];
         if (ctx->payload == NULL) {
             return xrootd_send_error(ctx, c, kXR_ArgMissing, "no path given");
         }
+        if (!xrootd_extract_path(c->log, ctx->payload, ctx->cur_dlen,
+                                 reqpath, sizeof(reqpath), 0)) {
+            xrootd_log_access(ctx, c, "TRUNCATE", "-", detail,
+                              0, kXR_ArgInvalid, "invalid path payload", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_TRUNCATE);
+            return xrootd_send_error(ctx, c, kXR_ArgInvalid,
+                                     "invalid path payload");
+        }
         if (!xrootd_resolve_path_write(c->log, &conf->root,
-                                       (const char *) ctx->payload,
+                                       reqpath,
                                        resolved, sizeof(resolved))) {
-            /* Try existing-file resolve too */
+              /*
+               * write-style resolution handles the common "target may not exist" case.
+               * If that fails, fall back to the normal resolver so existing files with
+               * canonical paths still truncate correctly.
+               */
             if (!xrootd_resolve_path(c->log, &conf->root,
-                                     (const char *) ctx->payload,
+                                     reqpath,
                                      resolved, sizeof(resolved))) {
-                xrootd_log_access(ctx, c, "TRUNCATE", (char *) ctx->payload,
+                xrootd_log_access(ctx, c, "TRUNCATE", reqpath,
                                   detail, 0, kXR_NotFound, "file not found", 0);
                 XROOTD_OP_ERR(ctx, XROOTD_OP_TRUNCATE);
                 return xrootd_send_error(ctx, c, kXR_NotFound, "file not found");
@@ -366,7 +391,7 @@ xrootd_handle_truncate(xrootd_ctx_t *ctx, ngx_connection_t *c,
         xrootd_log_access(ctx, c, "TRUNCATE", resolved, detail,
                           1, 0, NULL, 0);
     } else {
-        /* Handle-based truncate */
+        /* Handle-based truncate bypasses path resolution and uses the already-open fd. */
         int idx = (int)(unsigned char) req->fhandle[0];
         if (idx < 0 || idx >= XROOTD_MAX_FILES || ctx->files[idx].fd < 0) {
             xrootd_log_access(ctx, c, "TRUNCATE", "-", detail,
@@ -401,6 +426,7 @@ xrootd_handle_mkdir(xrootd_ctx_t *ctx, ngx_connection_t *c,
                      ngx_stream_xrootd_srv_conf_t *conf)
 {
     ClientMkdirRequest *req = (ClientMkdirRequest *) ctx->hdr_buf;
+    char     reqpath[XROOTD_MAX_PATH + 1];
     char     resolved[PATH_MAX];
     mode_t   mode;
     int      recursive;
@@ -415,6 +441,17 @@ xrootd_handle_mkdir(xrootd_ctx_t *ctx, ngx_connection_t *c,
         mode = 0755;
     }
 
+    /* kXR_mkdirpath changes only namespace creation strategy, not permission handling. */
+
+    if (!xrootd_extract_path(c->log, ctx->payload, ctx->cur_dlen,
+                             reqpath, sizeof(reqpath), 0)) {
+        xrootd_log_access(ctx, c, "MKDIR", "-", "-",
+                          0, kXR_ArgInvalid, "invalid path payload", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_MKDIR);
+        return xrootd_send_error(ctx, c, kXR_ArgInvalid,
+                                 "invalid path payload");
+    }
+
     /*
      * Resolve the target path.  For recursive mkdir intermediate directories
      * do not exist yet, so we use xrootd_resolve_path_noexist (no realpath).
@@ -422,18 +459,18 @@ xrootd_handle_mkdir(xrootd_ctx_t *ctx, ngx_connection_t *c,
      */
     if (recursive) {
         if (!xrootd_resolve_path_noexist(c->log, &conf->root,
-                                          (const char *) ctx->payload,
+                                          reqpath,
                                           resolved, sizeof(resolved))) {
-            xrootd_log_access(ctx, c, "MKDIR", (char *) ctx->payload, "-",
+            xrootd_log_access(ctx, c, "MKDIR", reqpath, "-",
                               0, kXR_NotFound, "invalid path", 0);
             XROOTD_OP_ERR(ctx, XROOTD_OP_MKDIR);
             return xrootd_send_error(ctx, c, kXR_NotFound, "invalid path");
         }
     } else {
         if (!xrootd_resolve_path_write(c->log, &conf->root,
-                                       (const char *) ctx->payload,
+                                       reqpath,
                                        resolved, sizeof(resolved))) {
-            xrootd_log_access(ctx, c, "MKDIR", (char *) ctx->payload, "-",
+            xrootd_log_access(ctx, c, "MKDIR", reqpath, "-",
                               0, kXR_NotFound, "invalid path", 0);
             XROOTD_OP_ERR(ctx, XROOTD_OP_MKDIR);
             return xrootd_send_error(ctx, c, kXR_NotFound, "invalid path");
@@ -448,6 +485,7 @@ xrootd_handle_mkdir(xrootd_ctx_t *ctx, ngx_connection_t *c,
             return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
         }
     } else {
+        /* Non-recursive mkdir maps directly to one mkdir(2) call on the resolved leaf. */
         if (mkdir(resolved, mode) != 0) {
             int err = errno;
             if (err == EEXIST) {
@@ -481,17 +519,27 @@ ngx_int_t
 xrootd_handle_rm(xrootd_ctx_t *ctx, ngx_connection_t *c,
                   ngx_stream_xrootd_srv_conf_t *conf)
 {
+    char reqpath[XROOTD_MAX_PATH + 1];
     char resolved[PATH_MAX];
 
     if (ctx->payload == NULL || ctx->cur_dlen == 0) {
         return xrootd_send_error(ctx, c, kXR_ArgMissing, "no path given");
     }
 
+    if (!xrootd_extract_path(c->log, ctx->payload, ctx->cur_dlen,
+                             reqpath, sizeof(reqpath), 0)) {
+        xrootd_log_access(ctx, c, "RM", "-", "-",
+                          0, kXR_ArgInvalid, "invalid path payload", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_RM);
+        return xrootd_send_error(ctx, c, kXR_ArgInvalid,
+                                 "invalid path payload");
+    }
+
     /* File must exist for rm — use standard resolve */
     if (!xrootd_resolve_path(c->log, &conf->root,
-                              (const char *) ctx->payload,
+                              reqpath,
                               resolved, sizeof(resolved))) {
-        xrootd_log_access(ctx, c, "RM", (char *) ctx->payload, "-",
+        xrootd_log_access(ctx, c, "RM", reqpath, "-",
                           0, kXR_NotFound, "file not found", 0);
         XROOTD_OP_ERR(ctx, XROOTD_OP_RM);
         return xrootd_send_error(ctx, c, kXR_NotFound, "file not found");
@@ -527,16 +575,26 @@ ngx_int_t
 xrootd_handle_rmdir(xrootd_ctx_t *ctx, ngx_connection_t *c,
                     ngx_stream_xrootd_srv_conf_t *conf)
 {
+    char reqpath[XROOTD_MAX_PATH + 1];
     char resolved[PATH_MAX];
 
     if (ctx->payload == NULL || ctx->cur_dlen == 0) {
         return xrootd_send_error(ctx, c, kXR_ArgMissing, "no path given");
     }
 
+    if (!xrootd_extract_path(c->log, ctx->payload, ctx->cur_dlen,
+                             reqpath, sizeof(reqpath), 0)) {
+        xrootd_log_access(ctx, c, "RMDIR", "-", "-",
+                          0, kXR_ArgInvalid, "invalid path payload", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_RMDIR);
+        return xrootd_send_error(ctx, c, kXR_ArgInvalid,
+                                 "invalid path payload");
+    }
+
     if (!xrootd_resolve_path(c->log, &conf->root,
-                              (const char *) ctx->payload,
+                              reqpath,
                               resolved, sizeof(resolved))) {
-        xrootd_log_access(ctx, c, "RMDIR", (char *) ctx->payload, "-",
+        xrootd_log_access(ctx, c, "RMDIR", reqpath, "-",
                           0, kXR_NotFound, "directory not found", 0);
         XROOTD_OP_ERR(ctx, XROOTD_OP_RMDIR);
         return xrootd_send_error(ctx, c, kXR_NotFound, "directory not found");
@@ -544,6 +602,8 @@ xrootd_handle_rmdir(xrootd_ctx_t *ctx, ngx_connection_t *c,
 
     if (rmdir(resolved) != 0) {
         int err = errno;
+
+        /* Map common namespace errors to protocol-level directory semantics. */
         if (err == ENOTEMPTY || err == EEXIST) {
             xrootd_log_access(ctx, c, "RMDIR", resolved, "-",
                               0, kXR_FSError, "directory not empty", 0);
@@ -595,9 +655,10 @@ xrootd_handle_mv(xrootd_ctx_t *ctx, ngx_connection_t *c,
     ClientMvRequest *req = (ClientMvRequest *) ctx->hdr_buf;
     char src_resolved[PATH_MAX];
     char dst_resolved[PATH_MAX];
-    char src_buf[PATH_MAX];      /* null-terminated copy of source path */
+    char src_buf[XROOTD_MAX_PATH + 1];
+    char dst_buf[XROOTD_MAX_PATH + 1];
     int16_t  src_len;
-    const char *src_path, *dst_path;
+    size_t   dst_len;
 
     if (ctx->payload == NULL || ctx->cur_dlen == 0) {
         return xrootd_send_error(ctx, c, kXR_ArgMissing, "no paths given");
@@ -616,20 +677,29 @@ xrootd_handle_mv(xrootd_ctx_t *ctx, ngx_connection_t *c,
                                  "invalid arg1len for mv");
     }
 
-    src_path = (const char *) ctx->payload;
     /* Separator byte at src_len must be a space */
     if (ctx->payload[src_len] != ' ') {
         return xrootd_send_error(ctx, c, kXR_ArgInvalid,
                                  "mv payload separator not a space");
     }
-    dst_path = (const char *) ctx->payload + src_len + 1;
-
-    /* Copy source path into a null-terminated buffer for resolve */
-    if (src_len >= (int16_t) sizeof(src_buf)) {
-        return xrootd_send_error(ctx, c, kXR_ArgTooLong, "source path too long");
+    dst_len = (size_t) ctx->cur_dlen - (size_t) src_len - 1;
+    if (dst_len == 0) {
+        return xrootd_send_error(ctx, c, kXR_ArgInvalid,
+                                 "missing destination path");
     }
-    ngx_memcpy(src_buf, src_path, src_len);
-    src_buf[src_len] = '\0';
+
+    /* Parse each half independently so embedded-NUL and traversal checks apply to both. */
+    if (!xrootd_extract_path(c->log, ctx->payload, (size_t) src_len,
+                             src_buf, sizeof(src_buf), 0)) {
+        return xrootd_send_error(ctx, c, kXR_ArgInvalid,
+                                 "invalid source path payload");
+    }
+
+    if (!xrootd_extract_path(c->log, ctx->payload + src_len + 1, dst_len,
+                             dst_buf, sizeof(dst_buf), 0)) {
+        return xrootd_send_error(ctx, c, kXR_ArgInvalid,
+                                 "invalid destination path payload");
+    }
 
     if (!xrootd_resolve_path(c->log, &conf->root, src_buf,
                               src_resolved, sizeof(src_resolved))) {
@@ -639,7 +709,7 @@ xrootd_handle_mv(xrootd_ctx_t *ctx, ngx_connection_t *c,
         return xrootd_send_error(ctx, c, kXR_NotFound, "source not found");
     }
 
-    if (!xrootd_resolve_path_write(c->log, &conf->root, dst_path,
+    if (!xrootd_resolve_path_write(c->log, &conf->root, dst_buf,
                                     dst_resolved, sizeof(dst_resolved))) {
         xrootd_log_access(ctx, c, "MV", src_buf, "-",
                           0, kXR_NotFound, "invalid destination path", 0);
@@ -648,6 +718,7 @@ xrootd_handle_mv(xrootd_ctx_t *ctx, ngx_connection_t *c,
                                  "invalid destination path");
     }
 
+    /* rename(2) performs the atomic namespace switch when source and dest share a filesystem. */
     if (rename(src_resolved, dst_resolved) != 0) {
         int err = errno;
         if (err == EACCES || err == EPERM) {
@@ -679,6 +750,7 @@ xrootd_handle_chmod(xrootd_ctx_t *ctx, ngx_connection_t *c,
                     ngx_stream_xrootd_srv_conf_t *conf)
 {
     ClientChmodRequest *req = (ClientChmodRequest *) ctx->hdr_buf;
+    char    reqpath[XROOTD_MAX_PATH + 1];
     char    resolved[PATH_MAX];
     mode_t  mode;
 
@@ -691,10 +763,21 @@ xrootd_handle_chmod(xrootd_ctx_t *ctx, ngx_connection_t *c,
         mode = 0644;  /* sensible default if client sends 0 */
     }
 
+    /* chmod uses only the low permission bits; file type bits are never client-controlled. */
+
+    if (!xrootd_extract_path(c->log, ctx->payload, ctx->cur_dlen,
+                             reqpath, sizeof(reqpath), 0)) {
+        xrootd_log_access(ctx, c, "CHMOD", "-", "-",
+                          0, kXR_ArgInvalid, "invalid path payload", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_CHMOD);
+        return xrootd_send_error(ctx, c, kXR_ArgInvalid,
+                                 "invalid path payload");
+    }
+
     if (!xrootd_resolve_path(c->log, &conf->root,
-                              (const char *) ctx->payload,
+                              reqpath,
                               resolved, sizeof(resolved))) {
-        xrootd_log_access(ctx, c, "CHMOD", (char *) ctx->payload, "-",
+        xrootd_log_access(ctx, c, "CHMOD", reqpath, "-",
                           0, kXR_NotFound, "path not found", 0);
         XROOTD_OP_ERR(ctx, XROOTD_OP_CHMOD);
         return xrootd_send_error(ctx, c, kXR_NotFound, "path not found");

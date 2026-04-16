@@ -38,6 +38,8 @@ scrape_configs:
 
 Metrics are shared across all nginx worker processes via shared memory and updated atomically. They survive `nginx -s reload` (counters are preserved across config reloads).
 
+Client-controlled strings are not used as Prometheus label values. Exported labels come from server configuration (`port`, `auth`) and the fixed operation table (`op`, `status`).
+
 ---
 
 ### Available metrics
@@ -153,15 +155,17 @@ One line is written per XRootD operation. The file is opened `O_APPEND` and is s
 <ip> <auth> "<identity>" [<timestamp>] "<verb> <path> <detail>" <status> <bytes> <ms>ms ["<errmsg>"]
 ```
 
+Before any client-controlled text is written, the logger escapes whitespace, control bytes, quotes, backslashes, and non-ASCII bytes as `\xNN`. This keeps every record single-line and prevents log injection.
+
 | Field | Meaning |
 |---|---|
 | `ip` | Client IP address |
 | `auth` | `anon` or `gsi` |
-| `identity` | X.509 subject DN for GSI connections; `-` for anonymous or before authentication completes |
+| `identity` | X.509 subject DN for GSI connections; `-` for anonymous or before authentication completes. Unsafe bytes are escaped as `\xNN`. |
 | `timestamp` | `DD/Mon/YYYY:HH:MM:SS +ZZZZ` |
 | `verb` | Operation name — see table below |
-| `path` | Resolved filesystem path, or `-` for session-level operations |
-| `detail` | Extra context — depends on the verb |
+| `path` | Resolved filesystem path, or `-` for session-level operations. Unsafe bytes are escaped as `\xNN`. |
+| `detail` | Extra context — depends on the verb. Unsafe bytes are escaped as `\xNN`. |
 | `status` | `OK` or `ERR` |
 | `bytes` | File data bytes transferred; `0` for non-data operations |
 | `ms` | Server-side processing time in milliseconds |
@@ -203,12 +207,12 @@ One line is written per XRootD operation. The file is opened `O_APPEND` and is s
 **GSI read with failed stat:**
 ```
 192.168.1.1 gsi "-" [14/Apr/2026:10:23:44 +0000] "LOGIN - rcurrie" OK 0 0ms
-192.168.1.1 gsi "/DC=test/CN=Test User" [14/Apr/2026:10:23:44 +0000] "AUTH - gsi" OK 0 48ms
-192.168.1.1 gsi "/DC=test/CN=Test User" [14/Apr/2026:10:23:45 +0000] "STAT /missing.root -" ERR 0 0ms "No such file or directory"
-192.168.1.1 gsi "/DC=test/CN=Test User" [14/Apr/2026:10:23:45 +0000] "OPEN /store/mc/data.root rd" OK 0 2ms
-192.168.1.1 gsi "/DC=test/CN=Test User" [14/Apr/2026:10:23:45 +0000] "READ /store/mc/data.root 0+4194304" OK 4194304 18ms
-192.168.1.1 gsi "/DC=test/CN=Test User" [14/Apr/2026:10:23:46 +0000] "CLOSE /store/mc/data.root 234.56MB/s" OK 4194304 0ms
-192.168.1.1 gsi "/DC=test/CN=Test User" [14/Apr/2026:10:23:46 +0000] "DISCONNECT - rx=0.00MB/s tx=234.56MB/s" OK 4194304 1ms
+192.168.1.1 gsi "/DC=test/CN=Test\x20User" [14/Apr/2026:10:23:44 +0000] "AUTH - gsi" OK 0 48ms
+192.168.1.1 gsi "/DC=test/CN=Test\x20User" [14/Apr/2026:10:23:45 +0000] "STAT /missing.root -" ERR 0 0ms "No\x20such\x20file\x20or\x20directory"
+192.168.1.1 gsi "/DC=test/CN=Test\x20User" [14/Apr/2026:10:23:45 +0000] "OPEN /store/mc/data.root rd" OK 0 2ms
+192.168.1.1 gsi "/DC=test/CN=Test\x20User" [14/Apr/2026:10:23:45 +0000] "READ /store/mc/data.root 0+4194304" OK 4194304 18ms
+192.168.1.1 gsi "/DC=test/CN=Test\x20User" [14/Apr/2026:10:23:46 +0000] "CLOSE /store/mc/data.root 234.56MB/s" OK 4194304 0ms
+192.168.1.1 gsi "/DC=test/CN=Test\x20User" [14/Apr/2026:10:23:46 +0000] "DISCONNECT - rx=0.00MB/s\x20tx=234.56MB/s" OK 4194304 1ms
 ```
 
 ### Log rotation

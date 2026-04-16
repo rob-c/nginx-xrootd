@@ -4,6 +4,28 @@
 /*  Read handlers                                                       */
 /* ================================================================== */
 
+/*
+ * This file groups the read-side half of the protocol:
+ *   - metadata lookups (query/stat/dirlist)
+ *   - open for read or write intent negotiation
+ *   - data-plane reads (read/readv)
+ *   - handle teardown (close)
+ *
+ * The common pattern across all handlers is:
+ *   1. validate handle-vs-path addressing from the fixed request header
+ *   2. normalize/resolve any client path under xrootd_root
+ *   3. translate POSIX results into the nearest XRootD status/error pair
+ *   4. log/account the request before queueing the wire response
+ *
+ * Several client-visible quirks are encoded here because XRootD clients are
+ * strict about wire compatibility:
+ *   - stat strings use "inode size flags mtime" ordering
+ *   - dirlist dStat mode requires a sentinel prefix the client probes for
+ *   - read/readv may need kXR_oksofar chunking for large replies
+ *   - handle-based requests reuse the canonical path cached at open time only
+ *     for logging; the fd remains the authoritative object for I/O
+ */
+
 
 /* ------------------------------------------------------------------ */
 /* kXR_query — query server information.                               */
@@ -40,25 +62,30 @@ xrootd_adler32_file(const char *path, ngx_log_t *log)
     uint32_t     A = 1, B = 0;
     const uint32_t MOD = 65521;
     u_char       buf[65536];
+    char         safe_path[512];
+
+    xrootd_sanitize_log_string(path, safe_path, sizeof(safe_path));
 
     fd = open(path, O_RDONLY);
     if (fd < 0) {
         ngx_log_error(NGX_LOG_ERR, log, errno,
-                      "xrootd: adler32 open(\"%s\") failed", path);
+                      "xrootd: adler32 open(\"%s\") failed", safe_path);
         return 0xFFFFFFFF;
     }
 
     for (;;) {
+        /* Stream the file in fixed-size blocks so checksum cost is bounded in memory. */
         n = read(fd, buf, sizeof(buf));
         if (n < 0) {
             if (errno == EINTR) continue;
             ngx_log_error(NGX_LOG_ERR, log, errno,
-                          "xrootd: adler32 read(\"%s\") failed", path);
+                          "xrootd: adler32 read(\"%s\") failed", safe_path);
             close(fd);
             return 0xFFFFFFFF;
         }
         if (n == 0) break;
 
+        /* Adler32 is inherently iterative, so fold each byte into A/B in order. */
         for (ssize_t i = 0; i < n; i++) {
             A = (A + buf[i]) % MOD;
             B = (B + A)      % MOD;
@@ -76,17 +103,31 @@ xrootd_handle_query(xrootd_ctx_t *ctx, ngx_connection_t *c,
     ClientQueryRequest *req = (ClientQueryRequest *) ctx->hdr_buf;
     uint16_t infotype = ntohs(req->infotype);
 
+    /*
+     * kXR_query multiplexes several unrelated info requests behind one opcode.
+     * The infotype field decides which sub-protocol is in use, so each branch
+     * below has its own payload expectations and response text format.
+     */
+
     /* ---- kXR_Qcksum (3): adler32 by path or open handle ---- */
     if (infotype == kXR_Qcksum) {
         char     resolved[PATH_MAX];
+        char     pathbuf[XROOTD_MAX_PATH + 1];
         uint32_t cksum;
         char     resp[64];
 
         if (ctx->cur_dlen > 0 && ctx->payload != NULL) {
-            /* Path-based checksum */
-            char pathbuf[XROOTD_MAX_PATH + 1];
-            xrootd_strip_cgi((const char *) ctx->payload,
-                             pathbuf, sizeof(pathbuf));
+            /*
+             * Path-based checksum follows the usual request-path pipeline:
+             * normalize wire bytes, strip CGI hints, resolve under root, then
+             * checksum the canonical target path.
+             */
+            if (!xrootd_extract_path(c->log, ctx->payload, ctx->cur_dlen,
+                                     pathbuf, sizeof(pathbuf), 1)) {
+                XROOTD_OP_ERR(ctx, XROOTD_OP_QUERY_CKSUM);
+                return xrootd_send_error(ctx, c, kXR_ArgInvalid,
+                                         "invalid path payload");
+            }
 
             if (!xrootd_resolve_path(c->log, &conf->root,
                                      pathbuf, resolved, sizeof(resolved))) {
@@ -107,7 +148,10 @@ xrootd_handle_query(xrootd_ctx_t *ctx, ngx_connection_t *c,
             }
 
         } else {
-            /* Handle-based checksum */
+            /*
+             * Handle-based checksum reuses the canonical path cached at open time
+             * rather than trying to reconstruct a path from the opaque handle.
+             */
             int idx = (int)(unsigned char) req->fhandle[0];
             if (idx < 0 || idx >= XROOTD_MAX_FILES
                         || ctx->files[idx].fd < 0) {
@@ -126,7 +170,8 @@ xrootd_handle_query(xrootd_ctx_t *ctx, ngx_connection_t *c,
             }
         }
 
-        /* Response format: "adler32 <8-hex-digits>\0" */
+        /* Response format is fixed text understood by XRootD clients verbatim. */
+        /* The trailing NUL is required because clients treat the body as a C string. */
         snprintf(resp, sizeof(resp), "adler32 %08x", (unsigned int) cksum);
 
         xrootd_log_access(ctx, c, "QUERY", resolved, "cksum", 1, 0, NULL, 0);
@@ -140,7 +185,10 @@ xrootd_handle_query(xrootd_ctx_t *ctx, ngx_connection_t *c,
         char            resp[256];
         unsigned long long total, free_bytes, used_bytes;
 
-        /* statvfs on the configured root directory */
+        /*
+         * Space queries are export-level rather than path-level: ask the host
+         * filesystem backing xrootd_root and report the answer in oss.* form.
+         */
         if (statvfs((const char *) conf->root.data, &vfs) != 0) {
             xrootd_log_access(ctx, c, "QUERY", (char *) conf->root.data,
                               "space", 0, kXR_IOError, strerror(errno), 0);
@@ -191,6 +239,12 @@ xrootd_handle_query(xrootd_ctx_t *ctx, ngx_connection_t *c,
                         ? (const char *) ctx->payload : "";
         const char *nl;
 
+        /*
+         * The client may ask for many keys in one request. We intentionally do
+         * not fail unknown keys because upstream servers also answer best-effort
+         * capability queries one line at a time.
+         */
+        /* Walk one requested key per iteration until the newline-delimited list is exhausted. */
         while (*p) {
             nl = strchr(p, '\n');
             size_t keylen = nl ? (size_t)(nl - p) : strlen(p);
@@ -209,11 +263,12 @@ xrootd_handle_query(xrootd_ctx_t *ctx, ngx_connection_t *c,
                 n = snprintf(resp + pos, sizeof(resp) - pos, "%s=0\n", key);
             }
             if (n > 0) pos += (size_t) n;
+            /* Stop cleanly if the fixed response buffer is nearly exhausted. */
             if (pos >= sizeof(resp) - 1) break;
             p = nl ? nl + 1 : p + keylen;
         }
         if (pos == 0) {
-            /* no keys requested — return empty ok */
+            /* No keys requested is still a valid query, just with an empty body. */
             return xrootd_send_ok(ctx, c, NULL, 0);
         }
         return xrootd_send_ok(ctx, c, resp, (uint32_t) pos);
@@ -236,15 +291,33 @@ xrootd_handle_stat(xrootd_ctx_t *ctx, ngx_connection_t *c,
     ClientStatRequest *req = (ClientStatRequest *) ctx->hdr_buf;
     struct stat        st;
     char               resolved[PATH_MAX];
+    char               reqpath_buf[XROOTD_MAX_PATH + 1];
     char               body[256];
     ngx_flag_t         is_vfs;
     const char        *reqpath = NULL;
 
     is_vfs = (req->options & kXR_vfs) ? 1 : 0;
 
+    /*
+     * kXR_stat is dual-mode like upstream XRootD:
+     *   - dlen > 0 means the payload names a path to resolve and stat(2)
+     *   - dlen == 0 means the opaque handle identifies an already-open fd
+     *
+     * The logging path and the syscall target are deliberately separated in the
+     * handle case: logs use the cached canonical path, while fstat() uses the fd.
+     */
+
     if (ctx->cur_dlen > 0 && ctx->payload != NULL) {
         /* Path-based stat */
-        reqpath = (const char *) ctx->payload;
+        if (!xrootd_extract_path(c->log, ctx->payload, ctx->cur_dlen,
+                                 reqpath_buf, sizeof(reqpath_buf), 0)) {
+            xrootd_log_access(ctx, c, "STAT", "-", "-",
+                              0, kXR_ArgInvalid, "invalid path payload", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_STAT);
+            return xrootd_send_error(ctx, c, kXR_ArgInvalid,
+                                     "invalid path payload");
+        }
+        reqpath = reqpath_buf;
 
         if (!xrootd_resolve_path(c->log, &conf->root,
                                  reqpath, resolved, sizeof(resolved))) {
@@ -263,7 +336,8 @@ xrootd_handle_stat(xrootd_ctx_t *ctx, ngx_connection_t *c,
                                      "file not found");
         }
     } else {
-        /* Handle-based stat: fhandle[0] is our slot index */
+        /* Handle-based stat: fhandle[0] is our slot index. */
+        /* The cached path is only for logging; the real metadata comes from fstat(). */
         int idx = (int)(unsigned char) req->fhandle[0];
 
         if (idx < 0 || idx >= XROOTD_MAX_FILES
@@ -288,6 +362,7 @@ xrootd_handle_stat(xrootd_ctx_t *ctx, ngx_connection_t *c,
         }
     }
 
+    /* Convert the host stat struct into the exact ASCII body the client expects. */
     xrootd_make_stat_body(&st, is_vfs, body, sizeof(body));
 
     ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
@@ -338,9 +413,20 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
     mode_bits = ntohs(req->mode);
     want_stat = (options & kXR_retstat) ? 1 : 0;
 
+    /*
+     * open is the densest request in the read-side path because it bridges
+     * protocol semantics (flags, mkpath, retstat) with POSIX open(2) details
+     * and also seeds the per-handle bookkeeping reused by later read/close ops.
+     */
+
     /* Determine whether this is a write-mode open */
     is_write = (options & (kXR_new | kXR_delete | kXR_open_updt |
                            kXR_open_wrto | kXR_open_apnd)) ? 1 : 0;
+
+    /*
+     * In XRootD the presence of any write-style option changes the semantics of
+     * the open, even if the path lookup portion still looks read-like.
+     */
 
     if (is_write && !conf->allow_write) {
         xrootd_log_access(ctx, c, "OPEN",
@@ -359,10 +445,22 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
         return xrootd_send_error(ctx, c, kXR_ArgMissing, "no path given");
     }
 
+    /*
+     * clean_path is the protocol-facing pathname after stripping client-side
+     * query metadata. resolved is the server's canonical or validated target.
+     */
     /* Strip XRootD CGI query string ("?oss.asize=N" etc.) from the path.
      * xrdcp and other clients append these for metadata; they are not part
      * of the filesystem path. */
-    xrootd_strip_cgi((const char *) ctx->payload, clean_path, sizeof(clean_path));
+    if (!xrootd_extract_path(c->log, ctx->payload, ctx->cur_dlen,
+                             clean_path, sizeof(clean_path), 1)) {
+        xrootd_log_access(ctx, c, "OPEN", "-",
+                          is_write ? "wr" : "rd",
+                          0, kXR_ArgInvalid, "invalid path payload", 0);
+        XROOTD_OP_ERR(ctx, is_write ? XROOTD_OP_OPEN_WR : XROOTD_OP_OPEN_RD);
+        return xrootd_send_error(ctx, c, kXR_ArgInvalid,
+                                 "invalid path payload");
+    }
 
     /* Resolve the path.
      * For read opens the file must already exist (realpath check).
@@ -370,6 +468,7 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
      * so use xrootd_resolve_path_noexist; otherwise use the write resolver
      * which requires the parent to exist. */
     if (!is_write) {
+        /* Read opens are strict: the final target must already exist and canonicalize. */
         if (!xrootd_resolve_path(c->log, &conf->root,
                                  clean_path, resolved, sizeof(resolved))) {
             xrootd_log_access(ctx, c, "OPEN", clean_path, "rd",
@@ -391,6 +490,11 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
         }
     } else {
         int ok;
+        /*
+         * Write opens are more permissive because the leaf may be created by
+         * the open itself. The exact resolver depends on whether the client also
+         * asked us to materialize missing parent directories.
+         */
         if (options & kXR_mkpath) {
             /* Parent dirs may not exist yet — validate without realpath */
             ok = xrootd_resolve_path_noexist(c->log, &conf->root,
@@ -417,6 +521,7 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
             if (slash && slash > parent) {
                 *slash = '\0';
                 /* mode 0755 for new directories */
+                /* mkdir -p behavior is best-effort here; open() reports any real failure next. */
                 xrootd_mkdir_recursive(parent, 0755);
             }
         }
@@ -472,6 +577,11 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
         create_mode = 0644;   /* sensible default if client sends 0 */
     }
 
+    /*
+     * The handle slot is reserved before open(2) so we can reuse the same
+     * cleanup path regardless of whether the file open succeeds or fails.
+     */
+
     /* Allocate a file handle slot */
     idx = xrootd_alloc_fhandle(ctx);
     if (idx < 0) {
@@ -487,6 +597,8 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
     if (fd < 0) {
         int err = errno;
         const char *mode_str = is_write ? "wr" : "rd";
+
+        /* Translate common errno values into the closest XRootD protocol error. */
         if (err == ENOENT || err == ENOTDIR) {
             xrootd_log_access(ctx, c, "OPEN", resolved, mode_str,
                               0, kXR_NotFound, "file not found", 0);
@@ -516,6 +628,7 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
 
     ctx->files[idx].fd       = fd;
     ctx->files[idx].writable = is_write;
+    /* Cache the resolved path for later read/close/query logging and handle-based ops. */
     ngx_cpystrn((u_char *) ctx->files[idx].path,
                 (u_char *) resolved,
                 sizeof(ctx->files[idx].path));
@@ -552,9 +665,14 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
         }
     }
 
-    ngx_log_debug4(NGX_LOG_DEBUG_STREAM, c->log, 0,
-                   "xrootd: kXR_open handle=%d path=%s mode=%s retstat=%d",
-                   idx, resolved, is_write ? "wr" : "rd", (int) want_stat);
+    if (c->log->log_level & NGX_LOG_DEBUG_STREAM) {
+        char log_path[512];
+
+        xrootd_sanitize_log_string(resolved, log_path, sizeof(log_path));
+        ngx_log_debug4(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                       "xrootd: kXR_open handle=%d path=%s mode=%s retstat=%d",
+                       idx, log_path, is_write ? "wr" : "rd", (int) want_stat);
+    }
 
     /*
      * Build response: 8-byte header + 12-byte ServerOpenBody
@@ -592,6 +710,7 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
                    statbuf, slen);
     }
 
+    /* Reset per-handle transfer counters so close/disconnect summaries start fresh. */
     ctx->files[idx].bytes_read    = 0;
     ctx->files[idx].bytes_written = 0;
     ctx->files[idx].open_time     = ngx_current_msec;
@@ -633,6 +752,17 @@ xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c)
 /* Hard cap for the total readv response (256 MiB). */
 #define XROOTD_MAX_READV_TOTAL  (256u * 1024u * 1024u)
 
+    /*
+     * readv is the most buffer-heavy read-side opcode:
+     *   - the request payload is an array of fixed 16-byte segment descriptors
+     *   - the response body repeats one descriptor per segment plus data bytes
+     *   - segment headers are patched with the actual returned length
+     *
+     * This handler therefore runs in two conceptual passes:
+     *   1. validate and size the whole response conservatively
+     *   2. fill a pre-laid-out buffer synchronously or asynchronously
+     */
+
     /* Validate payload: must be a non-empty, whole multiple of segment size */
     if (ctx->payload == NULL || ctx->cur_dlen == 0 ||
         (ctx->cur_dlen % XROOTD_READV_SEGSIZE) != 0) {
@@ -643,6 +773,8 @@ xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c)
 
     segs   = (readahead_list *) ctx->payload;
     n_segs = ctx->cur_dlen / XROOTD_READV_SEGSIZE;
+
+    /* The wire payload contains only segment headers; all data bytes are produced server-side. */
 
     /* --- First pass: validate all handles and compute max response size --- */
     max_rsp = 0;
@@ -657,9 +789,11 @@ xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c)
         }
 
         if (rlen > XROOTD_READ_MAX) { rlen = XROOTD_READ_MAX; }
+        /* Reserve header + maximum data bytes this segment could contribute. */
         max_rsp += XROOTD_READV_SEGSIZE + rlen;
 
         if (max_rsp > XROOTD_MAX_READV_TOTAL) {
+            /* Reject early rather than attempting an oversized pool allocation. */
             XROOTD_OP_ERR(ctx, XROOTD_OP_READV);
             return xrootd_send_error(ctx, c, kXR_ArgTooLong,
                                      "readv total would exceed server limit");
@@ -669,6 +803,12 @@ xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c)
     /* Allocate response body buffer (max size) and pre-fill headers */
     databuf = ngx_palloc(c->pool, max_rsp);
     if (databuf == NULL) { return NGX_ERROR; }
+
+    /*
+     * databuf is laid out exactly like the logical response body will look.
+     * That lets the sync path read directly into place and the async path hand
+     * each worker descriptor a pointer to its eventual output slice.
+     */
 
     /* Pre-fill readahead_list headers with fhandle and offset (BE).
      * rlen fields are left for the thread to patch after pread(). */
@@ -684,6 +824,7 @@ xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c)
             ngx_memcpy(p + 4, &rlen_be, 4);   /* requested rlen, thread patches actual */
             ngx_memcpy(p + 8, &segs[i].offset, 8);
 
+            /* Skip over the data area this segment will eventually fill. */
             p += XROOTD_READV_SEGSIZE + rlen;  /* skip to next segment's header */
         }
     }
@@ -694,7 +835,7 @@ xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c)
         xrootd_readv_aio_t      *t;
         xrootd_readv_seg_desc_t *seg_descs;
 
-        /* Allocate per-segment descriptors */
+        /* Allocate a sidecar descriptor array so the worker can iterate safely. */
         seg_descs = ngx_palloc(c->pool,
                                n_segs * sizeof(xrootd_readv_seg_desc_t));
         if (seg_descs == NULL) { return NGX_ERROR; }
@@ -706,6 +847,7 @@ xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c)
                 uint32_t rlen = (uint32_t) ntohl((uint32_t) segs[i].rlen);
                 if (rlen > XROOTD_READ_MAX) { rlen = XROOTD_READ_MAX; }
 
+                /* Each descriptor points at the header field and data slice for one segment. */
                 seg_descs[i].fd          = ctx->files[(int)(unsigned char)segs[i].fhandle[0]].fd;
                 seg_descs[i].handle_idx  = (int)(unsigned char) segs[i].fhandle[0];
                 seg_descs[i].offset      = (off_t)(int64_t) be64toh((uint64_t) segs[i].offset);
@@ -737,6 +879,7 @@ xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c)
         task->event.data    = task;
 
         if (ngx_thread_task_post(conf->thread_pool, task) == NGX_OK) {
+            /* Completion callback owns the response from this point onward. */
             ctx->state = XRD_ST_AIO;
             return NGX_OK;
         }
@@ -753,6 +896,11 @@ xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c)
         u_char *rspbuf;
         size_t  rsp_size;
 
+        /*
+         * The synchronous fallback mirrors the worker-thread algorithm exactly
+         * so both paths produce the same packed response layout and error rules.
+         */
+
         for (i = 0; i < n_segs; i++) {
             int      idx    = (int)(unsigned char) segs[i].fhandle[0];
             int64_t  offset = (int64_t) be64toh((uint64_t) segs[i].offset);
@@ -764,7 +912,10 @@ xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c)
             u_char *rlen_field = p + 4;
             p += XROOTD_READV_SEGSIZE;
 
+            /* p now points at the start of this segment's response data area. */
+
             if (rlen > 0) {
+                /* Read directly into the reserved data area behind this segment header. */
                 nread = pread(ctx->files[idx].fd, p, (size_t) rlen, (off_t) offset);
                 if (nread < 0) {
                     XROOTD_OP_ERR(ctx, XROOTD_OP_READV);
@@ -776,6 +927,7 @@ xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c)
                 }
             }
 
+            /* Patch the header to the actual bytes returned for this segment. */
             uint32_t actual_rlen_be = htonl((uint32_t) nread);
             ngx_memcpy(rlen_field, &actual_rlen_be, 4);
 
@@ -785,6 +937,8 @@ xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c)
 
         rsp_total = (size_t)(p - databuf);
 
+        /* rsp_total may be smaller than max_rsp because the final data lengths are now known. */
+
         {
             char detail[64];
             snprintf(detail, sizeof(detail), "%zu_segs", n_segs);
@@ -793,6 +947,7 @@ xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c)
         XROOTD_OP_OK(ctx, XROOTD_OP_READV);
         ctx->session_bytes += bytes_total;
 
+        /* Reuse the same chunking helper as kXR_read once the packed body is ready. */
         rspbuf = xrootd_build_readv_response(ctx, c, databuf, rsp_total, &rsp_size);
         if (rspbuf == NULL) { return NGX_ERROR; }
 
@@ -831,6 +986,12 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
     offset = (int64_t) be64toh((uint64_t) req->offset);
     rlen   = (size_t)(uint32_t) ntohl((uint32_t) req->rlen);
 
+    /*
+     * Unlike readv, plain read has exactly one contiguous data region, so the
+     * handler mainly arbitrates between sync vs async pread and then delegates
+     * all large-response chunking to xrootd_build_read_response().
+     */
+
     if (idx < 0 || idx >= XROOTD_MAX_FILES || ctx->files[idx].fd < 0) {
         xrootd_log_access(ctx, c, "READ", "-", "-",
                           0, kXR_FileNotOpen, "invalid file handle", 0);
@@ -840,11 +1001,13 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
     }
 
     if (rlen == 0) {
+        /* Zero-length reads are legal and return an immediate empty success body. */
         XROOTD_OP_OK(ctx, XROOTD_OP_READ);
         return xrootd_send_ok(ctx, c, NULL, 0);
     }
 
     if (rlen > XROOTD_READ_MAX * 16) {
+        /* One single read request should not monopolize memory or socket bandwidth indefinitely. */
         rlen = XROOTD_READ_MAX * 16;   /* 64 MB hard cap */
     }
 
@@ -852,6 +1015,8 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
     if (databuf == NULL) {
         return NGX_ERROR;
     }
+
+    /* databuf is temporary scratch storage; response construction copies or chunks from it. */
 
 #if (NGX_THREADS)
     /* Async path: post pread() to the thread pool */
@@ -878,6 +1043,8 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
         t->streamid[0] = ctx->cur_streamid[0];
         t->streamid[1] = ctx->cur_streamid[1];
 
+        /* Keep databuf alive in the task context until the completion handler copies/chunks it. */
+
         task->handler       = xrootd_read_aio_thread;
         task->event.handler = xrootd_read_aio_done;
         task->event.data    = task;
@@ -888,6 +1055,7 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
             goto sync_read;
         }
 
+        /* From here until completion, the AIO callback owns the reply path. */
         ctx->state = XRD_ST_AIO;
         return NGX_OK;
     }
@@ -907,6 +1075,9 @@ sync_read:
 
     data_total = (size_t) nread;
 
+    /* A short successful pread is the normal EOF signal for XRootD clients. */
+
+    /* Account bytes before building the protocol response so logs see the same totals. */
     ctx->files[idx].bytes_read += data_total;
     ctx->session_bytes         += data_total;
 
@@ -927,6 +1098,7 @@ sync_read:
     }
 
     {
+        /* queue_response_base may keep rspbuf for later if the socket blocks mid-send. */
         ngx_int_t rc = xrootd_queue_response_base(ctx, c, rspbuf, rsp_total, rspbuf);
         if (ctx->state != XRD_ST_SENDING) {
             ngx_pfree(c->pool, rspbuf);
@@ -963,6 +1135,8 @@ xrootd_handle_close(xrootd_ctx_t *ctx, ngx_connection_t *c)
         size_t     btotal = (bw > 0) ? bw : br;
         ngx_msec_t dur = ngx_current_msec - ctx->files[idx].open_time;
 
+        /* Prefer written-byte totals when uploads happened so write handles log correctly. */
+
         if (btotal > 0 && dur > 0) {
             double mbps = (double) btotal / (double) dur / 1000.0;
             snprintf(close_detail, sizeof(close_detail), "%.2fMB/s", mbps);
@@ -998,6 +1172,7 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
     ClientDirlistRequest *req = (ClientDirlistRequest *) ctx->hdr_buf;
     u_char                options;
     char                  resolved[PATH_MAX];
+    char                  reqpath[XROOTD_MAX_PATH + 1];
     DIR                  *dp;
     struct dirent        *de;
     ngx_flag_t            want_stat;
@@ -1011,6 +1186,12 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
     options   = req->options;
     want_stat = (options & kXR_dstat) ? 1 : 0;
 
+    /*
+     * dirlist is streamed one chunk at a time rather than precomputing the
+     * whole directory body up front. That keeps memory bounded for large trees
+     * while still preserving the exact newline-delimited body format clients parse.
+     */
+
     if (ctx->payload == NULL || ctx->cur_dlen == 0) {
         xrootd_log_access(ctx, c, "DIRLIST", "-", "-",
                           0, kXR_ArgMissing, "no path given", 0);
@@ -1018,10 +1199,19 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
         return xrootd_send_error(ctx, c, kXR_ArgMissing, "no path given");
     }
 
+    if (!xrootd_extract_path(c->log, ctx->payload, ctx->cur_dlen,
+                             reqpath, sizeof(reqpath), 0)) {
+        xrootd_log_access(ctx, c, "DIRLIST", "-", "-",
+                          0, kXR_ArgInvalid, "invalid path payload", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_DIRLIST);
+        return xrootd_send_error(ctx, c, kXR_ArgInvalid,
+                                 "invalid path payload");
+    }
+
     if (!xrootd_resolve_path(c->log, &conf->root,
-                             (const char *) ctx->payload,
+                             reqpath,
                              resolved, sizeof(resolved))) {
-        xrootd_log_access(ctx, c, "DIRLIST", (char *) ctx->payload, "-",
+        xrootd_log_access(ctx, c, "DIRLIST", reqpath, "-",
                           0, kXR_NotFound, "directory not found", 0);
         XROOTD_OP_ERR(ctx, XROOTD_OP_DIRLIST);
         return xrootd_send_error(ctx, c, kXR_NotFound, "directory not found");
@@ -1056,7 +1246,7 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
         return NGX_ERROR;
     }
 
-    /* We write entries starting after the response header (filled last) */
+    /* We write entries starting after the response header, which is filled just before send. */
     u_char *data = chunk + XRD_RESPONSE_HDR_LEN;
 
     /*
@@ -1122,10 +1312,11 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
                 return rc;
             }
 
+            /* Reuse the same chunk buffer from the front for the next batch of entries. */
             chunk_pos = 0;
         }
 
-        /* Append the entry name */
+        /* Append the entry name exactly as readdir() reported it, plus a newline separator. */
         ngx_memcpy(data + chunk_pos, name, nlen);
         chunk_pos += nlen;
         data[chunk_pos++] = '\n';
@@ -1136,6 +1327,7 @@ xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
             if (fstatat(dirfd(dp), name, &entry_st, AT_SYMLINK_NOFOLLOW)
                     == 0) {
                 size_t slen;
+                /* fstatat avoids building another path string for each directory entry. */
                 xrootd_make_stat_body(&entry_st, 0, statbuf, sizeof(statbuf));
                 slen = strlen(statbuf);
                 ngx_memcpy(data + chunk_pos, statbuf, slen);

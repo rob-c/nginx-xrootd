@@ -22,10 +22,17 @@
 #include <ngx_http.h>
 #include "ngx_xrootd_metrics.h"
 
-/* Forward declared in ngx_xrootd_metrics.h; defined in the stream module */
+/*
+ * Shared metrics zone allocated by the stream module during postconfiguration.
+ * The HTTP exporter only reads from it.
+ */
 ngx_shm_zone_t *ngx_xrootd_shm_zone = NULL;
 
-/* Human-readable operation names (must match XROOTD_OP_* indices) */
+/*
+ * Human-readable operation names exported as the Prometheus `op=` label.
+ * The array order must stay aligned with the XROOTD_OP_* constants because the
+ * stream side records counters by numeric slot, not by string.
+ */
 static const char *xrootd_op_names[XROOTD_NOPS] = {
     "login",        /* XROOTD_OP_LOGIN        */
     "auth",         /* XROOTD_OP_AUTH         */
@@ -57,6 +64,8 @@ typedef struct {
     ngx_flag_t  enable;
 } ngx_http_xrootd_metrics_loc_conf_t;
 
+/* One boolean per location is enough: either this URI serves metrics or it does not. */
+
 /* ------------------------------------------------------------------ */
 /* Forward declarations                                                 */
 /* ------------------------------------------------------------------ */
@@ -76,6 +85,7 @@ static ngx_command_t ngx_http_xrootd_metrics_commands[] = {
 
     { ngx_string("xrootd_metrics"),
       NGX_HTTP_LOC_CONF | NGX_CONF_FLAG,
+    /* Custom setter so enabling the directive also installs this location handler. */
       ngx_http_xrootd_metrics_set,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_xrootd_metrics_loc_conf_t, enable),
@@ -95,6 +105,7 @@ static ngx_http_module_t ngx_http_xrootd_metrics_module_ctx = {
     NULL,                                      /* init main conf      */
     NULL,                                      /* create srv conf     */
     NULL,                                      /* merge srv conf      */
+    /* Per-location config allocation/merge for `location /metrics { ... }`. */
     ngx_http_xrootd_metrics_create_loc_conf,   /* create loc conf     */
     ngx_http_xrootd_metrics_merge_loc_conf     /* merge loc conf      */
 };
@@ -120,8 +131,10 @@ static void *
 ngx_http_xrootd_metrics_create_loc_conf(ngx_conf_t *cf)
 {
     ngx_http_xrootd_metrics_loc_conf_t *conf;
+
     conf = ngx_pcalloc(cf->pool, sizeof(*conf));
     if (conf == NULL) { return NULL; }
+    /* Leave unset so nginx can distinguish "not configured" from explicit off. */
     conf->enable = NGX_CONF_UNSET;
     return conf;
 }
@@ -132,6 +145,8 @@ ngx_http_xrootd_metrics_merge_loc_conf(ngx_conf_t *cf,
 {
     ngx_http_xrootd_metrics_loc_conf_t *prev = parent;
     ngx_http_xrootd_metrics_loc_conf_t *conf = child;
+
+    /* Child location wins when explicitly set; otherwise inherit from parent. */
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     return NGX_CONF_OK;
 }
@@ -145,6 +160,7 @@ ngx_http_xrootd_metrics_set(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     rv = ngx_conf_set_flag_slot(cf, cmd, conf);
     if (rv != NGX_CONF_OK) { return rv; }
 
+    /* Requests matching this location should be served directly by this module. */
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
     clcf->handler = ngx_http_xrootd_metrics_handler;
     return NGX_CONF_OK;
@@ -160,9 +176,9 @@ typedef struct {
     ngx_pool_t   *pool;
     ngx_chain_t  *head;
     ngx_chain_t  *tail;
-    u_char       *pos;
-    u_char       *last;
-    size_t        total;
+    u_char       *pos;   /* current write cursor in tail buffer          */
+    u_char       *last;  /* one-past-end pointer for the tail buffer     */
+    size_t        total; /* total bytes emitted across the whole chain   */
 } metrics_writer_t;
 
 static ngx_int_t
@@ -171,6 +187,7 @@ mw_init(metrics_writer_t *mw, ngx_pool_t *pool)
     ngx_buf_t   *b;
     ngx_chain_t *cl;
 
+    /* Start with a single temporary buffer and append more buffers on demand. */
     b = ngx_create_temp_buf(pool, METRICS_BUF_SIZE);
     if (b == NULL) { return NGX_ERROR; }
 
@@ -184,6 +201,7 @@ mw_init(metrics_writer_t *mw, ngx_pool_t *pool)
     mw->head  = cl;
     mw->tail  = cl;
     mw->pos   = b->pos;
+    /* ngx_create_temp_buf() leaves b->last at the start of free space. */
     mw->last  = b->last + METRICS_BUF_SIZE;
     mw->total = 0;
     return NGX_OK;
@@ -202,6 +220,8 @@ mw_printf(metrics_writer_t *mw, const char *fmt, ...)
     ngx_buf_t   *b;
     ngx_chain_t *cl;
 
+    /* Try to append into the current tail buffer before growing the chain. */
+    /* Free bytes left in the current tail buffer. */
     avail = mw->last - mw->pos;
 
     va_start(args, fmt);
@@ -211,7 +231,10 @@ mw_printf(metrics_writer_t *mw, const char *fmt, ...)
     if (n < 0) { return NGX_ERROR; }
 
     if ((size_t) n >= avail) {
-        /* Current buffer full — allocate another */
+        /*
+         * vsnprintf reports the full length it wanted, so if the current tail
+         * buffer cannot hold the line we seal it and continue in a fresh link.
+         */
         mw->tail->buf->last = mw->pos;
 
         b = ngx_create_temp_buf(mw->pool, METRICS_BUF_SIZE);
@@ -225,8 +248,10 @@ mw_printf(metrics_writer_t *mw, const char *fmt, ...)
         mw->tail->next = cl;
         mw->tail       = cl;
         mw->pos        = b->pos;
+        /* Re-establish the writer invariant for the new tail buffer. */
         mw->last       = b->last + METRICS_BUF_SIZE;
 
+        /* Retry the same formatted write against the fresh empty buffer. */
         avail = METRICS_BUF_SIZE;
         va_start(args, fmt);
         n = vsnprintf((char *) mw->pos, avail, fmt, args);
@@ -243,6 +268,7 @@ mw_printf(metrics_writer_t *mw, const char *fmt, ...)
 static void
 mw_finish(metrics_writer_t *mw)
 {
+    /* Finalize the last buffer so ngx_http_output_filter can send the chain. */
     mw->tail->buf->last    = mw->pos;
     mw->tail->buf->last_buf = 1;
 }
@@ -264,13 +290,16 @@ ngx_http_xrootd_metrics_handler(ngx_http_request_t *r)
 
     lcf = ngx_http_get_module_loc_conf(r, ngx_http_xrootd_metrics_module);
     if (!lcf->enable) {
+        /* Another location matched this request but did not enable the exporter. */
         return NGX_DECLINED;
     }
 
+    /* Prometheus scrapes are simple GETs; HEAD is allowed for cheap probes. */
     if (r->method != NGX_HTTP_GET && r->method != NGX_HTTP_HEAD) {
         return NGX_HTTP_NOT_ALLOWED;
     }
 
+    /* Ignore and discard any request body before generating the response. */
     rc = ngx_http_discard_request_body(r);
     if (rc != NGX_OK) { return rc; }
 
@@ -287,19 +316,33 @@ ngx_http_xrootd_metrics_handler(ngx_http_request_t *r)
 
     shm = ngx_xrootd_shm_zone->data;
 
+    /*
+     * Export is intentionally eventually consistent rather than a single locked
+     * snapshot: each counter is read atomically, but different lines may observe
+     * slightly different moments in time while workers continue serving traffic.
+     */
+
     /* ---- xrootd_connections_total ---- */
     mw_printf(&mw,
         "# HELP xrootd_connections_total "
             "Total TCP connections accepted since process start.\n"
         "# TYPE xrootd_connections_total counter\n");
+    /* Emit one complete metric family at a time so HELP/TYPE stay contiguous. */
     for (i = 0; i < XROOTD_METRICS_MAX_SERVERS; i++) {
         srv = &shm->servers[i];
         if (!srv->in_use) { continue; }
+
+        /*
+         * Export labels directly from the shared slot assigned to each stream
+         * server during stream-module startup.
+         */
+        /* Prometheus labels are text, so the numeric listener port is rendered first. */
         ngx_snprintf((u_char *) port_str, sizeof(port_str),
                      "%ui%Z", srv->port);
         mw_printf(&mw,
             "xrootd_connections_total{port=\"%s\",auth=\"%s\"} %lu\n",
             port_str, srv->auth,
+            /* fetch_add(..., 0) is used as an atomic read of the counter value. */
             (unsigned long) ngx_atomic_fetch_add(&srv->connections_total, 0));
     }
 
@@ -311,6 +354,8 @@ ngx_http_xrootd_metrics_handler(ngx_http_request_t *r)
     for (i = 0; i < XROOTD_METRICS_MAX_SERVERS; i++) {
         srv = &shm->servers[i];
         if (!srv->in_use) { continue; }
+
+        /* Same slot walk as above, but exporting the live open-connection gauge. */
         ngx_snprintf((u_char *) port_str, sizeof(port_str),
                      "%ui%Z", srv->port);
         mw_printf(&mw,
@@ -327,6 +372,8 @@ ngx_http_xrootd_metrics_handler(ngx_http_request_t *r)
     for (i = 0; i < XROOTD_METRICS_MAX_SERVERS; i++) {
         srv = &shm->servers[i];
         if (!srv->in_use) { continue; }
+
+        /* bytes_rx_total tracks inbound client traffic, mostly write payload bytes. */
         ngx_snprintf((u_char *) port_str, sizeof(port_str),
                      "%ui%Z", srv->port);
         mw_printf(&mw,
@@ -343,6 +390,8 @@ ngx_http_xrootd_metrics_handler(ngx_http_request_t *r)
     for (i = 0; i < XROOTD_METRICS_MAX_SERVERS; i++) {
         srv = &shm->servers[i];
         if (!srv->in_use) { continue; }
+
+        /* bytes_tx_total is the mirror counter for outbound read/response traffic. */
         ngx_snprintf((u_char *) port_str, sizeof(port_str),
                      "%ui%Z", srv->port);
         mw_printf(&mw,
@@ -356,18 +405,27 @@ ngx_http_xrootd_metrics_handler(ngx_http_request_t *r)
         "# HELP xrootd_requests_total "
             "XRootD requests completed, by operation and status.\n"
         "# TYPE xrootd_requests_total counter\n");
+    /*
+     * Outer loop walks operations first so all server variants of a given op
+     * are adjacent in the output, which is easier to inspect manually.
+     */
     for (op = 0; op < XROOTD_NOPS; op++) {
         for (i = 0; i < XROOTD_METRICS_MAX_SERVERS; i++) {
             srv = &shm->servers[i];
             if (!srv->in_use) { continue; }
+
+            /* Recompute the common labels for each server/op pair we emit. */
             ngx_snprintf((u_char *) port_str, sizeof(port_str),
                          "%ui%Z", srv->port);
+
+            /* Emit one ok-series per op/server pair so dashboards have a stable shape. */
             mw_printf(&mw,
                 "xrootd_requests_total"
                     "{port=\"%s\",auth=\"%s\",op=\"%s\",status=\"ok\"}"
                     " %lu\n",
                 port_str, srv->auth, xrootd_op_names[op],
                 (unsigned long) ngx_atomic_fetch_add(&srv->op_ok[op], 0));
+
             /* Only emit error series when non-zero to keep output terse */
             ngx_atomic_t errs = ngx_atomic_fetch_add(&srv->op_err[op], 0);
             if (errs > 0) {
@@ -384,21 +442,29 @@ ngx_http_xrootd_metrics_handler(ngx_http_request_t *r)
 done:
     mw_finish(&mw);
 
+    /* Standard nginx HTTP response setup for an in-memory generated body. */
     r->headers_out.status           = NGX_HTTP_OK;
     r->headers_out.content_length_n = (off_t) mw.total;
 
     {
         ngx_str_t ct = ngx_string(
             "text/plain; version=0.0.4; charset=utf-8");
+        /* Prometheus expects the 0.0.4 text exposition content type. */
         r->headers_out.content_type      = ct;
         r->headers_out.content_type_len  = ct.len;
         r->headers_out.content_type_lowcase = NULL;
     }
 
     rc = ngx_http_send_header(r);
+    /* HEAD requests stop here after headers; send_header also reports hard errors. */
     if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
         return rc;
     }
 
+    /*
+     * ngx_http_output_filter() consumes the linked list of buffers directly;
+     * no extra flattening step is needed because the writer already built a
+     * valid chain in pool memory.
+     */
     return ngx_http_output_filter(r, mw.head);
 }

@@ -255,3 +255,72 @@ There is a concurrency hazard between the nginx write event handler and the AIO 
 **Fix:** In `ngx_stream_xrootd_send`, after draining `ctx->wbuf`, check `ctx->state`. If it is no longer `XRD_ST_SENDING`, the pipeline has already advanced and the write handler returns without calling the read path.
 
 This bug only manifests under a specific timing: a large response that requires a second `send()` call, combined with a very fast subsequent read completing before the write event fires. It does not show up in benchmarks but was observed with concurrent clients under load.
+
+---
+
+## 19. Real clients may include one trailing NUL inside path `dlen`
+
+Several path-carrying requests are documented as “path payload follows”, and many client implementations do in fact send a C-string-like trailing `\0` inside the declared payload length.
+
+In practice the safest rule is:
+
+- allow exactly one trailing NUL at `payload[dlen - 1]`
+- reject any embedded NUL before the last byte
+- convert the result into an internal C string only after validation
+
+Rejecting all NUL bytes outright breaks real clients. Accepting embedded NUL bytes is unsafe because it creates ambiguity between what the protocol length says and what libc file APIs will actually read.
+
+---
+
+## 20. Log sinks need the same kind of hardening as path sinks
+
+The access log and nginx error/debug log receive several values that originate from the client or from client-controlled metadata:
+
+- login usernames
+- authenticated subject DNs
+- request paths
+- request detail strings derived from those paths
+- error messages that may include client-originating context
+
+Writing those values raw makes log injection possible: embedded newlines, tabs, quotes, backslashes, or other control bytes can split one logical record into many physical lines or make later parsing ambiguous.
+
+The server now uses a dedicated escaping rule before logging client-controlled text:
+
+- printable safe ASCII stays as-is
+- whitespace, control bytes, quotes, backslashes, and non-ASCII bytes are rendered as `\xNN`
+
+This is not a wire-protocol requirement, but it is an implementation requirement for any production-facing server.
+
+---
+
+## 21. Prometheus labels must stay low-cardinality and non-user-controlled
+
+It is tempting to expose usernames, DNs, paths, or client addresses as metric labels. Do not do that here.
+
+The current exporter is intentionally limited to stable, low-cardinality labels:
+
+- `port`
+- `auth`
+- `op`
+- `status`
+
+Using client-controlled strings as labels would create an unbounded metric cardinality problem and would also reintroduce the same sanitization concerns that were removed from the logging path.
+
+---
+
+## 22. Rebuild vs reload matters when testing nginx modules
+
+When iterating on a statically linked nginx module, there are two very different operations:
+
+- rebuild the nginx binary after recompiling the module
+- reload nginx configuration for an already-running master process
+
+Only the first one changes code. A plain `nginx -s reload` keeps running the same executable image and just reparses config. If you rebuild `/tmp/nginx-1.28.3/objs/nginx` but only reload, you are still testing the old binary.
+
+For this repo's test setup, the reliable sequence after code changes is:
+
+1. rebuild `/tmp/nginx-1.28.3/objs/nginx`
+2. stop the existing test nginx master
+3. start the rebuilt binary again with `/tmp/xrd-test/conf/nginx.conf`
+
+That operational detail is easy to forget and explains a lot of “the fix compiled but the behavior did not change” confusion.
