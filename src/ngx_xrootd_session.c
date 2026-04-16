@@ -209,5 +209,16 @@ xrootd_handle_endsess(xrootd_ctx_t *ctx, ngx_connection_t *c)
      */
     xrootd_on_disconnect(ctx, c);
     xrootd_close_all_files(ctx);
+
+    /*
+     * SECURITY: clear session-level auth flags so the dispatcher rejects any
+     * further requests that the client attempts on this TCP connection.
+     * Without this, a client could re-open files and read/write them after
+     * kXR_endsess, bypassing the session-end semantics (and, in GSI deployments,
+     * bypassing proxy-certificate expiry that triggered the endsess).
+     */
+    ctx->logged_in = 0;
+    ctx->auth_done = 0;
+
     return xrootd_send_ok(ctx, c, NULL, 0);
 }

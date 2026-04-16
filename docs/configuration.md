@@ -219,11 +219,11 @@ http {
 
 ---
 
-## Directive summary table
+## XRootD stream directive summary
 
 | Directive | Context | Default | Required? |
 |---|---|---|---|
-| `xrootd on\|off` | `server` | `off` | Yes |
+| `xrootd on\|off` | `server` (stream) | `off` | Yes |
 | `xrootd_root <path>` | `server` | `/` | Recommended |
 | `xrootd_allow_write on\|off` | `server` | `off` | No |
 | `xrootd_auth none\|gsi` | `server` | `none` | No |
@@ -233,3 +233,20 @@ http {
 | `xrootd_access_log <path>\|off` | `server` | `off` | No |
 | `xrootd_thread_pool <name>` | `server` | `default` | No |
 | `xrootd_metrics on\|off` | `location` (HTTP) | `off` | No |
+
+---
+
+## WebDAV directives
+
+The WebDAV module (`ngx_http_xrootd_webdav_module`) handles `davs://` clients in nginx's `http {}` context. Full documentation and examples: [webdav.md](webdav.md).
+
+| Directive | Context | Default | Notes |
+|---|---|---|---|
+| `xrootd_webdav on\|off` | `location` | `off` | Activates WebDAV handler |
+| `xrootd_webdav_root <path>` | `location` | — | Filesystem root for clients |
+| `xrootd_webdav_auth none\|optional\|required` | `location` | `none` | Client cert policy |
+| `xrootd_webdav_cadir <path>` | `location` | — | Hashed CA directory |
+| `xrootd_webdav_cafile <path>` | `location` | — | Single CA PEM file |
+| `xrootd_webdav_allow_write on\|off` | `location` | `off` | Enable PUT/DELETE/MKCOL |
+| `xrootd_webdav_proxy_certs on\|off` | `server` (HTTP) | `off` | Accept RFC 3820 proxy certs |
+| `xrootd_webdav_verify_depth <n>` | `location` | `10` | Proxy chain depth limit |

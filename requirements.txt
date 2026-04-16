@@ -1,1 +1,2 @@
 xrootd>=6.0.0
+pytest-timeout>=2.1.0

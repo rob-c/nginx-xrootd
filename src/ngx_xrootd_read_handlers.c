@@ -743,8 +743,6 @@ ngx_int_t
 xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c)
 {
     readahead_list               *segs;
-    ngx_stream_xrootd_srv_conf_t *conf =
-        ngx_stream_get_module_srv_conf((ngx_stream_session_t *)(c->data), ngx_stream_xrootd_module);
     size_t           n_segs, i;
     u_char          *databuf;
     size_t           max_rsp;
@@ -830,6 +828,9 @@ xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c)
     }
 
 #if (NGX_THREADS)
+    {
+    ngx_stream_xrootd_srv_conf_t *conf =
+        ngx_stream_get_module_srv_conf((ngx_stream_session_t *)(c->data), ngx_stream_xrootd_module);
     if (conf->thread_pool != NULL) {
         ngx_thread_task_t       *task;
         xrootd_readv_aio_t      *t;
@@ -886,6 +887,7 @@ xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c)
         ngx_log_error(NGX_LOG_WARN, c->log, 0,
                       "xrootd: thread_task_post failed, falling back to sync readv");
     }
+    } /* end NGX_THREADS block */
 #endif /* NGX_THREADS */
 
     /* --- Synchronous path: pread each segment in the event loop --- */
@@ -971,8 +973,6 @@ ngx_int_t
 xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
 {
     ClientReadRequest            *req  = (ClientReadRequest *) ctx->hdr_buf;
-    ngx_stream_xrootd_srv_conf_t *conf =
-        ngx_stream_get_module_srv_conf((ngx_stream_session_t *)(c->data), ngx_stream_xrootd_module);
     int      idx;
     int64_t  offset;
     size_t   rlen;
@@ -1020,6 +1020,9 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
 
 #if (NGX_THREADS)
     /* Async path: post pread() to the thread pool */
+    {
+    ngx_stream_xrootd_srv_conf_t *conf =
+        ngx_stream_get_module_srv_conf((ngx_stream_session_t *)(c->data), ngx_stream_xrootd_module);
     if (conf->thread_pool != NULL) {
         ngx_thread_task_t  *task;
         xrootd_read_aio_t  *t;
@@ -1059,6 +1062,7 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
         ctx->state = XRD_ST_AIO;
         return NGX_OK;
     }
+    } /* end NGX_THREADS block */
 
 sync_read:
 #endif /* NGX_THREADS */

@@ -10,8 +10,6 @@ ngx_int_t
 xrootd_handle_write(xrootd_ctx_t *ctx, ngx_connection_t *c)
 {
     ClientWriteRequest           *req  = (ClientWriteRequest *) ctx->hdr_buf;
-    ngx_stream_xrootd_srv_conf_t *conf =
-        ngx_stream_get_module_srv_conf((ngx_stream_session_t *)(c->data), ngx_stream_xrootd_module);
     int     idx    = (int)(unsigned char) req->fhandle[0];
     int64_t offset = (int64_t) be64toh((uint64_t) req->offset);
     size_t  wlen   = ctx->cur_dlen;
@@ -42,6 +40,9 @@ xrootd_handle_write(xrootd_ctx_t *ctx, ngx_connection_t *c)
     }
 
 #if (NGX_THREADS)
+    {
+    ngx_stream_xrootd_srv_conf_t *conf =
+        ngx_stream_get_module_srv_conf((ngx_stream_session_t *)(c->data), ngx_stream_xrootd_module);
     if (conf->thread_pool != NULL) {
         ngx_thread_task_t   *task;
         xrootd_write_aio_t  *t;
@@ -82,6 +83,7 @@ xrootd_handle_write(xrootd_ctx_t *ctx, ngx_connection_t *c)
         ctx->state = XRD_ST_AIO;
         return NGX_OK;
     }
+    } /* end NGX_THREADS block */
 
 sync_write:
 #endif /* NGX_THREADS */
@@ -144,8 +146,6 @@ ngx_int_t
 xrootd_handle_pgwrite(xrootd_ctx_t *ctx, ngx_connection_t *c)
 {
     ClientPgWriteRequest         *req  = (ClientPgWriteRequest *) ctx->hdr_buf;
-    ngx_stream_xrootd_srv_conf_t *conf =
-        ngx_stream_get_module_srv_conf((ngx_stream_session_t *)(c->data), ngx_stream_xrootd_module);
     int     idx     = (int)(unsigned char) req->fhandle[0];
     int64_t offset  = (int64_t) be64toh((uint64_t) req->offset);
     size_t  dlen    = ctx->cur_dlen;
@@ -209,6 +209,9 @@ xrootd_handle_pgwrite(xrootd_ctx_t *ctx, ngx_connection_t *c)
         }
 
 #if (NGX_THREADS)
+        {
+        ngx_stream_xrootd_srv_conf_t *conf =
+            ngx_stream_get_module_srv_conf((ngx_stream_session_t *)(c->data), ngx_stream_xrootd_module);
         if (conf->thread_pool != NULL) {
             ngx_thread_task_t   *task;
             xrootd_write_aio_t  *t;
@@ -247,6 +250,7 @@ xrootd_handle_pgwrite(xrootd_ctx_t *ctx, ngx_connection_t *c)
             ngx_log_error(NGX_LOG_WARN, c->log, 0,
                           "xrootd: thread_task_post failed, falling back to sync pgwrite");
         }
+        } /* end NGX_THREADS block */
 #endif /* NGX_THREADS */
 
         /* Synchronous path: write the flat buffer page by page */

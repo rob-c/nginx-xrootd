@@ -27,3 +27,9 @@ ngx_module_name=ngx_http_xrootd_metrics_module
 ngx_module_srcs="$ngx_addon_dir/src/ngx_http_xrootd_metrics_module.c"
 ngx_module_libs=
 . auto/module
+
+ngx_module_type=HTTP
+ngx_module_name=ngx_http_xrootd_webdav_module
+ngx_module_srcs="$ngx_addon_dir/src/ngx_http_xrootd_webdav_module.c"
+ngx_module_libs="-lssl -lcrypto"
+. auto/module
