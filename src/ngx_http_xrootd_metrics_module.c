@@ -274,6 +274,125 @@ mw_finish(metrics_writer_t *mw)
 }
 
 /* ------------------------------------------------------------------ */
+/* Prometheus export helper                                              */
+/* ------------------------------------------------------------------ */
+
+static void
+xrootd_export_prometheus_metrics(metrics_writer_t *mw,
+                                 ngx_xrootd_metrics_t *shm)
+{
+    ngx_xrootd_srv_metrics_t *srv;
+    ngx_uint_t                i, op;
+    char                      port_str[16];
+
+    /*
+     * Export is intentionally eventually consistent rather than a single locked
+     * snapshot: each counter is read atomically, but different lines may observe
+     * slightly different moments in time while workers continue serving traffic.
+     */
+
+    /* ---- xrootd_connections_total ---- */
+    mw_printf(mw,
+        "# HELP xrootd_connections_total "
+            "Total TCP connections accepted since process start.\n"
+        "# TYPE xrootd_connections_total counter\n");
+    for (i = 0; i < XROOTD_METRICS_MAX_SERVERS; i++) {
+        srv = &shm->servers[i];
+        if (!srv->in_use) { continue; }
+
+        ngx_snprintf((u_char *) port_str, sizeof(port_str),
+                     "%ui%Z", srv->port);
+        mw_printf(mw,
+            "xrootd_connections_total{port=\"%s\",auth=\"%s\"} %lu\n",
+            port_str, srv->auth,
+            (unsigned long) ngx_atomic_fetch_add(&srv->connections_total, 0));
+    }
+
+    /* ---- xrootd_connections_active ---- */
+    mw_printf(mw,
+        "# HELP xrootd_connections_active "
+            "Currently open XRootD connections.\n"
+        "# TYPE xrootd_connections_active gauge\n");
+    for (i = 0; i < XROOTD_METRICS_MAX_SERVERS; i++) {
+        srv = &shm->servers[i];
+        if (!srv->in_use) { continue; }
+
+        ngx_snprintf((u_char *) port_str, sizeof(port_str),
+                     "%ui%Z", srv->port);
+        mw_printf(mw,
+            "xrootd_connections_active{port=\"%s\",auth=\"%s\"} %lu\n",
+            port_str, srv->auth,
+            (unsigned long) ngx_atomic_fetch_add(&srv->connections_active, 0));
+    }
+
+    /* ---- xrootd_bytes_rx_total ---- */
+    mw_printf(mw,
+        "# HELP xrootd_bytes_rx_total "
+            "Bytes received from clients (write payloads).\n"
+        "# TYPE xrootd_bytes_rx_total counter\n");
+    for (i = 0; i < XROOTD_METRICS_MAX_SERVERS; i++) {
+        srv = &shm->servers[i];
+        if (!srv->in_use) { continue; }
+
+        ngx_snprintf((u_char *) port_str, sizeof(port_str),
+                     "%ui%Z", srv->port);
+        mw_printf(mw,
+            "xrootd_bytes_rx_total{port=\"%s\",auth=\"%s\"} %lu\n",
+            port_str, srv->auth,
+            (unsigned long) ngx_atomic_fetch_add(&srv->bytes_rx_total, 0));
+    }
+
+    /* ---- xrootd_bytes_tx_total ---- */
+    mw_printf(mw,
+        "# HELP xrootd_bytes_tx_total "
+            "Bytes sent to clients (read data).\n"
+        "# TYPE xrootd_bytes_tx_total counter\n");
+    for (i = 0; i < XROOTD_METRICS_MAX_SERVERS; i++) {
+        srv = &shm->servers[i];
+        if (!srv->in_use) { continue; }
+
+        ngx_snprintf((u_char *) port_str, sizeof(port_str),
+                     "%ui%Z", srv->port);
+        mw_printf(mw,
+            "xrootd_bytes_tx_total{port=\"%s\",auth=\"%s\"} %lu\n",
+            port_str, srv->auth,
+            (unsigned long) ngx_atomic_fetch_add(&srv->bytes_tx_total, 0));
+    }
+
+    /* ---- xrootd_requests_total ---- */
+    mw_printf(mw,
+        "# HELP xrootd_requests_total "
+            "XRootD requests completed, by operation and status.\n"
+        "# TYPE xrootd_requests_total counter\n");
+    for (op = 0; op < XROOTD_NOPS; op++) {
+        for (i = 0; i < XROOTD_METRICS_MAX_SERVERS; i++) {
+            srv = &shm->servers[i];
+            if (!srv->in_use) { continue; }
+
+            ngx_snprintf((u_char *) port_str, sizeof(port_str),
+                         "%ui%Z", srv->port);
+
+            mw_printf(mw,
+                "xrootd_requests_total"
+                    "{port=\"%s\",auth=\"%s\",op=\"%s\",status=\"ok\"}"
+                    " %lu\n",
+                port_str, srv->auth, xrootd_op_names[op],
+                (unsigned long) ngx_atomic_fetch_add(&srv->op_ok[op], 0));
+
+            ngx_atomic_t errs = ngx_atomic_fetch_add(&srv->op_err[op], 0);
+            if (errs > 0) {
+                mw_printf(mw,
+                    "xrootd_requests_total"
+                        "{port=\"%s\",auth=\"%s\",op=\"%s\",status=\"error\"}"
+                        " %lu\n",
+                    port_str, srv->auth, xrootd_op_names[op],
+                    (unsigned long) errs);
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Request handler                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -281,12 +400,8 @@ static ngx_int_t
 ngx_http_xrootd_metrics_handler(ngx_http_request_t *r)
 {
     ngx_http_xrootd_metrics_loc_conf_t *lcf;
-    ngx_xrootd_metrics_t               *shm;
-    ngx_xrootd_srv_metrics_t           *srv;
     metrics_writer_t                    mw;
-    ngx_uint_t                          i, op;
     ngx_int_t                           rc;
-    char                                port_str[16];
 
     lcf = ngx_http_get_module_loc_conf(r, ngx_http_xrootd_metrics_module);
     if (!lcf->enable) {
@@ -311,135 +426,10 @@ ngx_http_xrootd_metrics_handler(ngx_http_request_t *r)
      * return empty metrics rather than crashing. */
     if (ngx_xrootd_shm_zone == NULL || ngx_xrootd_shm_zone->data == NULL) {
         mw_printf(&mw, "# nginx-xrootd: no stream servers configured\n");
-        goto done;
+    } else {
+        xrootd_export_prometheus_metrics(&mw, ngx_xrootd_shm_zone->data);
     }
 
-    shm = ngx_xrootd_shm_zone->data;
-
-    /*
-     * Export is intentionally eventually consistent rather than a single locked
-     * snapshot: each counter is read atomically, but different lines may observe
-     * slightly different moments in time while workers continue serving traffic.
-     */
-
-    /* ---- xrootd_connections_total ---- */
-    mw_printf(&mw,
-        "# HELP xrootd_connections_total "
-            "Total TCP connections accepted since process start.\n"
-        "# TYPE xrootd_connections_total counter\n");
-    /* Emit one complete metric family at a time so HELP/TYPE stay contiguous. */
-    for (i = 0; i < XROOTD_METRICS_MAX_SERVERS; i++) {
-        srv = &shm->servers[i];
-        if (!srv->in_use) { continue; }
-
-        /*
-         * Export labels directly from the shared slot assigned to each stream
-         * server during stream-module startup.
-         */
-        /* Prometheus labels are text, so the numeric listener port is rendered first. */
-        ngx_snprintf((u_char *) port_str, sizeof(port_str),
-                     "%ui%Z", srv->port);
-        mw_printf(&mw,
-            "xrootd_connections_total{port=\"%s\",auth=\"%s\"} %lu\n",
-            port_str, srv->auth,
-            /* fetch_add(..., 0) is used as an atomic read of the counter value. */
-            (unsigned long) ngx_atomic_fetch_add(&srv->connections_total, 0));
-    }
-
-    /* ---- xrootd_connections_active ---- */
-    mw_printf(&mw,
-        "# HELP xrootd_connections_active "
-            "Currently open XRootD connections.\n"
-        "# TYPE xrootd_connections_active gauge\n");
-    for (i = 0; i < XROOTD_METRICS_MAX_SERVERS; i++) {
-        srv = &shm->servers[i];
-        if (!srv->in_use) { continue; }
-
-        /* Same slot walk as above, but exporting the live open-connection gauge. */
-        ngx_snprintf((u_char *) port_str, sizeof(port_str),
-                     "%ui%Z", srv->port);
-        mw_printf(&mw,
-            "xrootd_connections_active{port=\"%s\",auth=\"%s\"} %lu\n",
-            port_str, srv->auth,
-            (unsigned long) ngx_atomic_fetch_add(&srv->connections_active, 0));
-    }
-
-    /* ---- xrootd_bytes_rx_total ---- */
-    mw_printf(&mw,
-        "# HELP xrootd_bytes_rx_total "
-            "Bytes received from clients (write payloads).\n"
-        "# TYPE xrootd_bytes_rx_total counter\n");
-    for (i = 0; i < XROOTD_METRICS_MAX_SERVERS; i++) {
-        srv = &shm->servers[i];
-        if (!srv->in_use) { continue; }
-
-        /* bytes_rx_total tracks inbound client traffic, mostly write payload bytes. */
-        ngx_snprintf((u_char *) port_str, sizeof(port_str),
-                     "%ui%Z", srv->port);
-        mw_printf(&mw,
-            "xrootd_bytes_rx_total{port=\"%s\",auth=\"%s\"} %lu\n",
-            port_str, srv->auth,
-            (unsigned long) ngx_atomic_fetch_add(&srv->bytes_rx_total, 0));
-    }
-
-    /* ---- xrootd_bytes_tx_total ---- */
-    mw_printf(&mw,
-        "# HELP xrootd_bytes_tx_total "
-            "Bytes sent to clients (read data).\n"
-        "# TYPE xrootd_bytes_tx_total counter\n");
-    for (i = 0; i < XROOTD_METRICS_MAX_SERVERS; i++) {
-        srv = &shm->servers[i];
-        if (!srv->in_use) { continue; }
-
-        /* bytes_tx_total is the mirror counter for outbound read/response traffic. */
-        ngx_snprintf((u_char *) port_str, sizeof(port_str),
-                     "%ui%Z", srv->port);
-        mw_printf(&mw,
-            "xrootd_bytes_tx_total{port=\"%s\",auth=\"%s\"} %lu\n",
-            port_str, srv->auth,
-            (unsigned long) ngx_atomic_fetch_add(&srv->bytes_tx_total, 0));
-    }
-
-    /* ---- xrootd_requests_total ---- */
-    mw_printf(&mw,
-        "# HELP xrootd_requests_total "
-            "XRootD requests completed, by operation and status.\n"
-        "# TYPE xrootd_requests_total counter\n");
-    /*
-     * Outer loop walks operations first so all server variants of a given op
-     * are adjacent in the output, which is easier to inspect manually.
-     */
-    for (op = 0; op < XROOTD_NOPS; op++) {
-        for (i = 0; i < XROOTD_METRICS_MAX_SERVERS; i++) {
-            srv = &shm->servers[i];
-            if (!srv->in_use) { continue; }
-
-            /* Recompute the common labels for each server/op pair we emit. */
-            ngx_snprintf((u_char *) port_str, sizeof(port_str),
-                         "%ui%Z", srv->port);
-
-            /* Emit one ok-series per op/server pair so dashboards have a stable shape. */
-            mw_printf(&mw,
-                "xrootd_requests_total"
-                    "{port=\"%s\",auth=\"%s\",op=\"%s\",status=\"ok\"}"
-                    " %lu\n",
-                port_str, srv->auth, xrootd_op_names[op],
-                (unsigned long) ngx_atomic_fetch_add(&srv->op_ok[op], 0));
-
-            /* Only emit error series when non-zero to keep output terse */
-            ngx_atomic_t errs = ngx_atomic_fetch_add(&srv->op_err[op], 0);
-            if (errs > 0) {
-                mw_printf(&mw,
-                    "xrootd_requests_total"
-                        "{port=\"%s\",auth=\"%s\",op=\"%s\",status=\"error\"}"
-                        " %lu\n",
-                    port_str, srv->auth, xrootd_op_names[op],
-                    (unsigned long) errs);
-            }
-        }
-    }
-
-done:
     mw_finish(&mw);
 
     /* Standard nginx HTTP response setup for an in-memory generated body. */

@@ -1142,16 +1142,14 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
         if (ngx_thread_task_post(conf->thread_pool, task) != NGX_OK) {
             ngx_log_error(NGX_LOG_WARN, c->log, 0,
                           "xrootd: thread_task_post failed, falling back to sync read");
-            goto sync_read;
+        } else {
+            /* From here until completion, the AIO callback owns the reply path. */
+            ctx->state = XRD_ST_AIO;
+            return NGX_OK;
         }
-
-        /* From here until completion, the AIO callback owns the reply path. */
-        ctx->state = XRD_ST_AIO;
-        return NGX_OK;
     }
     } /* end NGX_THREADS block */
 
-sync_read:
 #endif /* NGX_THREADS */
 
     /* Synchronous path: pread() in the event loop worker */

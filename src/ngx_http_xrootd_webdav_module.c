@@ -671,6 +671,70 @@ webdav_resolve_path(ngx_http_request_t *r, const ngx_str_t *root,
 /* Proxy certificate verification                                        */
 /* ------------------------------------------------------------------ */
 
+static void
+webdav_free_verify_resources(X509_STORE_CTX *vctx, X509_STORE *store,
+                             X509 *leaf)
+{
+    if (vctx)  X509_STORE_CTX_free(vctx);
+    if (store) X509_STORE_free(store);
+    if (leaf)  X509_free(leaf);
+    /* chain is owned by the SSL session — do not free */
+}
+
+/*
+ * Build an X509_STORE from the configured CA directory and/or file.
+ * Returns NULL on allocation failure or over-length paths.
+ */
+static X509_STORE *
+webdav_build_ca_store(ngx_log_t *log,
+                      ngx_http_xrootd_webdav_loc_conf_t *conf)
+{
+    X509_STORE *store;
+    char        cadir_buf[PATH_MAX];
+    char        cafile_buf[PATH_MAX];
+
+    store = X509_STORE_new();
+    if (store == NULL) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "xrootd_webdav: X509_STORE_new failed");
+        return NULL;
+    }
+
+    if (conf->cadir.len > 0) {
+        if (conf->cadir.len >= sizeof(cadir_buf)) {
+            X509_STORE_free(store);
+            return NULL;
+        }
+        ngx_memcpy(cadir_buf, conf->cadir.data, conf->cadir.len);
+        cadir_buf[conf->cadir.len] = '\0';
+        if (!X509_STORE_load_path(store, cadir_buf)) {
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                          "xrootd_webdav: failed to load CA directory \"%s\"",
+                          cadir_buf);
+        }
+    }
+
+    if (conf->cafile.len > 0) {
+        if (conf->cafile.len >= sizeof(cafile_buf)) {
+            X509_STORE_free(store);
+            return NULL;
+        }
+        ngx_memcpy(cafile_buf, conf->cafile.data, conf->cafile.len);
+        cafile_buf[conf->cafile.len] = '\0';
+        if (!X509_STORE_load_file(store, cafile_buf)) {
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                          "xrootd_webdav: failed to load CA file \"%s\"",
+                          cafile_buf);
+        }
+    }
+
+    if (conf->cadir.len == 0 && conf->cafile.len == 0) {
+        X509_STORE_set_default_paths(store);
+    }
+
+    return store;
+}
+
 static ngx_int_t
 webdav_verify_proxy_cert(ngx_http_request_t *r,
                          ngx_http_xrootd_webdav_loc_conf_t *conf)
@@ -683,8 +747,6 @@ webdav_verify_proxy_cert(ngx_http_request_t *r,
     X509_STORE_CTX   *vctx  = NULL;
     char             *dn    = NULL;
     int               ok    = 0;
-    char              cadir_buf[PATH_MAX];
-    char              cafile_buf[PATH_MAX];
 
     /* Check for cached result from a previous sub-request phase */
     ctx = ngx_http_get_module_ctx(r, ngx_http_xrootd_webdav_module);
@@ -702,7 +764,7 @@ webdav_verify_proxy_cert(ngx_http_request_t *r,
     if (r->connection->ssl == NULL) {
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                       "xrootd_webdav: non-TLS connection, cannot verify GSI");
-        goto done;
+        return NGX_HTTP_FORBIDDEN;
     }
 
     ssl  = r->connection->ssl->connection;
@@ -710,54 +772,22 @@ webdav_verify_proxy_cert(ngx_http_request_t *r,
     if (leaf == NULL) {
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "xrootd_webdav: no client certificate presented");
-        goto done;
+        return NGX_HTTP_FORBIDDEN;
     }
 
     /* chain includes the leaf at index 0 plus any intermediate certs */
     chain = SSL_get_peer_cert_chain(ssl);
 
-    /* Build a CA store from the configured cadir / cafile */
-    store = X509_STORE_new();
+    store = webdav_build_ca_store(r->connection->log, conf);
     if (store == NULL) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "xrootd_webdav: X509_STORE_new failed");
-        goto done;
-    }
-
-    if (conf->cadir.len > 0) {
-        if (conf->cadir.len >= sizeof(cadir_buf)) {
-            goto done;
-        }
-        ngx_memcpy(cadir_buf, conf->cadir.data, conf->cadir.len);
-        cadir_buf[conf->cadir.len] = '\0';
-        if (!X509_STORE_load_path(store, cadir_buf)) {
-            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                          "xrootd_webdav: failed to load CA directory \"%s\"",
-                          cadir_buf);
-        }
-    }
-
-    if (conf->cafile.len > 0) {
-        if (conf->cafile.len >= sizeof(cafile_buf)) {
-            goto done;
-        }
-        ngx_memcpy(cafile_buf, conf->cafile.data, conf->cafile.len);
-        cafile_buf[conf->cafile.len] = '\0';
-        if (!X509_STORE_load_file(store, cafile_buf)) {
-            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                          "xrootd_webdav: failed to load CA file \"%s\"",
-                          cafile_buf);
-        }
-    }
-
-    /* Fall back to system default CAs if nothing was configured */
-    if (conf->cadir.len == 0 && conf->cafile.len == 0) {
-        X509_STORE_set_default_paths(store);
+        webdav_free_verify_resources(NULL, NULL, leaf);
+        return NGX_HTTP_FORBIDDEN;
     }
 
     vctx = X509_STORE_CTX_new();
     if (vctx == NULL) {
-        goto done;
+        webdav_free_verify_resources(NULL, store, leaf);
+        return NGX_HTTP_FORBIDDEN;
     }
 
     /*
@@ -766,7 +796,8 @@ webdav_verify_proxy_cert(ngx_http_request_t *r,
      * leaf so we can pass it directly as the untrusted set.
      */
     if (!X509_STORE_CTX_init(vctx, store, leaf, chain)) {
-        goto done;
+        webdav_free_verify_resources(vctx, store, leaf);
+        return NGX_HTTP_FORBIDDEN;
     }
 
     /* Allow RFC 3820 proxy certificates */
@@ -783,7 +814,8 @@ webdav_verify_proxy_cert(ngx_http_request_t *r,
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                       "xrootd_webdav: proxy cert verification failed: %s",
                       X509_verify_cert_error_string(verr));
-        goto done;
+        webdav_free_verify_resources(vctx, store, leaf);
+        return NGX_HTTP_FORBIDDEN;
     }
 
     /* Extract the subject DN for logging / downstream use */
@@ -803,13 +835,8 @@ webdav_verify_proxy_cert(ngx_http_request_t *r,
                       "xrootd_webdav: GSI auth OK dn=\"%s\"", dn_log);
     }
 
-done:
-    if (vctx)  X509_STORE_CTX_free(vctx);
-    if (store) X509_STORE_free(store);
-    if (leaf)  X509_free(leaf);
-    /* chain is owned by the SSL session — do not free */
-
-    return ctx->verified ? NGX_OK : NGX_HTTP_FORBIDDEN;
+    webdav_free_verify_resources(vctx, store, leaf);
+    return NGX_OK;
 }
 
 /* ------------------------------------------------------------------ */

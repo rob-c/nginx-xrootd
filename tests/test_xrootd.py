@@ -8,7 +8,7 @@ Prerequisites:
   - nginx running: /tmp/nginx-1.28.3/objs/nginx -c /tmp/xrd-test/conf/nginx.conf
   - Test PKI at /tmp/xrd-test/pki/
   - Test data at /tmp/xrd-test/data/
-  - Proxy cert regenerated if expired: python3 /tmp/make_proxy.py
+  - Proxy cert regenerated if expired: python3 utils/make_proxy.py
 
 Run:
   pytest tests/test_xrootd.py -v

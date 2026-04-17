@@ -741,3 +741,133 @@ class TestRoundTrip:
         finally:
             if os.path.exists(dst_dir):
                 shutil.rmtree(dst_dir)
+
+
+# ---------------------------------------------------------------------------
+# WebDAV path traversal hardening
+# ---------------------------------------------------------------------------
+
+class TestWebdavTraversal:
+    """Path traversal attempts via WebDAV must be blocked."""
+
+    def test_get_dot_dot_traversal(self):
+        """GET /../etc/passwd must be blocked (403 or 400)."""
+        code = _http_code("--path-as-is", f"{BASE_URL}/../etc/passwd")
+        assert code in (400, 403, 404), f"expected rejection, got {code}"
+
+    def test_propfind_dot_dot_traversal(self):
+        """PROPFIND /../ must not leak the parent directory listing."""
+        code = _http_code(
+            "--path-as-is",
+            "-X", "PROPFIND", "-H", "Depth: 1",
+            f"{BASE_URL}/../",
+        )
+        assert code in (400, 403, 404), f"expected rejection, got {code}"
+
+    def test_put_dot_dot_escape(self):
+        """PUT /../escape.txt must not create a file outside the root."""
+        escaped = "/tmp/_webdav_escaped_file.txt"
+        try:
+            code = _http_code(
+                "--path-as-is",
+                "-X", "PUT",
+                "--data-binary", "escaped",
+                f"{BASE_URL}/../_webdav_escaped_file.txt",
+            )
+            assert code in (400, 403, 404), f"expected rejection, got {code}"
+            assert not os.path.exists(escaped), "file created outside root"
+        finally:
+            if os.path.exists(escaped):
+                os.unlink(escaped)
+
+    def test_delete_dot_dot_escape(self):
+        """DELETE /../ must not remove anything outside the root."""
+        code = _http_code(
+            "--path-as-is",
+            "-X", "DELETE",
+            f"{BASE_URL}/../",
+        )
+        assert code in (400, 403, 404), f"expected rejection, got {code}"
+
+    def test_symlink_traversal_via_get(self):
+        """A symlink under the root pointing outside must not be followed."""
+        link_name = f"{_PFX}symlink_escape"
+        link_path = _data_path(link_name)
+
+        with tempfile.TemporaryDirectory(prefix="webdav_escape_") as outside:
+            secret_file = os.path.join(outside, "secret.txt")
+            with open(secret_file, "w") as f:
+                f.write("leaked data\n")
+            os.symlink(outside, link_path)
+            try:
+                code = _http_code(f"{BASE_URL}/{link_name}/secret.txt")
+                # Server may follow the symlink (acceptable if within root)
+                # but the file is outside root so it should fail
+                if code == 200:
+                    body = _get(f"/{link_name}/secret.txt")
+                    assert body != b"leaked data\n", "symlink traversal leaked data"
+            finally:
+                if os.path.islink(link_path):
+                    os.unlink(link_path)
+
+    def test_propfind_depth1_symlink_escape(self):
+        """PROPFIND Depth:1 on a symlink-to-outside must not list external dirs."""
+        link_name = f"{_PFX}symlink_propfind"
+        link_path = _data_path(link_name)
+
+        with tempfile.TemporaryDirectory(prefix="webdav_pf_escape_") as outside:
+            with open(os.path.join(outside, "hidden.txt"), "w") as f:
+                f.write("hidden\n")
+            os.symlink(outside, link_path)
+            try:
+                code = _http_code(
+                    "-X", "PROPFIND", "-H", "Depth: 1",
+                    f"{BASE_URL}/{link_name}",
+                )
+                # If it succeeds, verify no outside content leaked
+                if code == 207:
+                    rc, out, _ = _curl(
+                        "-X", "PROPFIND", "-H", "Depth: 1",
+                        f"{BASE_URL}/{link_name}",
+                    )
+                    assert b"hidden.txt" not in out, "symlink PROPFIND leaked external file"
+            finally:
+                if os.path.islink(link_path):
+                    os.unlink(link_path)
+
+
+# ---------------------------------------------------------------------------
+# HTTP method restrictions
+# ---------------------------------------------------------------------------
+
+class TestMethodRestrictions:
+    """Unsupported HTTP methods must be cleanly rejected."""
+
+    def test_post_returns_405(self):
+        """POST is not a WebDAV method we support."""
+        code = _http_code(
+            "-X", "POST",
+            "--data-binary", "body",
+            f"{BASE_URL}/{_PFX}post_test.txt",
+        )
+        assert code == 405, f"POST should return 405, got {code}"
+
+    def test_patch_returns_405(self):
+        """PATCH is not supported."""
+        code = _http_code(
+            "-X", "PATCH",
+            "--data-binary", "body",
+            f"{BASE_URL}/{_PFX}patch_test.txt",
+        )
+        assert code == 405, f"PATCH should return 405, got {code}"
+
+    def test_propfind_invalid_depth_handled(self):
+        """PROPFIND with Depth: infinity may be rejected or limited."""
+        code = _http_code(
+            "-X", "PROPFIND",
+            "-H", "Depth: infinity",
+            f"{BASE_URL}/",
+        )
+        # RFC 4918: servers SHOULD reject Depth: infinity with 403
+        # but treating it as Depth:1 (207) is also acceptable
+        assert code in (207, 403), f"Depth:infinity got unexpected {code}"

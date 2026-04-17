@@ -76,16 +76,14 @@ xrootd_handle_write(xrootd_ctx_t *ctx, ngx_connection_t *c)
         if (ngx_thread_task_post(conf->thread_pool, task) != NGX_OK) {
             ngx_log_error(NGX_LOG_WARN, c->log, 0,
                           "xrootd: thread_task_post failed, falling back to sync write");
-            goto sync_write;
+        } else {
+            /* Completion callback will restore streamid/state and send the final reply. */
+            ctx->state = XRD_ST_AIO;
+            return NGX_OK;
         }
-
-        /* Completion callback will restore streamid/state and send the final reply. */
-        ctx->state = XRD_ST_AIO;
-        return NGX_OK;
     }
     } /* end NGX_THREADS block */
 
-sync_write:
 #endif /* NGX_THREADS */
 
     /* Synchronous fallback writes the request payload directly from the recv buffer. */

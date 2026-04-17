@@ -72,6 +72,12 @@ extern ngx_module_t ngx_stream_xrootd_module;
  */
 #define XROOTD_MAX_WRITE_PAYLOAD  (16 * 1024 * 1024)
 
+/*
+ * Maximum kXR_auth payload.  GSI certificate chains with VOMS attribute
+ * certificates can reach 8-10 KB depending on the CA chain depth.
+ */
+#define XROOTD_MAX_AUTH_PAYLOAD   (16 * 1024)
+
 /* TCP receive buffer (sized to hold the largest expected request) */
 #define XROOTD_RECV_BUF      (XROOTD_MAX_PATH + XRD_REQUEST_HDR_LEN + 64)
 

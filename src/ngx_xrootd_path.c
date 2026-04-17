@@ -149,8 +149,8 @@ xrootd_append_vo_token(char *primary_vo, size_t primary_vo_sz,
             return 0;
         }
 
-        ngx_cpystrn((u_char *) vo_list, (const u_char *) vo, vo_list_sz);
-        ngx_cpystrn((u_char *) primary_vo, (const u_char *) vo, primary_vo_sz);
+        ngx_cpystrn((u_char *) vo_list, (u_char *) vo, vo_list_sz);
+        ngx_cpystrn((u_char *) primary_vo, (u_char *) vo, primary_vo_sz);
         return 1;
     }
 
@@ -191,6 +191,54 @@ xrootd_fqan_to_vo(const char *fqan, char *vo, size_t vo_sz)
     return 1;
 }
 
+/*
+ * Iterate VOMS attribute data and collect VO names into primary_vo/vo_list.
+ * Returns NGX_OK if at least one VO was found, NGX_ERROR on overflow,
+ * NGX_DECLINED if no VOs were present.
+ */
+static ngx_int_t
+xrootd_collect_voms_vos(struct vomsdata *vd,
+                        char *primary_vo, size_t primary_vo_sz,
+                        char *vo_list, size_t vo_list_sz)
+{
+    struct voms **entry;
+
+    if (vd->data == NULL) {
+        return NGX_DECLINED;
+    }
+
+    for (entry = vd->data; *entry != NULL; entry++) {
+        char **fqan;
+        char   derived_vo[128];
+
+        if ((*entry)->voname != NULL && (*entry)->voname[0] != '\0') {
+            if (!xrootd_append_vo_token(primary_vo, primary_vo_sz,
+                                        vo_list, vo_list_sz,
+                                        (*entry)->voname)) {
+                return NGX_ERROR;
+            }
+        }
+
+        if ((*entry)->fqan == NULL) {
+            continue;
+        }
+
+        for (fqan = (*entry)->fqan; *fqan != NULL; fqan++) {
+            if (!xrootd_fqan_to_vo(*fqan, derived_vo, sizeof(derived_vo))) {
+                continue;
+            }
+
+            if (!xrootd_append_vo_token(primary_vo, primary_vo_sz,
+                                        vo_list, vo_list_sz,
+                                        derived_vo)) {
+                return NGX_ERROR;
+            }
+        }
+    }
+
+    return (vo_list != NULL && vo_list[0] != '\0') ? NGX_OK : NGX_DECLINED;
+}
+
 ngx_int_t
 xrootd_extract_voms_info(ngx_log_t *log, X509 *leaf, STACK_OF(X509) *chain,
                          const ngx_str_t *vomsdir, const ngx_str_t *cert_dir,
@@ -198,7 +246,6 @@ xrootd_extract_voms_info(ngx_log_t *log, X509 *leaf, STACK_OF(X509) *chain,
                          char *vo_list, size_t vo_list_sz)
 {
     struct vomsdata *vd;
-    struct voms    **entry;
     STACK_OF(X509)  *voms_chain = NULL;
     char             vomsdir_buf[PATH_MAX];
     char             cert_dir_buf[PATH_MAX];
@@ -254,49 +301,11 @@ xrootd_extract_voms_info(ngx_log_t *log, X509 *leaf, STACK_OF(X509) *chain,
                           VOMS_ErrorMessage(vd, error, errbuf, sizeof(errbuf)));
             rc = NGX_ERROR;
         }
-        goto done;
+    } else {
+        rc = xrootd_collect_voms_vos(vd, primary_vo, primary_vo_sz,
+                                     vo_list, vo_list_sz);
     }
 
-    if (vd->data == NULL) {
-        goto done;
-    }
-
-    for (entry = vd->data; *entry != NULL; entry++) {
-        char **fqan;
-        char   derived_vo[128];
-
-        if ((*entry)->voname != NULL && (*entry)->voname[0] != '\0') {
-            if (!xrootd_append_vo_token(primary_vo, primary_vo_sz,
-                                        vo_list, vo_list_sz,
-                                        (*entry)->voname)) {
-                rc = NGX_ERROR;
-                goto done;
-            }
-        }
-
-        if ((*entry)->fqan == NULL) {
-            continue;
-        }
-
-        for (fqan = (*entry)->fqan; *fqan != NULL; fqan++) {
-            if (!xrootd_fqan_to_vo(*fqan, derived_vo, sizeof(derived_vo))) {
-                continue;
-            }
-
-            if (!xrootd_append_vo_token(primary_vo, primary_vo_sz,
-                                        vo_list, vo_list_sz,
-                                        derived_vo)) {
-                rc = NGX_ERROR;
-                goto done;
-            }
-        }
-    }
-
-    if (vo_list != NULL && vo_list[0] != '\0') {
-        rc = NGX_OK;
-    }
-
-done:
     if (voms_chain != NULL) {
         sk_X509_free(voms_chain);
     }

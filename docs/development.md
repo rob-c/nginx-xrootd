@@ -20,6 +20,15 @@
 
 The `tests/` directory covers client interoperability, throughput, bridge transfers, GSI, WebDAV, metrics, and security regressions.
 
+The `utils/` directory contains standalone helper scripts used during development and testing. See [`utils/README.md`](../utils/README.md) for full usage details.
+
+| Script | Purpose |
+|---|---|
+| `utils/make_proxy.py` | Generate RFC 3820 GSI proxy certificates — called by the test suite when proxies expire |
+| `utils/xrd_proxy.py` | TCP relay that hex-dumps XRootD protocol traffic for wire-level debugging |
+| `utils/xrd_ref_server.py` | Minimal reference XRootD data server for calibrating client behaviour |
+| `utils/xrd_sec_probe.py` | Adversarial security probe (44 tests): lockups, auth bypass, path traversal, resource exhaustion |
+
 ---
 
 ## Development workflow

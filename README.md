@@ -96,12 +96,15 @@ Full setup: [docs/getting-started.md](docs/getting-started.md)
 | | |
 |---|---|
 | [Getting started](docs/getting-started.md) | Build, install, first working server |
+| [Building from scratch](docs/building.md) | Detailed build guide with all dependencies |
 | [Configuration reference](docs/configuration.md) | All directives |
 | [WebDAV / HTTPS+GSI](docs/webdav.md) | WebDAV setup and xrdcp compatibility |
 | [Authentication](docs/authentication.md) | Anonymous and GSI/x509 setup |
+| [Test PKI & VOMS](docs/test-pki.md) | Generate test CA, certs, proxies, and VOMS infrastructure |
 | [Operations](docs/operations.md) | Supported XRootD operations |
 | [Metrics & logging](docs/metrics-and-logging.md) | Prometheus metrics, access log format |
-| [Development](docs/development.md) | Source layout, workflow, known quirks |
+| [Development](docs/development.md) | Source layout, utilities, workflow, known quirks |
+| [Utilities](utils/README.md) | Test and debug tools: proxy generator, protocol dumper, reference server, security probe |
 | [Background](docs/background.md) | What XRootD is and why this module exists |
 | [Protocol notes](docs/protocol-notes.md) | Wire-protocol details for developers |
 
@@ -109,7 +112,7 @@ Full setup: [docs/getting-started.md](docs/getting-started.md)
 
 ## Status
 
-302 tests pass against xrdcp / XRootD Python client v5.9.2 and nginx 1.28.3.
+413 tests pass against xrdcp / XRootD Python client v5.9.2 and nginx 1.28.3.
 
 ## License
 

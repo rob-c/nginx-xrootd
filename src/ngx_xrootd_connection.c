@@ -145,7 +145,7 @@ ngx_stream_xrootd_recv(ngx_event_t *rev)
         if (ctx->state == XRD_ST_AIO) {
             /* A worker thread owns the request; just keep the read event armed. */
             if (ngx_handle_read_event(rev, 0) != NGX_OK) {
-                goto fatal;
+                break;
             }
             return;
         }
@@ -171,66 +171,57 @@ ngx_stream_xrootd_recv(ngx_event_t *rev)
             need  = ctx->cur_dlen - ctx->payload_pos;
         }
 
-        if (need == 0) {
-            /* Exact-size frame already assembled; process it without another recv(). */
-            goto process;
-        }
+        if (need > 0) {
+            /*
+             * Ask the socket for exactly the remaining bytes needed for the
+             * current frame fragment.  The state machine tracks any short
+             * read explicitly.
+             */
+            rev->available = -1;
+            n = c->recv(c, dest, need);
 
-        /*
-         * Ask the socket for exactly the remaining bytes needed for the current
-         * frame fragment. The state machine tracks any short read explicitly.
-         */
-        /* Ignore any stale "available" hint and ask recv() directly. */
-        rev->available = -1;
-        n = c->recv(c, dest, need);
-
-        if (n == NGX_AGAIN) {
-            /* Socket input is drained for now; wait until nginx marks it readable again. */
-            ngx_log_error(NGX_LOG_INFO, c->log, 0,
-                          "xrootd: recv AGAIN st=%d hdr_pos=%uz avail=%d"
-                          " ready=%d active=%d",
-                          (int)ctx->state, ctx->hdr_pos,
-                          rev->available, (int)rev->ready, (int)rev->active);
-            if (ngx_handle_read_event(rev, 0) != NGX_OK) {
-                goto fatal;
+            if (n == NGX_AGAIN) {
+                ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                              "xrootd: recv AGAIN st=%d hdr_pos=%uz avail=%d"
+                              " ready=%d active=%d",
+                              (int)ctx->state, ctx->hdr_pos,
+                              rev->available, (int)rev->ready, (int)rev->active);
+                if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+                    break;
+                }
+                return;
             }
-            return;
+
+            if (n == NGX_ERROR || n == 0) {
+                ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                               "xrootd: client disconnected");
+                xrootd_on_disconnect(ctx, c);
+                xrootd_close_all_files(ctx);
+                ngx_stream_finalize_session(s, NGX_STREAM_OK);
+                return;
+            }
+
+            avail = (size_t) n;
+
+            if (ctx->state == XRD_ST_HANDSHAKE) {
+                ctx->hdr_pos += avail;
+            } else if (ctx->state == XRD_ST_REQ_HEADER) {
+                ctx->hdr_pos += avail;
+            } else {
+                ctx->payload_pos += avail;
+            }
+
+            if (avail < need) {
+                continue;
+            }
         }
 
-        if (n == NGX_ERROR || n == 0) {
-            ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
-                           "xrootd: client disconnected");
-            /* EOF and hard recv failure both translate to connection teardown. */
-            xrootd_on_disconnect(ctx, c);
-            xrootd_close_all_files(ctx);
-            ngx_stream_finalize_session(s, NGX_STREAM_OK);
-            return;
-        }
-
-        avail = (size_t) n;
-
-        if (ctx->state == XRD_ST_HANDSHAKE) {
-            /* Handshake bytes accumulate in the same hdr_buf used for later headers. */
-            ctx->hdr_pos += avail;
-        } else if (ctx->state == XRD_ST_REQ_HEADER) {
-            ctx->hdr_pos += avail;
-        } else {
-            /* Payload state tracks a separate cursor because payload can be much larger. */
-            ctx->payload_pos += avail;
-        }
-
-        if (avail < need) {
-            /* Partial frame: stay in the same state and wait for more bytes. */
-            continue;
-        }
-
-process:
-    /* The current handshake/header/payload frame is complete; act on it now. */
+        /* The current handshake/header/payload frame is complete; act on it now. */
         if (ctx->state == XRD_ST_HANDSHAKE) {
 
             rc = xrootd_process_handshake(ctx, c);
             if (rc != NGX_OK) {
-                goto fatal;
+                break;
             }
             /* Handshake succeeded; all further traffic is 24-byte request headers. */
             ctx->state   = XRD_ST_REQ_HEADER;
@@ -267,6 +258,9 @@ process:
                     max_pl = XROOTD_MAX_WRITE_PAYLOAD;
                 } else if (ctx->cur_reqid == kXR_readv) {
                     max_pl = XROOTD_READV_MAXSEGS * XROOTD_READV_SEGSIZE;
+                } else if (ctx->cur_reqid == kXR_auth) {
+                    /* GSI cert chains with VOMS extensions can exceed 4 KB. */
+                    max_pl = XROOTD_MAX_AUTH_PAYLOAD;
                 } else {
                     max_pl = XROOTD_MAX_PATH + 64;
                 }
@@ -275,7 +269,7 @@ process:
                     ngx_log_error(NGX_LOG_WARN, c->log, 0,
                                   "xrootd: payload too large (%uz), closing",
                                   (size_t) ctx->cur_dlen);
-                    goto fatal;
+                    break;
                 }
             }
 
@@ -287,7 +281,7 @@ process:
                  */
                 ctx->payload = ngx_palloc(c->pool, ctx->cur_dlen + 1);
                 if (ctx->payload == NULL) {
-                    goto fatal;
+                    break;
                 }
                 /* The spare byte is for local convenience only, never sent back on the wire. */
                 ctx->payload[ctx->cur_dlen] = '\0';
@@ -303,13 +297,13 @@ process:
             ctx->payload = NULL;
             rc = xrootd_dispatch(ctx, c, conf);
             if (rc == NGX_ERROR) {
-                goto fatal;
+                break;
             }
 
             if (ctx->state == XRD_ST_AIO) {
                 /* The handler posted background work; the completion callback resumes. */
                 if (ngx_handle_read_event(rev, 0) != NGX_OK) {
-                    goto fatal;
+                    break;
                 }
                 return;
             }
@@ -327,7 +321,7 @@ process:
 
             rc = xrootd_dispatch(ctx, c, conf);
             if (rc == NGX_ERROR) {
-                goto fatal;
+                break;
             }
 
             if (ctx->state == XRD_ST_SENDING) {
@@ -339,7 +333,7 @@ process:
         }
     }
 
-fatal:
+    /* Fatal error — tear down the connection. */
     xrootd_on_disconnect(ctx, c);
     xrootd_close_all_files(ctx);
     ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
