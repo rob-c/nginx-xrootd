@@ -38,7 +38,7 @@ scrape_configs:
 
 Metrics are shared across all nginx worker processes via shared memory and updated atomically. They survive `nginx -s reload` (counters are preserved across config reloads).
 
-Client-controlled strings are not used as Prometheus label values. Exported labels come from server configuration (`port`, `auth`) and the fixed operation table (`op`, `status`).
+Client-controlled strings are not used as Prometheus label values. Exported labels come from server configuration (`port`, `auth`) and the fixed operation table (`op`, `status`). The current `auth` metric label is `gsi` for GSI-only listeners and `anon` for all non-GSI-only listeners, including token and mixed listeners.
 
 ---
 
@@ -100,7 +100,7 @@ xrootd_requests_total{port="1094",auth="anon",op="close",status="ok"} 8314
 xrootd_requests_total{port="1094",auth="anon",op="open_rd",status="error"} 12
 ```
 
-Operations tracked (`op` label values): `login`, `auth`, `stat`, `open_rd`, `open_wr`, `read`, `write`, `sync`, `close`, `dirlist`, `mkdir`, `rmdir`, `rm`, `mv`, `chmod`, `truncate`, `ping`
+Operations tracked (`op` label values): `login`, `auth`, `stat`, `open_rd`, `open_wr`, `read`, `write`, `sync`, `close`, `dirlist`, `mkdir`, `rmdir`, `rm`, `mv`, `chmod`, `truncate`, `ping`, `query_cksum`, `query_space`, `readv`
 
 Error series (`status="error"`) are omitted from the output when the count is zero — this keeps the scrape output short when errors are rare.
 
@@ -160,8 +160,8 @@ Before any client-controlled text is written, the logger escapes whitespace, con
 | Field | Meaning |
 |---|---|
 | `ip` | Client IP address |
-| `auth` | `anon` or `gsi` |
-| `identity` | X.509 subject DN for GSI connections; `-` for anonymous or before authentication completes. Unsafe bytes are escaped as `\xNN`. |
+| `auth` | `gsi` for GSI-only listeners; `anon` for anonymous, token, and mixed listeners in the current implementation |
+| `identity` | X.509 subject DN for GSI-only connections; `-` for anonymous, token, mixed, or before authentication completes. Unsafe bytes are escaped as `\xNN`. |
 | `timestamp` | `DD/Mon/YYYY:HH:MM:SS +ZZZZ` |
 | `verb` | Operation name — see table below |
 | `path` | Resolved filesystem path, or `-` for session-level operations. Unsafe bytes are escaped as `\xNN`. |
@@ -190,6 +190,8 @@ Before any client-controlled text is written, the logger escapes whitespace, con
 | `MV` | File renamed | `-` |
 | `CHMOD` | Permissions changed | `-` |
 | `PING` | Liveness check | `-` |
+| `QUERY` | Checksum, space, or config query | `cksum`, `space`, or query-specific detail |
+| `READV` | Vector read | Segment count, e.g. `3_segs` |
 | `DISCONNECT` | Connection closed | Session summary: `rx=N.NNMiB/s tx=N.NNMiB/s` |
 
 ### Example log lines

@@ -2,7 +2,7 @@
 
 An nginx module that serves files over both the native [XRootD](https://xrootd.slac.stanford.edu/) `root://` protocol and WebDAV over HTTPS — the two transfer paths used by `xrdcp`, `xrdfs`, and the Python XRootD client across High Energy Physics (CERN, SLAC, Fermilab).
 
-Instead of running a separate `xrootd` daemon, you add this module to your existing nginx and get XRootD plus everything nginx already provides: TLS, access controls, rate limiting, load balancing, Prometheus metrics.
+Instead of running a separate `xrootd` daemon, you add this module to your existing nginx and get XRootD plus everything nginx already provides: TLS, access controls, rate limiting, load balancing, Prometheus metrics, and shared GSI/JWT authentication plumbing.
 
 > **New to XRootD?** See [docs/background.md](docs/background.md).
 
@@ -15,7 +15,7 @@ Instead of running a separate `xrootd` daemon, you add this module to your exist
 | XRootD `root://` (stream) | 1094 / 1095 | `xrdcp`, `xrdfs`, Python client |
 | WebDAV over HTTPS (`davs://`) | 8443 | `xrdcp --allow-http`, HTTP clients |
 
-Both protocols support anonymous and GSI/x509 proxy-certificate authentication.
+Both protocols support anonymous access, GSI/x509 proxy-certificate authentication, and WLCG/JWT bearer-token authentication when configured.
 
 ---
 
@@ -85,7 +85,7 @@ Full setup: [docs/getting-started.md](docs/getting-started.md)
 
 - **XRootD operations:** `stat`, `open`, `read`, `readv`, `close`, `mkdir`, `rm`, `rmdir`, `mv`, `chmod`, `truncate`, checksum and space queries
 - **WebDAV operations:** OPTIONS, GET (with Range), HEAD, PUT, DELETE, MKCOL, PROPFIND — the full set required by `xrdcp` via `davs://`
-- **Authentication:** anonymous or GSI/x509 proxy certificates on both protocols
+- **Authentication:** anonymous access, GSI/x509 proxy certificates, and WLCG/JWT bearer tokens
 - **Async I/O:** nginx thread-pool support so disk operations never block the event loop
 - **Observability:** per-request access logs and Prometheus metrics
 
@@ -98,13 +98,14 @@ Full setup: [docs/getting-started.md](docs/getting-started.md)
 | [Getting started](docs/getting-started.md) | Build, install, first working server |
 | [Building from scratch](docs/building.md) | Detailed build guide with all dependencies |
 | [Configuration reference](docs/configuration.md) | All directives |
-| [WebDAV / HTTPS+GSI](docs/webdav.md) | WebDAV setup and xrdcp compatibility |
-| [Authentication](docs/authentication.md) | Anonymous and GSI/x509 setup |
+| [WebDAV / HTTPS+GSI/Bearer](docs/webdav.md) | WebDAV setup, x509 proxy, and bearer-token compatibility |
+| [Authentication](docs/authentication.md) | Anonymous, GSI/x509, and WLCG/JWT setup |
 | [Test PKI & VOMS](docs/test-pki.md) | Generate test CA, certs, proxies, and VOMS infrastructure |
+| [Test tokens](docs/test-tokens.md) | Generate local WLCG/JWT signing keys and bearer tokens |
 | [Operations](docs/operations.md) | Supported XRootD operations |
 | [Metrics & logging](docs/metrics-and-logging.md) | Prometheus metrics, access log format |
 | [Development](docs/development.md) | Source layout, utilities, workflow, known quirks |
-| [Utilities](utils/README.md) | Test and debug tools: proxy generator, protocol dumper, reference server, security probe |
+| [Utilities](utils/README.md) | Test and debug tools: proxy/token/CRL generators, protocol dumper, reference server, security probe |
 | [Background](docs/background.md) | What XRootD is and why this module exists |
 | [Protocol notes](docs/protocol-notes.md) | Wire-protocol details for developers |
 
@@ -112,7 +113,7 @@ Full setup: [docs/getting-started.md](docs/getting-started.md)
 
 ## Status
 
-413 tests pass against xrdcp / XRootD Python client v5.9.2 and nginx 1.28.3.
+The Python suite currently collects 459 tests for xrdcp / XRootD Python client v5.9.2 and nginx 1.28.3. Run `pytest -v` against the test nginx layout in [docs/building.md](docs/building.md) for a full pass/fail result.
 
 ## License
 

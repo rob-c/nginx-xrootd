@@ -1,6 +1,6 @@
 # Configuration reference
 
-All `xrootd_*` directives go inside a `server {}` block in the `stream {}` section of `nginx.conf`. Each `server {}` block is a separate XRootD endpoint and can have its own settings.
+Native XRootD stream directives go inside a `server {}` block in the `stream {}` section of `nginx.conf`. Each `server {}` block is a separate XRootD endpoint and can have its own settings. HTTP/WebDAV and metrics directives are summarized at the end of this page.
 
 ---
 
@@ -52,7 +52,7 @@ xrootd_allow_write on;   # allow uploads and deletes
 
 ---
 
-### `xrootd_auth none|gsi`
+### `xrootd_auth none|gsi|token|both`
 
 **Default:** `none`
 
@@ -60,6 +60,8 @@ Authentication mode:
 
 - `none` — accept any username, no credentials required
 - `gsi` — require a valid x509 proxy certificate (see [Authentication](authentication.md))
+- `token` — require a valid WLCG/JWT bearer token using the `ztn` security protocol
+- `both` — accept either GSI or bearer-token credentials on the same listener
 
 ```nginx
 xrootd_auth gsi;
@@ -69,7 +71,7 @@ xrootd_auth gsi;
 
 ### `xrootd_certificate <path>`
 
-Path to the server's PEM certificate file. Required when `xrootd_auth gsi`.
+Path to the server's PEM certificate file. Required when `xrootd_auth gsi` or `xrootd_auth both`.
 
 ```nginx
 xrootd_certificate /etc/grid-security/hostcert.pem;
@@ -79,7 +81,7 @@ xrootd_certificate /etc/grid-security/hostcert.pem;
 
 ### `xrootd_certificate_key <path>`
 
-Path to the server's PEM private key file. Required when `xrootd_auth gsi`.
+Path to the server's PEM private key file. Required when `xrootd_auth gsi` or `xrootd_auth both`.
 
 ```nginx
 xrootd_certificate_key /etc/grid-security/hostkey.pem;
@@ -89,10 +91,62 @@ xrootd_certificate_key /etc/grid-security/hostkey.pem;
 
 ### `xrootd_trusted_ca <path>`
 
-Path to a PEM file containing the CA certificate (or bundle of CA certificates) that the server trusts for verifying client proxy certificates. Required when `xrootd_auth gsi`.
+Path to a PEM file containing the CA certificate (or bundle of CA certificates) that the server trusts for verifying client proxy certificates. Required when `xrootd_auth gsi` or `xrootd_auth both`.
 
 ```nginx
 xrootd_trusted_ca /etc/grid-security/certificates/ca.pem;
+```
+
+---
+
+### `xrootd_crl <path>`
+
+Path to a PEM CRL file or a directory containing CRLs. Directory mode scans `*.pem` and grid-style `*.r0` through `*.r9` files. When configured, GSI verification enables OpenSSL CRL checks for the full certificate chain.
+
+```nginx
+xrootd_crl /etc/grid-security/certificates;
+```
+
+---
+
+### `xrootd_crl_reload <seconds>`
+
+**Default:** `0` (disabled)
+
+How often each worker reloads `xrootd_crl` and rebuilds its GSI trust store. A failed reload keeps the previous store in place.
+
+```nginx
+xrootd_crl_reload 300;  # reload CRLs every five minutes
+```
+
+---
+
+### `xrootd_token_jwks <path>`
+
+Path to a JWKS file containing public keys trusted for JWT/WLCG bearer-token validation. Used when `xrootd_auth token` or `xrootd_auth both` is configured.
+
+```nginx
+xrootd_token_jwks /etc/tokens/jwks.json;
+```
+
+---
+
+### `xrootd_token_issuer <string>`
+
+Expected JWT `iss` claim. Tokens from other issuers are rejected.
+
+```nginx
+xrootd_token_issuer "https://idp.example.com";
+```
+
+---
+
+### `xrootd_token_audience <string>`
+
+Expected JWT `aud` claim. Tokens for other services are rejected.
+
+```nginx
+xrootd_token_audience "my-storage";
 ```
 
 ---
@@ -139,7 +193,7 @@ How many threads to use: a good starting point is one thread per disk spindle, o
 
 ### `xrootd_vomsdir <path>`
 
-Path to the directory containing VOMS server information (`.lsc` files), one per VO. Required when `xrootd_require_vo` is used. Compile-time `XROOTD_HAVE_VOMS` flag must be set.
+Path to the directory containing VOMS server information (`.lsc` files), one per VO. Required when `xrootd_require_vo` is used. Requires `libvomsapi.so.1` at runtime (install `voms-libs` on EL9 or `libvomsapi1` on Debian/Ubuntu).
 
 ```nginx
 xrootd_vomsdir /etc/voms;
@@ -159,16 +213,16 @@ xrootd_voms_cert_dir /etc/grid-security/certificates;
 
 ### `xrootd_require_vo <path> <vo>`
 
-Restricts access to `<path>` (and all descendants) to clients whose VOMS proxy certificate includes membership in `<vo>`. Can be specified multiple times for different paths.
+Restricts access to `<path>` (and all descendants) to clients whose VO list includes `<vo>`. For GSI, the VO list comes from VOMS proxy attributes. For token authentication, `wlcg.groups` claims are mapped into the same VO list. Can be specified multiple times for different paths.
 
-`xrootd_auth gsi` and VOMS support (`XROOTD_HAVE_VOMS`) must be enabled.
+`xrootd_auth gsi`, `xrootd_auth token`, or `xrootd_auth both` must be enabled, and `libvomsapi.so.1` must be available at runtime. The directive also requires `xrootd_vomsdir` and `xrootd_voms_cert_dir` because the same ACL machinery is used for GSI and token groups.
 
 ```nginx
 xrootd_require_vo /atlas atlas;   # only ATLAS members can access /atlas
 xrootd_require_vo /cms   cms;     # only CMS members can access /cms
 ```
 
-If a client authenticated with GSI but has no VOMS extensions, they have an empty VO list and will be denied access to any protected path.
+If a GSI client has no VOMS extensions, or a token client has no matching `wlcg.groups`, the VO list is empty and access to protected paths is denied.
 
 ---
 
@@ -267,6 +321,35 @@ With `setgid` on the top-level directories (set once with `chmod g+s /ceph/store
 
 ---
 
+### Token-authenticated stream listener
+
+```nginx
+worker_processes auto;
+thread_pool default threads=4 max_queue=65536;
+
+events { worker_connections 1024; }
+
+stream {
+    server {
+        listen 1096;
+        xrootd on;
+        xrootd_root /data/token;
+        xrootd_auth token;
+        xrootd_allow_write on;
+
+        xrootd_token_jwks     /etc/tokens/jwks.json;
+        xrootd_token_issuer   "https://idp.example.com";
+        xrootd_token_audience "my-storage";
+
+        xrootd_access_log /var/log/nginx/xrootd_token.log;
+    }
+}
+```
+
+Native stream token auth validates the JWT and stores the `sub`, `scope`, and `wlcg.groups` claims. Native stream write access is still controlled by `xrootd_allow_write`; `storage.read` and `storage.write` scopes are not currently enforced per path on the stream protocol. Use `xrootd_require_vo` with `wlcg.groups` for path ACLs.
+
+---
+
 ### Two ports: read-only anonymous + read-write GSI-authenticated
 
 ```nginx
@@ -318,14 +401,19 @@ http {
 | `xrootd on\|off` | `server` (stream) | `off` | Yes |
 | `xrootd_root <path>` | `server` | `/` | Recommended |
 | `xrootd_allow_write on\|off` | `server` | `off` | No |
-| `xrootd_auth none\|gsi` | `server` | `none` | No |
-| `xrootd_certificate <path>` | `server` | — | If `auth gsi` |
-| `xrootd_certificate_key <path>` | `server` | — | If `auth gsi` |
-| `xrootd_trusted_ca <path>` | `server` | — | If `auth gsi` |
+| `xrootd_auth none\|gsi\|token\|both` | `server` | `none` | No |
+| `xrootd_certificate <path>` | `server` | — | If `auth gsi` or `auth both` |
+| `xrootd_certificate_key <path>` | `server` | — | If `auth gsi` or `auth both` |
+| `xrootd_trusted_ca <path>` | `server` | — | If `auth gsi` or `auth both` |
+| `xrootd_crl <path>` | `server` | — | No |
+| `xrootd_crl_reload <seconds>` | `server` | `0` | No |
 | `xrootd_vomsdir <path>` | `server` | — | If `require_vo` |
 | `xrootd_voms_cert_dir <path>` | `server` | — | If `require_vo` |
 | `xrootd_require_vo <path> <vo>` | `server` | — | No |
 | `xrootd_inherit_parent_group <path>` | `server` | — | No |
+| `xrootd_token_jwks <path>` | `server` | — | If `auth token` or `auth both` |
+| `xrootd_token_issuer <string>` | `server` | — | If token JWKS is configured |
+| `xrootd_token_audience <string>` | `server` | — | If token JWKS is configured |
 | `xrootd_access_log <path>\|off` | `server` | `off` | No |
 | `xrootd_thread_pool <name>` | `server` | `default` | No |
 | `xrootd_metrics on\|off` | `location` (HTTP) | `off` | No |
@@ -339,10 +427,14 @@ The WebDAV module (`ngx_http_xrootd_webdav_module`) handles `davs://` clients in
 | Directive | Context | Default | Notes |
 |---|---|---|---|
 | `xrootd_webdav on\|off` | `location` | `off` | Activates WebDAV handler |
-| `xrootd_webdav_root <path>` | `location` | — | Filesystem root for clients |
-| `xrootd_webdav_auth none\|optional\|required` | `location` | `none` | Client cert policy |
+| `xrootd_webdav_root <path>` | `location` | `/` | Filesystem root for clients |
+| `xrootd_webdav_auth none\|optional\|required` | `location` | `optional` | Proxy-cert or bearer-token auth policy |
 | `xrootd_webdav_cadir <path>` | `location` | — | Hashed CA directory |
 | `xrootd_webdav_cafile <path>` | `location` | — | Single CA PEM file |
+| `xrootd_webdav_crl <path>` | `location` | — | PEM CRL file for proxy-cert revocation checks |
 | `xrootd_webdav_allow_write on\|off` | `location` | `off` | Enable PUT/DELETE/MKCOL |
-| `xrootd_webdav_proxy_certs on\|off` | `server` (HTTP) | `off` | Accept RFC 3820 proxy certs |
+| `xrootd_webdav_proxy_certs on\|off` | `server` or `location` (HTTP) | `off` | Accept RFC 3820 proxy certs |
 | `xrootd_webdav_verify_depth <n>` | `location` | `10` | Proxy chain depth limit |
+| `xrootd_webdav_token_jwks <path>` | `location` | — | JWKS for Bearer tokens |
+| `xrootd_webdav_token_issuer <string>` | `location` | — | Expected token issuer |
+| `xrootd_webdav_token_audience <string>` | `location` | — | Expected token audience |

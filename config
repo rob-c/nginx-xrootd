@@ -1,18 +1,10 @@
 # nginx module config — XRootD stream module + Prometheus metrics HTTP module
 # Requires: --with-stream
 # Uses OpenSSL (via -lssl -lcrypto) for GSI x509 authentication
+# VOMS support: loaded at runtime via dlopen(libvomsapi.so.1) — no compile-time
+# link needed.  Install voms-libs on EL9 to enable VO ACL enforcement.
 
 ngx_addon_name=ngx_stream_xrootd_module
-
-XROOTD_VOMS_CFLAGS=
-XROOTD_VOMS_LIBS=
-XROOTD_VOMS_DEFINES=
-
-if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists voms-2.0; then
-    XROOTD_VOMS_CFLAGS=`pkg-config --cflags voms-2.0`
-    XROOTD_VOMS_LIBS=`pkg-config --libs voms-2.0`
-    XROOTD_VOMS_DEFINES="-DXROOTD_HAVE_VOMS=1"
-fi
 
 # Build both the stream module and the companion HTTP metrics module
 ngx_module_type=STREAM
@@ -23,14 +15,15 @@ ngx_module_srcs="$ngx_addon_dir/src/ngx_stream_xrootd_module.c \
                  $ngx_addon_dir/src/ngx_xrootd_handshake.c \
                  $ngx_addon_dir/src/ngx_xrootd_session.c \
                  $ngx_addon_dir/src/ngx_xrootd_gsi.c \
+                 $ngx_addon_dir/src/ngx_xrootd_token.c \
                  $ngx_addon_dir/src/ngx_xrootd_read_handlers.c \
                  $ngx_addon_dir/src/ngx_xrootd_write_handlers.c \
                  $ngx_addon_dir/src/ngx_xrootd_aio.c \
                  $ngx_addon_dir/src/ngx_xrootd_response.c \
-                 $ngx_addon_dir/src/ngx_xrootd_path.c"
-ngx_module_cflags="$XROOTD_VOMS_CFLAGS $XROOTD_VOMS_DEFINES"
-ngx_module_libs="-lssl -lcrypto $XROOTD_VOMS_LIBS"
-CORE_LIBS="$CORE_LIBS -lssl -lcrypto $XROOTD_VOMS_LIBS"
+                 $ngx_addon_dir/src/ngx_xrootd_path.c \
+                 $ngx_addon_dir/src/ngx_xrootd_voms.c"
+ngx_module_libs="-lssl -lcrypto"
+CORE_LIBS="$CORE_LIBS -lssl -lcrypto"
 . auto/module
 
 ngx_module_type=HTTP
@@ -42,6 +35,5 @@ ngx_module_libs=
 ngx_module_type=HTTP
 ngx_module_name=ngx_http_xrootd_webdav_module
 ngx_module_srcs="$ngx_addon_dir/src/ngx_http_xrootd_webdav_module.c"
-ngx_module_cflags="$XROOTD_VOMS_CFLAGS $XROOTD_VOMS_DEFINES"
-ngx_module_libs="-lssl -lcrypto $XROOTD_VOMS_LIBS"
+ngx_module_libs="-lssl -lcrypto"
 . auto/module

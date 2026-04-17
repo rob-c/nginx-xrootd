@@ -32,12 +32,11 @@
 #include <openssl/param_build.h>
 #include <openssl/core_names.h>
 
-#if defined(XROOTD_HAVE_VOMS)
-#include <voms/voms_apic.h>
-#endif
+/* VOMS support is loaded at runtime via dlopen; no compile-time header needed */
 
 #include "xrootd_protocol.h"
 #include "ngx_xrootd_metrics.h"
+#include "ngx_xrootd_token.h"
 
 #if (NGX_THREADS)
 #include <ngx_thread_pool.h>
@@ -171,6 +170,11 @@ typedef struct {
     /* GSI handshake state */
     EVP_PKEY  *gsi_dh_key;   /* freed after kXGC_cert processing */
 
+    /* Token authentication state */
+    int                   token_auth;  /* 1 if authenticated via bearer token */
+    int                   token_scope_count;
+    xrootd_token_scope_t  token_scopes[XROOTD_MAX_TOKEN_SCOPES];
+
     /* Per-request timing */
     ngx_msec_t  req_start;
 
@@ -193,6 +197,8 @@ typedef struct {
 
 #define XROOTD_AUTH_NONE   0   /* no authentication required (anonymous) */
 #define XROOTD_AUTH_GSI    1   /* GSI/x509 authentication required       */
+#define XROOTD_AUTH_TOKEN  2   /* Bearer token (JWT/WLCG) authentication */
+#define XROOTD_AUTH_BOTH   3   /* Accept either GSI or token auth        */
 
 typedef struct {
     ngx_str_t  path;
@@ -216,6 +222,8 @@ typedef struct {
     ngx_str_t   trusted_ca;
     ngx_str_t   vomsdir;
     ngx_str_t   voms_cert_dir;
+    ngx_str_t   crl;              /* xrootd_crl /path/to/file_or_dir     */
+    time_t      crl_reload;       /* xrootd_crl_reload interval (sec), 0=off */
 
     ngx_array_t *vo_rules;
     ngx_array_t *group_rules;
@@ -226,8 +234,20 @@ typedef struct {
     X509_STORE  *gsi_store;
     uint32_t     gsi_ca_hash;
 
+    /* CRL reload timer (heap-allocated in init_process) */
+    ngx_event_t *crl_timer;
+
     /* Write support */
     ngx_flag_t   allow_write;
+
+    /* Token (JWT/WLCG) authentication */
+    ngx_str_t   token_jwks;       /* xrootd_token_jwks /path/to/jwks.json  */
+    ngx_str_t   token_issuer;     /* xrootd_token_issuer "https://..."     */
+    ngx_str_t   token_audience;   /* xrootd_token_audience "nginx-xrootd"  */
+
+    /* Loaded JWKS keys (populated at postconfiguration) */
+    xrootd_jwks_key_t  jwks_keys[XROOTD_MAX_JWKS_KEYS];
+    int                 jwks_key_count;
 
     /* Access logging */
     ngx_str_t    access_log;
@@ -251,7 +271,10 @@ void *ngx_stream_xrootd_create_srv_conf(ngx_conf_t *cf);
 char *ngx_stream_xrootd_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child);
 char *ngx_stream_xrootd_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 ngx_int_t ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf);
+ngx_int_t ngx_stream_xrootd_init_process(ngx_cycle_t *cycle);
 ngx_int_t ngx_xrootd_metrics_shm_init(ngx_shm_zone_t *shm_zone, void *data);
+ngx_int_t xrootd_rebuild_gsi_store(ngx_stream_xrootd_srv_conf_t *xcf,
+    ngx_log_t *log);
 char *xrootd_conf_set_require_vo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 char *xrootd_conf_set_inherit_parent_group(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
@@ -288,6 +311,8 @@ int gsi_find_bucket(const u_char *payload, size_t plen,
     uint32_t target_type, const u_char **data_out, size_t *len_out);
 STACK_OF(X509) *xrootd_gsi_parse_x509(xrootd_ctx_t *ctx, ngx_connection_t *c);
 ngx_int_t xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c);
+
+/* ngx_xrootd_token.c — see ngx_xrootd_token.h for types and API */
 
 /* ngx_xrootd_read_handlers.c */
 ngx_int_t xrootd_handle_stat(xrootd_ctx_t *ctx, ngx_connection_t *c,
@@ -368,12 +393,13 @@ void xrootd_log_access(xrootd_ctx_t *ctx, ngx_connection_t *c,
     const char *verb, const char *path, const char *detail,
     ngx_uint_t xrd_ok, uint16_t errcode, const char *errmsg, size_t bytes);
 
-#if defined(XROOTD_HAVE_VOMS)
-ngx_int_t xrootd_extract_voms_info(ngx_log_t *log, X509 *leaf,
+/* ngx_xrootd_voms.c — runtime VOMS via dlopen(libvomsapi.so.1) */
+ngx_int_t  xrootd_voms_init(ngx_log_t *log);
+ngx_flag_t xrootd_voms_available(void);
+ngx_int_t  xrootd_extract_voms_info(ngx_log_t *log, X509 *leaf,
     STACK_OF(X509) *chain, const ngx_str_t *vomsdir,
     const ngx_str_t *cert_dir, char *primary_vo, size_t primary_vo_sz,
     char *vo_list, size_t vo_list_sz);
-#endif
 
 /* ngx_xrootd_aio.c — AIO response builders (used by read/write handlers) */
 u_char *xrootd_build_read_response(xrootd_ctx_t *ctx, ngx_connection_t *c,

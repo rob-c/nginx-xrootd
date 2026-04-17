@@ -236,142 +236,7 @@ Most grid proxies use `id-ppl-inheritAll` (`1.3.6.1.5.5.7.21.1`) as the policy l
 
 ### 5.3 Generate the proxy with Python
 
-The Python `cryptography` library does not have native RFC 3820 support, so the extension must be DER-encoded manually. This project includes a ready-made script at [`utils/make_proxy.py`](../utils/make_proxy.py). The key logic is shown below for reference:
-
-```python
-#!/usr/bin/env python3
-"""
-Create an RFC 3820 proxy certificate with proxyCertInfo extension.
-"""
-import datetime
-import os
-from cryptography import x509
-from cryptography.x509.oid import NameOID
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.backends import default_backend
-from cryptography.x509 import CertificateBuilder, Name, NameAttribute
-
-PKI = "/tmp/xrd-test/pki"
-
-# Load the user cert and key (the proxy issuer)
-with open(f"{PKI}/user/usercert.pem", "rb") as f:
-    user_cert = x509.load_pem_x509_certificate(f.read())
-with open(f"{PKI}/user/userkey.pem", "rb") as f:
-    user_key = serialization.load_pem_private_key(f.read(), password=None)
-
-# Generate an ephemeral RSA key for the proxy
-proxy_key = rsa.generate_private_key(
-    public_exponent=65537, key_size=2048, backend=default_backend()
-)
-
-# Proxy subject: user DN + CN=<serial>
-proxy_serial = 12346
-proxy_subject = Name(
-    list(user_cert.subject) + [NameAttribute(NameOID.COMMON_NAME, str(proxy_serial))]
-)
-
-now = datetime.datetime.now(datetime.timezone.utc)
-
-
-# --- DER-encode the proxyCertInfo extension manually ---
-
-def encode_oid(oid_str):
-    """Encode an OID string to DER content bytes."""
-    parts = [int(x) for x in oid_str.split('.')]
-    encoded = [40 * parts[0] + parts[1]]
-    for part in parts[2:]:
-        if part == 0:
-            encoded.append(0)
-        else:
-            chunks = []
-            while part > 0:
-                chunks.append(part & 0x7F)
-                part >>= 7
-            chunks.reverse()
-            for i in range(len(chunks) - 1):
-                chunks[i] |= 0x80
-            encoded.extend(chunks)
-    return bytes(encoded)
-
-def der_length(length):
-    if length < 0x80:
-        return bytes([length])
-    elif length < 0x100:
-        return bytes([0x81, length])
-    else:
-        return bytes([0x82, (length >> 8) & 0xFF, length & 0xFF])
-
-def der_tlv(tag, value):
-    return bytes([tag]) + der_length(len(value)) + value
-
-def der_sequence(value):
-    return der_tlv(0x30, value)
-
-def der_oid(oid_str):
-    return der_tlv(0x06, encode_oid(oid_str))
-
-
-# ProxyCertInfo: SEQUENCE { SEQUENCE { OID id-ppl-inheritAll } }
-id_ppl_inheritAll = "1.3.6.1.5.5.7.21.1"
-proxy_policy = der_sequence(der_oid(id_ppl_inheritAll))
-proxy_cert_info_value = der_sequence(proxy_policy)
-
-PROXY_CERT_INFO_OID = x509.ObjectIdentifier("1.3.6.1.5.5.7.1.14")
-
-
-# --- Build and sign the proxy certificate ---
-
-builder = (
-    CertificateBuilder()
-    .subject_name(proxy_subject)
-    .issuer_name(user_cert.subject)           # signed BY the user
-    .public_key(proxy_key.public_key())
-    .serial_number(proxy_serial)
-    .not_valid_before(now - datetime.timedelta(minutes=5))
-    .not_valid_after(now + datetime.timedelta(hours=12))
-    .add_extension(
-        x509.UnrecognizedExtension(PROXY_CERT_INFO_OID, proxy_cert_info_value),
-        critical=True,
-    )
-    .add_extension(
-        x509.KeyUsage(
-            digital_signature=True, content_commitment=False,
-            key_encipherment=False, data_encipherment=False,
-            key_agreement=False, key_cert_sign=False,
-            crl_sign=False, encipher_only=False, decipher_only=False,
-        ),
-        critical=True,
-    )
-)
-
-proxy_cert = builder.sign(user_key, hashes.SHA256())
-
-
-# --- Write the proxy file in GSI convention: cert + key + chain ---
-
-proxy_cert_pem = proxy_cert.public_bytes(serialization.Encoding.PEM)
-proxy_key_pem = proxy_key.private_bytes(
-    encoding=serialization.Encoding.PEM,
-    format=serialization.PrivateFormat.TraditionalOpenSSL,
-    encryption_algorithm=serialization.NoEncryption(),
-)
-with open(f"{PKI}/user/usercert.pem", "rb") as f:
-    user_cert_pem = f.read()
-
-proxy_path = f"{PKI}/user/proxy_std.pem"
-with open(proxy_path, "wb") as f:
-    f.write(proxy_cert_pem)
-    f.write(proxy_key_pem)
-    f.write(user_cert_pem)
-os.chmod(proxy_path, 0o400)
-
-print(f"Proxy written to {proxy_path}")
-print(f"Subject: {proxy_cert.subject.rfc4514_string()}")
-print(f"Valid:   {proxy_cert.not_valid_before_utc} → {proxy_cert.not_valid_after_utc}")
-```
-
-Run it:
+The Python `cryptography` library does not have native RFC 3820 support, so the extension must be DER-encoded manually. The implementation lives in [`utils/make_proxy.py`](../utils/make_proxy.py); run that helper instead of copying Python from this guide:
 
 ```bash
 # From the project root (uses default PKI path /tmp/xrd-test/pki)
@@ -650,7 +515,7 @@ pytest -v
 # Run VO ACL tests specifically (starts its own nginx on 11096)
 pytest tests/test_vo_acl.py -v
 
-# Expected: 28 passed
+# Expected: all selected tests pass
 ```
 
 ---
@@ -692,7 +557,63 @@ stream {
 
 ---
 
-## 10. Troubleshooting
+## 10. Certificate revocation lists
+
+The stream and WebDAV GSI paths can reject revoked certificates using PEM CRLs.
+
+### 10.1 Generate a test CRL
+
+For a local test CA, generate a CRL that revokes the user certificate:
+
+```bash
+python3 utils/make_crl.py /tmp/xrd-test/pki
+```
+
+### 10.2 Configure stream and WebDAV CRL checks
+
+```nginx
+stream {
+    server {
+        listen 11100;
+        xrootd on;
+        xrootd_root /tmp/xrd-test/data;
+        xrootd_auth gsi;
+        xrootd_certificate     /tmp/xrd-test/pki/server/hostcert.pem;
+        xrootd_certificate_key /tmp/xrd-test/pki/server/hostkey.pem;
+        xrootd_trusted_ca      /tmp/xrd-test/pki/ca/ca.pem;
+        xrootd_crl             /tmp/xrd-test/pki/ca/test-user.crl.pem;
+        xrootd_crl_reload      300;
+    }
+}
+
+http {
+    server {
+        listen 8444 ssl;
+        ssl_certificate     /tmp/xrd-test/pki/server/hostcert.pem;
+        ssl_certificate_key /tmp/xrd-test/pki/server/hostkey.pem;
+        ssl_verify_client   optional_no_ca;
+        xrootd_webdav_proxy_certs on;
+
+        location / {
+            xrootd_webdav         on;
+            xrootd_webdav_root    /tmp/xrd-test/data;
+            xrootd_webdav_cafile  /tmp/xrd-test/pki/ca/ca.pem;
+            xrootd_webdav_crl     /tmp/xrd-test/pki/ca/test-user.crl.pem;
+            xrootd_webdav_auth    required;
+        }
+    }
+}
+```
+
+The automated CRL tests generate their own CRL and sidecar nginx instance on stream port 11100 and WebDAV port 8444:
+
+```bash
+pytest tests/test_crl.py -v
+```
+
+---
+
+## 11. Troubleshooting
 
 ### Proxy not recognized as valid
 

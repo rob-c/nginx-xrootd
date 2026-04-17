@@ -324,3 +324,23 @@ For this repo's test setup, the reliable sequence after code changes is:
 3. start the rebuilt binary again with `/tmp/xrd-test/conf/nginx.conf`
 
 That operational detail is easy to forget and explains a lot of “the fix compiled but the behavior did not change” confusion.
+
+---
+
+## 23. Bearer-token auth uses the XRootD `ztn` credential type
+
+Token-authenticated stream listeners advertise `ztn` in the `kXR_protocol` security info and in the `kXR_login` parameter block:
+
+```
+&P=ztn,v:10000
+```
+
+The client then sends a single `kXR_auth` request. The payload starts with the four-byte credential prefix `ztn\0`, followed immediately by the compact JWT bytes. There is no multi-round challenge/response sequence like GSI.
+
+When `xrootd_auth both` is configured, the server advertises token first and then GSI:
+
+```
+&P=ztn,v:10000&P=gsi,v:10000,c:ssl,ca:<hash>
+```
+
+The auth handler routes by the credential type in the request: `ztn` goes to JWT/JWKS validation; `gsi` goes to the GSI certificate exchange.

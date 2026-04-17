@@ -19,7 +19,10 @@ xrootd_handle_protocol(xrootd_ctx_t *ctx, ngx_connection_t *c,
 
     /* kXR_protocol packs client capability flags into the fifth byte of body[]. */
     client_flags = ctx->cur_body[4];
-    want_gsi     = (conf->auth == XROOTD_AUTH_GSI);
+    want_gsi     = (conf->auth == XROOTD_AUTH_GSI || conf->auth == XROOTD_AUTH_BOTH);
+
+    int want_token = (conf->auth == XROOTD_AUTH_TOKEN
+                      || conf->auth == XROOTD_AUTH_BOTH);
 
     /*
      * Base kXR_protocol reply is the fixed 8-byte ServerProtocolBody.
@@ -28,10 +31,9 @@ xrootd_handle_protocol(xrootd_ctx_t *ctx, ngx_connection_t *c,
      */
     bodylen = sizeof(body);
     if (client_flags & 0x01) {                  /* kXR_secreqs */
+        int sec_count = (want_gsi ? 1 : 0) + (want_token ? 1 : 0);
         bodylen += 4;                            /* SecurityInfo header */
-        if (want_gsi) {
-            bodylen += 8;                        /* one SecurityProtocol entry */
-        }
+        bodylen += (size_t) sec_count * 8;       /* 8 bytes per SecurityProtocol entry */
     }
 
     total = XRD_RESPONSE_HDR_LEN + bodylen;
@@ -59,16 +61,22 @@ xrootd_handle_protocol(xrootd_ctx_t *ctx, ngx_connection_t *c,
          * any of the optional legacy fields encoded there.
          */
         u_char *si = buf + XRD_RESPONSE_HDR_LEN + sizeof(body);
+        int sec_count = (want_gsi ? 1 : 0) + (want_token ? 1 : 0);
         si[0] = 0;
-        si[1] = want_gsi ? 0x01 : 0x00;
-        si[2] = want_gsi ? 1    : 0;
+        si[1] = sec_count > 0 ? 0x01 : 0x00;
+        si[2] = (u_char) sec_count;
         si[3] = 0;
-        if (want_gsi) {
-            /* Single advertised protocol entry: "gsi" plus zeroed metadata. */
+        {
             u_char *pe = si + 4;
-            pe[0] = 'g'; pe[1] = 's'; pe[2] = 'i'; pe[3] = ' ';
-            pe[4] = 0;
-            pe[5] = 0; pe[6] = 0; pe[7] = 0;
+            if (want_token) {
+                pe[0] = 'z'; pe[1] = 't'; pe[2] = 'n'; pe[3] = ' ';
+                pe[4] = 0;   pe[5] = 0;   pe[6] = 0;   pe[7] = 0;
+                pe += 8;
+            }
+            if (want_gsi) {
+                pe[0] = 'g'; pe[1] = 's'; pe[2] = 'i'; pe[3] = ' ';
+                pe[4] = 0;   pe[5] = 0;   pe[6] = 0;   pe[7] = 0;
+            }
         }
     }
 
@@ -76,7 +84,9 @@ xrootd_handle_protocol(xrootd_ctx_t *ctx, ngx_connection_t *c,
                    "xrootd: kXR_protocol ok (client_flags=0x%02x "
                    "bodylen=%uz auth=%s)",
                    (int) client_flags, bodylen,
-                   want_gsi ? "gsi" : "none");
+                   want_gsi && want_token ? "both" :
+                   want_gsi ? "gsi" :
+                   want_token ? "token" : "none");
 
     return xrootd_queue_response(ctx, c, buf, total);
 }
@@ -104,7 +114,9 @@ xrootd_handle_login(xrootd_ctx_t *ctx, ngx_connection_t *c,
     ngx_log_debug3(NGX_LOG_DEBUG_STREAM, c->log, 0,
                    "xrootd: login user=\"%s\" pid=%d auth=%s",
                    user_log, (int) ntohl(req->pid),
-                   (conf->auth == XROOTD_AUTH_GSI) ? "gsi" : "none");
+                   (conf->auth == XROOTD_AUTH_GSI) ? "gsi" :
+                   (conf->auth == XROOTD_AUTH_TOKEN) ? "token" :
+                   (conf->auth == XROOTD_AUTH_BOTH) ? "both" : "none");
 
     /* Login marks the session as known; auth_done is deferred for GSI mode. */
     ctx->logged_in = 1;
@@ -134,25 +146,33 @@ xrootd_handle_login(xrootd_ctx_t *ctx, ngx_connection_t *c,
     }
 
     /*
-     * GSI auth starts with a legacy text parameter block appended after the
-     * 16-byte session id. The client uses this to decide which auth plugin to
-     * load before it begins the binary kXR_auth exchange.
+     * Authenticated modes send a text parameter block after the 16-byte
+     * session id.  The client parses "&P=..." entries to decide which
+     * security plugin to load.
      */
     {
-        char   parms[128];
+        char   parms[256];
         size_t parms_len;
 
         /* Re-fetch the live merged srv_conf in case login inherited settings. */
         conf = ngx_stream_get_module_srv_conf(ctx->session,
                                               ngx_stream_xrootd_module);
 
-        /*
-         * Historical XRootD convention: append a text "&P=..." parameter block
-         * after the 16-byte session id to bootstrap which security plugin to use.
-         */
-        parms_len = (size_t) snprintf(parms, sizeof(parms),
-                        "&P=gsi,v:10000,c:ssl,ca:%08x",
-                        (unsigned) conf->gsi_ca_hash) + 1;
+        if (conf->auth == XROOTD_AUTH_TOKEN) {
+            /* Token-only: advertise ztn, no CA hash needed. */
+            parms_len = (size_t) snprintf(parms, sizeof(parms),
+                            "&P=ztn,v:10000") + 1;
+        } else if (conf->auth == XROOTD_AUTH_BOTH) {
+            /* Both: token first (preferred), then GSI. */
+            parms_len = (size_t) snprintf(parms, sizeof(parms),
+                            "&P=ztn,v:10000&P=gsi,v:10000,c:ssl,ca:%08x",
+                            (unsigned) conf->gsi_ca_hash) + 1;
+        } else {
+            /* GSI-only */
+            parms_len = (size_t) snprintf(parms, sizeof(parms),
+                            "&P=gsi,v:10000,c:ssl,ca:%08x",
+                            (unsigned) conf->gsi_ca_hash) + 1;
+        }
 
         /* Include the trailing NUL because clients treat the parameter block as C-string data. */
 

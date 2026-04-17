@@ -33,6 +33,99 @@ See [docs/test-pki.md](../docs/test-pki.md) for the full PKI setup walkthrough.
 
 ---
 
+### make_token.py — WLCG JWT token generator
+
+Manages a local signing authority (RSA keypair + JWKS) and generates signed JWT tokens with configurable WLCG claims and scopes. The test suite uses this for all token authentication tests.
+
+```bash
+# Initialize signing authority (creates signing_key.pem + jwks.json)
+python3 utils/make_token.py init /tmp/xrd-test/tokens
+
+# Generate a read-only token (printed to stdout)
+python3 utils/make_token.py gen --scope "storage.read:/" /tmp/xrd-test/tokens
+
+# Generate a read-write token with groups
+python3 utils/make_token.py gen \
+    --scope "storage.read:/ storage.write:/" \
+    --groups "/cms,/atlas" \
+    /tmp/xrd-test/tokens
+
+# Generate a negative-test token
+python3 utils/make_token.py gen --kind expired /tmp/xrd-test/tokens
+
+# Save a token to a file
+python3 utils/make_token.py gen --scope "storage.read:/" -o /tmp/token.jwt
+```
+
+**Inputs** (for `gen` command):
+- `TOKEN_DIR/signing_key.pem` — RSA private key (created by `init`)
+
+**Outputs** (for `init` command):
+- `TOKEN_DIR/signing_key.pem` — RSA-2048 private key (mode `0400`)
+- `TOKEN_DIR/jwks.json` — JSON Web Key Set containing the public key (loaded by nginx)
+
+The `TokenIssuer` class can also be imported directly in Python for programmatic token generation, including convenience methods for expired, bad-signature, wrong-issuer, and wrong-audience tokens.
+
+**Requires:** `cryptography` (listed in `requirements.txt`).
+
+See [docs/test-tokens.md](../docs/test-tokens.md) for the full token setup walkthrough.
+
+---
+
+### inspect_token.py — JWT/JWKS inspection helper
+
+Decodes JWT header and payload data without verifying the signature, and can list key IDs from a JWKS file. Useful when debugging issuer, audience, scope, or `kid` mismatches.
+
+```bash
+# Inspect a token from an environment variable
+python3 utils/inspect_token.py "$BEARER_TOKEN"
+
+# Inspect a token from stdin
+python3 utils/make_token.py gen /tmp/xrd-test/tokens | python3 utils/inspect_token.py -
+
+# Print key IDs from a JWKS
+python3 utils/inspect_token.py --jwks /tmp/xrd-test/tokens/jwks.json
+```
+
+---
+
+### token_examples.py — custom token generation examples
+
+Shows how to use `TokenIssuer` programmatically without copying Python from the docs. It prints a read-only token and a read/write token with WLCG group claims.
+
+```bash
+python3 utils/token_examples.py /tmp/xrd-test/tokens
+```
+
+---
+
+### make_crl.py — test CRL generator
+
+Generates a PEM certificate revocation list for the local test CA. By default it revokes `/tmp/xrd-test/pki/user/usercert.pem` and writes `/tmp/xrd-test/pki/ca/test-user.crl.pem`.
+
+```bash
+python3 utils/make_crl.py /tmp/xrd-test/pki
+
+# Override the revoked certificate or output path
+python3 utils/make_crl.py /tmp/xrd-test/pki \
+    --cert /tmp/xrd-test/pki/user/usercert.pem \
+    --out /tmp/xrd-test/pki/ca/test-user.crl.pem
+```
+
+---
+
+### xrd_python_smoke.py — Python XRootD client smoke test
+
+Lists `/` and reads a file using the XRootD Python client. This is the runnable helper used by the getting-started guide.
+
+```bash
+python3 utils/xrd_python_smoke.py --url root://localhost:1094 --path /test.txt
+```
+
+**Requires:** `xrootd` Python package.
+
+---
+
 ### xrd_proxy.py — protocol traffic hex-dumper
 
 A TCP relay that sits between a client and the nginx-xrootd server, printing every byte exchanged in both directions as hex. Useful for debugging wire-level protocol issues.

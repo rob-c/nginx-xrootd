@@ -14,7 +14,7 @@ The XRootD client sends a 20-byte binary handshake when it first connects, then 
 
 ### `kXR_login`
 
-After the protocol handshake, the client sends its username. For anonymous servers, the module accepts any username. For GSI servers, the login response triggers the certificate exchange (see [Authentication](authentication.md)).
+After the protocol handshake, the client sends its username. For anonymous servers, the module accepts any username. For GSI servers, the login response triggers the certificate exchange. For token servers, the login response advertises the `ztn` bearer-token security protocol.
 
 ### `kXR_ping`
 
@@ -162,7 +162,7 @@ Open flags for writing:
 
 ### `kXR_pgwrite` — paged write with CRC32c (used by xrdcp v5)
 
-The primary write method used by `xrdcp` in XRootD v5. Data is sent in pages with CRC32c checksums for integrity verification. The module verifies the checksums and writes the raw data to disk.
+The primary write method used by `xrdcp` in XRootD v5. Data is sent in pages with CRC32c fields. The module strips those CRC fields and writes the raw data to disk; it does not currently verify the CRC32c values itself.
 
 ```bash
 xrdcp /tmp/local_file.root root://localhost:1094//remote_file.root
@@ -321,3 +321,11 @@ status, resp = fs.query(QueryCode.SPACE, "/")
 | Maximum path length | 4 KB |
 | Maximum `kXR_readv` segments per request | 1024 |
 | Maximum total `kXR_readv` response | 256 MB |
+
+---
+
+## Authentication and authorisation notes
+
+All data and namespace operations require a completed session login. When `xrootd_auth` is `gsi`, `token`, or `both`, the client must also complete the advertised security exchange before file operations are accepted.
+
+Native stream write access is controlled by `xrootd_allow_write`. JWT/WLCG scopes are parsed during token authentication, but native stream operations do not currently enforce `storage.read` or `storage.write` scopes per path. Path-level restrictions use `xrootd_require_vo`; token `wlcg.groups` claims are mapped into the same VO list used by VOMS proxies.

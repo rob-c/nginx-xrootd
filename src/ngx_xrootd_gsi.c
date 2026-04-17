@@ -338,6 +338,8 @@ xrootd_gsi_send_cert(xrootd_ctx_t *ctx, ngx_connection_t *c)
     BUF_MEM      *bptr;
     u_char       *buf, *p;
     u_char       *cert_pem, *puk_blob;
+
+
     size_t        cert_len, puk_len, body_len, total;
     char          puk_buf[4096];
     int           puk_written;
@@ -548,6 +550,105 @@ xrootd_gsi_send_cert(xrootd_ctx_t *ctx, ngx_connection_t *c)
     return xrootd_queue_response(ctx, c, buf, total);
 }
 
+
+/* ================================================================== */
+/*  Bearer-token (JWT/WLCG) authentication — "ztn" credential type    */
+/* ================================================================== */
+
+/*
+ * xrootd_handle_token_auth — validate a bearer token from kXR_auth.
+ *
+ * The ZTN wire format is simple:
+ *   payload[0..3] = "ztn\0"   (credential type, already checked by caller)
+ *   payload[4..N] = raw JWT token bytes
+ *
+ * Single round — no back-and-forth like GSI.
+ */
+static ngx_int_t
+xrootd_handle_token_auth(xrootd_ctx_t *ctx, ngx_connection_t *c,
+                         ngx_stream_xrootd_srv_conf_t *conf)
+{
+    xrootd_token_claims_t claims;
+    const char *token;
+    size_t      token_len;
+    int         rc, i;
+
+    if (ctx->payload == NULL || ctx->cur_dlen <= 4) {
+        xrootd_log_access(ctx, c, "AUTH", "-", "ztn",
+                          0, kXR_NotAuthorized, "empty token payload", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_AUTH);
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                 "empty bearer token");
+    }
+
+    /* Token follows the 4-byte "ztn\0" prefix. */
+    token     = (const char *)(ctx->payload + 4);
+    token_len = ctx->cur_dlen - 4;
+
+    /* Strip trailing NUL bytes the client may have sent. */
+    while (token_len > 0 && token[token_len - 1] == '\0')
+        token_len--;
+
+    if (token_len == 0) {
+        xrootd_log_access(ctx, c, "AUTH", "-", "ztn",
+                          0, kXR_NotAuthorized, "empty token payload", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_AUTH);
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                 "empty bearer token");
+    }
+
+    rc = xrootd_token_validate(c->log, token, token_len,
+                               conf->jwks_keys, conf->jwks_key_count,
+                               (const char *) conf->token_issuer.data,
+                               (const char *) conf->token_audience.data,
+                               &claims);
+    if (rc != 0) {
+        xrootd_log_access(ctx, c, "AUTH", "-", "ztn",
+                          0, kXR_NotAuthorized, "token validation failed", 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_AUTH);
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                 "bearer token validation failed");
+    }
+
+    /* Populate per-connection state from validated claims. */
+    ctx->token_auth = 1;
+    ctx->auth_done  = 1;
+
+    /* Use sub claim as the identity (like DN in GSI). */
+    ngx_cpystrn((u_char *) ctx->dn, (u_char *) claims.sub, sizeof(ctx->dn));
+
+    /* Map wlcg.groups to vo_list (comma-separated → same format as VOMS). */
+    if (claims.groups[0]) {
+        ngx_cpystrn((u_char *) ctx->vo_list,
+                    (u_char *) claims.groups,
+                    sizeof(ctx->vo_list));
+        /* Set primary_vo to the first group. */
+        const char *comma = strchr(claims.groups, ',');
+        size_t pvo_len = comma ? (size_t)(comma - claims.groups)
+                               : strlen(claims.groups);
+        if (pvo_len >= sizeof(ctx->primary_vo))
+            pvo_len = sizeof(ctx->primary_vo) - 1;
+        ngx_memcpy(ctx->primary_vo, claims.groups, pvo_len);
+        ctx->primary_vo[pvo_len] = '\0';
+    }
+
+    /* Store parsed scopes for per-operation authorization. */
+    ctx->token_scope_count = claims.scope_count;
+    for (i = 0; i < claims.scope_count && i < XROOTD_MAX_TOKEN_SCOPES; i++) {
+        ctx->token_scopes[i] = claims.scopes[i];
+    }
+
+    ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                  "xrootd: token auth ok sub=\"%s\" scopes=%d groups=\"%s\"",
+                  claims.sub, claims.scope_count, claims.groups);
+
+    xrootd_log_access(ctx, c, "AUTH", "-", claims.sub, 1, 0, NULL, 0);
+    XROOTD_OP_OK(ctx, XROOTD_OP_AUTH);
+
+    return xrootd_send_ok(ctx, c, NULL, 0);
+}
+
+
 /*
  * xrootd_handle_auth — handle GSI authentication sub-steps.
  */
@@ -571,8 +672,8 @@ xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c)
     conf = ngx_stream_get_module_srv_conf(ctx->session,
                                           ngx_stream_xrootd_module);
 
-    if (conf->auth != XROOTD_AUTH_GSI || conf->gsi_store == NULL) {
-        /* Non-GSI listeners reuse this path but complete auth immediately. */
+    if (conf->auth == XROOTD_AUTH_NONE) {
+        /* Non-authenticated listeners complete auth immediately. */
         ctx->auth_done = 1;
         return xrootd_send_ok(ctx, c, NULL, 0);
     }
@@ -581,7 +682,7 @@ xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c)
         char credtype[5];
         char safe_credtype[32];
 
-        ngx_memcpy(credtype, ctx->cur_body, 4);
+        ngx_memcpy(credtype, ctx->cur_body + 12, 4);
         credtype[4] = '\0';
         xrootd_sanitize_log_string(credtype, safe_credtype,
                                    sizeof(safe_credtype));
@@ -589,20 +690,46 @@ xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c)
         ngx_log_debug2(NGX_LOG_DEBUG_STREAM, c->log, 0,
                        "xrootd: kXR_auth credtype=\"%s\" payloadlen=%d",
                        safe_credtype, (int) ctx->cur_dlen);
+
+        /* ---- Route by credential type ---- */
+        if (credtype[0] == 'z' && credtype[1] == 't' && credtype[2] == 'n') {
+            /* Bearer token (JWT/WLCG) authentication */
+            if (conf->auth != XROOTD_AUTH_TOKEN &&
+                conf->auth != XROOTD_AUTH_BOTH)
+            {
+                return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                         "token auth not enabled");
+            }
+            return xrootd_handle_token_auth(ctx, c, conf);
+        }
+
+        if (credtype[0] != 'g' || credtype[1] != 's' || credtype[2] != 'i') {
+            ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                          "xrootd: kXR_auth unknown credtype=\"%s\"",
+                          safe_credtype);
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "unsupported credential type");
+        }
+
+        /* GSI authentication — fall through to GSI handling below */
+        if (conf->auth != XROOTD_AUTH_GSI &&
+            conf->auth != XROOTD_AUTH_BOTH)
+        {
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "GSI auth not enabled");
+        }
+    }
+
+    if (conf->gsi_store == NULL) {
+        /* GSI requested but not configured (shouldn't happen). */
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                 "GSI not configured");
     }
 
     if (ctx->payload == NULL || ctx->cur_dlen < 8) {
         /* Need at least "gsi\0" + 4-byte step number before parsing buckets. */
         return xrootd_send_error(ctx, c, kXR_NotAuthorized,
                                  "empty GSI credential");
-    }
-
-    /* Every GSI auth payload starts with the literal protocol name "gsi". */
-    if (ctx->payload[0] != 'g' || ctx->payload[1] != 's' ||
-        ctx->payload[2] != 'i')
-    {
-        return xrootd_send_error(ctx, c, kXR_NotAuthorized,
-                                 "not a GSI credential");
     }
 
     ngx_memcpy(&gsi_step, ctx->payload + 4, 4);
@@ -692,10 +819,11 @@ xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c)
         OPENSSL_free(dn_str);
     }
 
-#if defined(XROOTD_HAVE_VOMS)
     /* Extract VOMS VO membership while the cert chain is still live.
      * Must happen before sk_X509_pop_free frees the chain below. */
-    if (conf->vomsdir.len > 0 && conf->voms_cert_dir.len > 0) {
+    if (xrootd_voms_available()
+        && conf->vomsdir.len > 0 && conf->voms_cert_dir.len > 0)
+    {
         ngx_int_t voms_rc = xrootd_extract_voms_info(
             c->log, leaf, chain,
             &conf->vomsdir, &conf->voms_cert_dir,
@@ -708,7 +836,6 @@ xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c)
                           "xrootd: VOMS VO membership: %s", vo_log);
         }
     }
-#endif
 
     sk_X509_pop_free(chain, X509_free);
 

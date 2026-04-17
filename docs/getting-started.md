@@ -139,29 +139,22 @@ Install the Python XRootD client:
 pip install xrootd
 ```
 
-```python
-from XRootD import client
-from XRootD.client.flags import OpenFlags
+Run the Python smoke-test helper from the repository root:
 
-fs = client.FileSystem("root://localhost:1094")
-
-# List root directory
-status, listing = fs.dirlist("/")
-print([e.name for e in listing])
-
-# Read back the file we uploaded
-f = client.File()
-f.open("root://localhost:1094//test.txt", OpenFlags.READ)
-status, data = f.read()
-print(data)
-f.close()
+```bash
+python3 utils/xrd_python_smoke.py --url root://localhost:1094 --path /test.txt
 ```
+
+The helper lists `/`, reads `/test.txt`, and exits non-zero if either operation fails.
 
 ---
 
 ## What's next?
 
 - **Add GSI authentication** — [docs/authentication.md](authentication.md)
+- **Add token (JWT/WLCG) authentication** — [docs/authentication.md](authentication.md#token--jwt-wlcg-bearer-token-authentication)
+- **Set up a test PKI from scratch** — [docs/test-pki.md](test-pki.md)
+- **Set up test tokens from scratch** — [docs/test-tokens.md](test-tokens.md)
 - **All configuration options** — [docs/configuration.md](configuration.md)
 - **Prometheus metrics** — [docs/metrics-and-logging.md](metrics-and-logging.md)
 - **Understand all supported operations** — [docs/operations.md](operations.md)

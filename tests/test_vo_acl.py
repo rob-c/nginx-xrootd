@@ -7,7 +7,7 @@ certificate.
 
 Topology
 --------
-  nginx-xrootd VO server (port 11096)
+  nginx-xrootd VO server (port 11103)
     xrootd_root   /tmp/xrd-test/data
     xrootd_require_vo /cms   cms      # CMS VO required for /cms/
     xrootd_require_vo /atlas atlas    # ATLAS VO required for /atlas/
@@ -31,7 +31,7 @@ Prerequisites
   - Test PKI at /tmp/xrd-test/pki/  (CA, user cert+key, host cert+key)
   - voms-proxy-fake on PATH
 
-The session fixture starts and stops its own nginx process on port 11096;
+The session fixture starts and stops its own nginx process on port 11103;
 it does not touch the main test nginx on ports 11094/11095.
 """
 
@@ -67,10 +67,20 @@ SERVER_CERT = "/tmp/xrd-test/pki/server/hostcert.pem"
 SERVER_KEY  = "/tmp/xrd-test/pki/server/hostkey.pem"
 
 DATA_ROOT   = "/tmp/xrd-test/data"
-VO_PORT     = 11096
+VO_PORT     = 11103
 VO_URL      = f"root://localhost:{VO_PORT}"
 
 VO_NGINX_DIR = "/tmp/xrd-vo-test"
+
+# Resolve voms-proxy-fake: prefer Python script in utils/, fall back to system binary
+_UTILS_DIR = os.path.join(os.path.dirname(__file__), "..", "utils")
+_VOMS_PROXY_FAKE_PY = os.path.join(_UTILS_DIR, "voms_proxy_fake.py")
+if os.path.isfile(_VOMS_PROXY_FAKE_PY):
+    VOMS_PROXY_FAKE = [sys.executable, _VOMS_PROXY_FAKE_PY]
+elif shutil.which("voms-proxy-fake"):
+    VOMS_PROXY_FAKE = ["voms-proxy-fake"]
+else:
+    VOMS_PROXY_FAKE = None
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +166,7 @@ def _make_vomsdir():
 def _make_voms_proxy(vo: str, fqan: str, out: str):
     """Create a fake VOMS proxy for *vo* with the given *fqan*."""
     subprocess.run(
-        ["voms-proxy-fake",
+        VOMS_PROXY_FAKE + [
          "-cert",     USER_CERT,
          "-key",      USER_KEY,
          "-certdir",  CA_DIR,
@@ -248,6 +258,11 @@ def _start_vo_nginx(conf_path: str) -> subprocess.Popen:
         stderr_fh.close()
         with open(stderr_path) as f:
             stderr_text = f.read()
+        if "libvomsapi" in stderr_text:
+            pytest.skip(
+                "libvomsapi.so.1 not available — "
+                "skipping VO ACL tests"
+            )
         pytest.fail(
             f"VO nginx exited immediately (rc={proc.returncode}).\n"
             f"stderr: {stderr_text}"
@@ -295,7 +310,7 @@ def vo_nginx(tmp_path_factory):
     Skips the whole module if voms-proxy-fake is not on PATH or the nginx
     binary is absent.
     """
-    if not shutil.which("voms-proxy-fake"):
+    if not VOMS_PROXY_FAKE:
         pytest.skip("voms-proxy-fake not found — skipping VO ACL tests")
     if not os.path.exists(NGINX_BIN):
         pytest.skip(

@@ -9,7 +9,7 @@ The protocol is similar in concept to FTP or HTTP, but optimised for physics wor
 - **Addresses** look like `root://server//path/to/file.root` (note the double slash before the path)
 - **Port 1094** is the default (also 1095 for authenticated access)
 - **Tools** include `xrdcp` (like `scp`), `xrdfs` (like an FTP shell), and the XRootD Python and C++ client libraries
-- **Authentication** uses x509/GSI proxy certificates — the same certificate infrastructure used across the WLCG computing grid
+- **Authentication** commonly uses x509/GSI proxy certificates, and modern WLCG deployments are also moving toward JWT bearer tokens
 
 A typical use looks like:
 
@@ -71,14 +71,14 @@ The trade-off: this is an nginx module, not the full xrootd daemon. It implement
 - All standard file operations: open, read, write, stat, dirlist, rename, delete, chmod, mkdir, truncate
 - Scatter-gather vector reads (`kXR_readv`)
 - Checksum queries (adler32)
-- Anonymous access and GSI/x509 proxy certificate authentication
+- Anonymous access, GSI/x509 proxy certificate authentication, and JWT/WLCG bearer-token authentication
+- VO-style path ACLs from VOMS proxy attributes or token `wlcg.groups`
 - Async file I/O via nginx thread pools (non-blocking reads and writes)
 - Prometheus metrics
 
 **Not supported:**
 
 - TLS at the XRootD protocol level (`roots://`) — terminate TLS externally at nginx
-- SciToken / WLCG bearer token authentication
 - `kXR_locate` (redirect to optimal replica)
 - XRootD federation / redirector role (`kXR_Manager`)
 - Remote storage backends (HDFS, EOS, etc.)

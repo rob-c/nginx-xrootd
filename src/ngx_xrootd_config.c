@@ -114,6 +114,7 @@ ngx_stream_xrootd_create_srv_conf(ngx_conf_t *cf)
     conf->enable       = NGX_CONF_UNSET;
     conf->auth         = NGX_CONF_UNSET_UINT;
     conf->allow_write  = NGX_CONF_UNSET;
+    conf->crl_reload   = NGX_CONF_UNSET;
     conf->gsi_cert     = NULL;
     conf->gsi_key      = NULL;
     conf->gsi_store    = NULL;
@@ -148,7 +149,12 @@ ngx_stream_xrootd_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_str_value(conf->trusted_ca,      prev->trusted_ca,      "");
     ngx_conf_merge_str_value(conf->vomsdir,         prev->vomsdir,         "");
     ngx_conf_merge_str_value(conf->voms_cert_dir,   prev->voms_cert_dir,   "");
+    ngx_conf_merge_str_value(conf->crl,             prev->crl,             "");
+    ngx_conf_merge_value(conf->crl_reload,    prev->crl_reload,      0);
     ngx_conf_merge_str_value(conf->access_log,      prev->access_log,      "");
+    ngx_conf_merge_str_value(conf->token_jwks,      prev->token_jwks,      "");
+    ngx_conf_merge_str_value(conf->token_issuer,    prev->token_issuer,    "");
+    ngx_conf_merge_str_value(conf->token_audience,  prev->token_audience,  "");
 
     child_vo_rules = conf->vo_rules;
     conf->vo_rules = xrootd_merge_arrays(cf, prev->vo_rules, child_vo_rules,
@@ -200,6 +206,282 @@ ngx_stream_xrootd_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 /* ================================================================== */
+/*  CRL loading helpers                                                 */
+/* ================================================================== */
+
+/*
+ * Load all PEM-encoded CRLs from a single file into the given X509_STORE.
+ * Returns the number of CRLs added, or -1 on error opening the file.
+ */
+static int
+xrootd_load_crls_from_file(X509_STORE *store, const char *path, ngx_log_t *log)
+{
+    FILE      *fp;
+    X509_CRL  *crl;
+    int        count = 0;
+
+    fp = fopen(path, "r");
+    if (fp == NULL) {
+        ngx_log_error(NGX_LOG_WARN, log, ngx_errno,
+                      "xrootd: cannot open CRL file \"%s\"", path);
+        return -1;
+    }
+
+    while ((crl = PEM_read_X509_CRL(fp, NULL, NULL, NULL)) != NULL) {
+        if (!X509_STORE_add_crl(store, crl)) {
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                          "xrootd: failed to add CRL entry from \"%s\"", path);
+        } else {
+            count++;
+        }
+        X509_CRL_free(crl);
+    }
+
+    fclose(fp);
+    return count;
+}
+
+/*
+ * Load CRLs from a path that is either a single PEM file or a directory
+ * (scanning *.pem, *.r0, *.r1, … *.r9 files, matching /etc/grid-security/certificates).
+ * Returns the total number of CRLs loaded, or -1 on error.
+ */
+static int
+xrootd_load_crls(X509_STORE *store, const char *path, ngx_log_t *log)
+{
+    struct stat  st;
+    DIR         *dir;
+    struct dirent *ent;
+    int          total = 0;
+    int          n;
+
+    if (stat(path, &st) != 0) {
+        ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                      "xrootd: cannot stat CRL path \"%s\"", path);
+        return -1;
+    }
+
+    /* Single file */
+    if (S_ISREG(st.st_mode)) {
+        return xrootd_load_crls_from_file(store, path, log);
+    }
+
+    /* Directory — scan for CRL files */
+    if (!S_ISDIR(st.st_mode)) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "xrootd: CRL path \"%s\" is neither a file nor directory",
+                      path);
+        return -1;
+    }
+
+    dir = opendir(path);
+    if (dir == NULL) {
+        ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                      "xrootd: cannot open CRL directory \"%s\"", path);
+        return -1;
+    }
+
+    while ((ent = readdir(dir)) != NULL) {
+        const char *name = ent->d_name;
+        size_t      nlen = strlen(name);
+        char        fullpath[PATH_MAX];
+        int         match = 0;
+
+        /* Match *.pem */
+        if (nlen > 4 && strcmp(name + nlen - 4, ".pem") == 0) {
+            match = 1;
+        }
+        /* Match *.r0 through *.r9 (grid CA CRL naming convention) */
+        if (nlen > 3 && name[nlen - 3] == '.' && name[nlen - 2] == 'r'
+            && name[nlen - 1] >= '0' && name[nlen - 1] <= '9')
+        {
+            match = 1;
+        }
+
+        if (!match) {
+            continue;
+        }
+
+        n = snprintf(fullpath, sizeof(fullpath), "%s/%s", path, name);
+        if (n < 0 || (size_t) n >= sizeof(fullpath)) {
+            continue;
+        }
+
+        /* Only load regular files, skip symlink targets that vanished etc. */
+        if (stat(fullpath, &st) != 0 || !S_ISREG(st.st_mode)) {
+            continue;
+        }
+
+        n = xrootd_load_crls_from_file(store, fullpath, log);
+        if (n > 0) {
+            total += n;
+        }
+    }
+
+    closedir(dir);
+    return total;
+}
+
+/*
+ * Build (or rebuild) the X509_STORE used for GSI certificate verification.
+ *
+ * Loads the trusted CA from xcf->trusted_ca, then loads CRLs from xcf->crl
+ * (which may be a single PEM file or a directory of *.pem / *.r0 files).
+ *
+ * On success the new store is atomically swapped into xcf->gsi_store and any
+ * previous store is freed.  On failure the old store is left in place so
+ * existing connections are not disrupted.
+ */
+ngx_int_t
+xrootd_rebuild_gsi_store(ngx_stream_xrootd_srv_conf_t *xcf, ngx_log_t *log)
+{
+    X509_STORE   *store;
+    X509_STORE   *old_store;
+    X509_LOOKUP  *lookup;
+
+    store = X509_STORE_new();
+    if (store == NULL) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "xrootd: X509_STORE_new() failed");
+        return NGX_ERROR;
+    }
+
+    X509_STORE_set_flags(store, X509_V_FLAG_ALLOW_PROXY_CERTS);
+
+    lookup = X509_STORE_add_lookup(store, X509_LOOKUP_file());
+    if (lookup == NULL) {
+        X509_STORE_free(store);
+        return NGX_ERROR;
+    }
+
+    if (!X509_LOOKUP_load_file(lookup,
+                               (char *) xcf->trusted_ca.data,
+                               X509_FILETYPE_PEM))
+    {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "xrootd: cannot load trusted CA \"%s\"",
+                      xcf->trusted_ca.data);
+        X509_STORE_free(store);
+        return NGX_ERROR;
+    }
+
+    /* Load CRLs if configured (file or directory) */
+    if (xcf->crl.len > 0) {
+        int crl_count = xrootd_load_crls(store, (char *) xcf->crl.data, log);
+        if (crl_count < 0) {
+            ngx_log_error(NGX_LOG_ERR, log, 0,
+                          "xrootd: failed to load CRLs from \"%s\"",
+                          xcf->crl.data);
+            X509_STORE_free(store);
+            return NGX_ERROR;
+        }
+
+        if (crl_count > 0) {
+            /*
+             * Enable CRL checking on the store.  X509_V_FLAG_CRL_CHECK checks
+             * the leaf issuer's CRL; _CHECK_ALL checks the entire chain.
+             */
+            X509_STORE_set_flags(store,
+                                 X509_V_FLAG_CRL_CHECK |
+                                 X509_V_FLAG_CRL_CHECK_ALL);
+        }
+
+        ngx_log_error(NGX_LOG_NOTICE, log, 0,
+                      "xrootd: loaded %d CRL(s) from \"%s\"",
+                      crl_count, xcf->crl.data);
+    }
+
+    /* Atomic swap */
+    old_store = xcf->gsi_store;
+    xcf->gsi_store = store;
+
+    if (old_store != NULL) {
+        X509_STORE_free(old_store);
+    }
+
+    return NGX_OK;
+}
+
+/* ================================================================== */
+/*  CRL reload timer                                                    */
+/* ================================================================== */
+
+static void
+xrootd_crl_reload_handler(ngx_event_t *ev)
+{
+    ngx_stream_xrootd_srv_conf_t *xcf = ev->data;
+
+    ngx_log_error(NGX_LOG_INFO, ev->log, 0,
+                  "xrootd: CRL reload timer fired, rebuilding store "
+                  "from \"%s\"", xcf->crl.data);
+
+    if (xrootd_rebuild_gsi_store(xcf, ev->log) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, ev->log, 0,
+                      "xrootd: CRL reload failed — keeping previous store");
+    }
+
+    /* Re-arm the timer */
+    if (xcf->crl_reload > 0) {
+        ngx_add_timer(ev, (ngx_msec_t) xcf->crl_reload * 1000);
+    }
+}
+
+/*
+ * Worker process init: start CRL reload timers for every server block that
+ * has xrootd_crl_reload configured.  Timers are per-worker because each
+ * nginx worker process has its own event loop and its own copy of the config
+ * pointers (but the X509_STORE* is shared within a worker).
+ */
+ngx_int_t
+ngx_stream_xrootd_init_process(ngx_cycle_t *cycle)
+{
+    ngx_stream_core_main_conf_t   *cmcf;
+    ngx_stream_core_srv_conf_t   **cscfp;
+    ngx_stream_xrootd_srv_conf_t  *xcf;
+    ngx_uint_t                     i;
+
+    cmcf = ngx_stream_cycle_get_module_main_conf(cycle, ngx_stream_core_module);
+    if (cmcf == NULL) {
+        return NGX_OK;
+    }
+
+    cscfp = cmcf->servers.elts;
+
+    for (i = 0; i < cmcf->servers.nelts; i++) {
+        xcf = ngx_stream_conf_get_module_srv_conf(cscfp[i],
+                                                   ngx_stream_xrootd_module);
+
+        if (!xcf->enable) {
+            continue;
+        }
+
+        if ((xcf->auth != XROOTD_AUTH_GSI && xcf->auth != XROOTD_AUTH_BOTH)
+            || xcf->crl.len == 0 || xcf->crl_reload == 0)
+        {
+            continue;
+        }
+
+        /* Allocate and start the CRL reload timer */
+        xcf->crl_timer = ngx_pcalloc(cycle->pool, sizeof(ngx_event_t));
+        if (xcf->crl_timer == NULL) {
+            return NGX_ERROR;
+        }
+        xcf->crl_timer->handler = xrootd_crl_reload_handler;
+        xcf->crl_timer->data    = xcf;
+        xcf->crl_timer->log     = cycle->log;
+
+        ngx_add_timer(xcf->crl_timer, (ngx_msec_t) xcf->crl_reload * 1000);
+
+        ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                      "xrootd: CRL reload timer started — interval=%ds "
+                      "path=\"%s\"",
+                      (int) xcf->crl_reload, xcf->crl.data);
+    }
+
+    return NGX_OK;
+}
+
+/* ================================================================== */
 /*  Post-configuration: load GSI certificates                          */
 /* ================================================================== */
 
@@ -213,6 +495,11 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
 
     cmcf  = ngx_stream_conf_get_module_main_conf(cf, ngx_stream_core_module);
     cscfp = cmcf->servers.elts;
+
+    /* Attempt to load libvomsapi.so.1 via dlopen.  If the library is not
+     * present we continue; the config validation below will reject any
+     * xrootd_require_vo directives when voms is unavailable. */
+    (void) xrootd_voms_init(cf->log);
 
     /*
      * First pass over enabled servers:
@@ -256,10 +543,7 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
                 xcf->access_log.data);
         }
 
-        if (xcf->auth != XROOTD_AUTH_GSI) {
-            /* Non-GSI servers skip all OpenSSL/X509 setup in this pass. */
-            continue;
-        }
+        if (xcf->auth == XROOTD_AUTH_GSI || xcf->auth == XROOTD_AUTH_BOTH) {
 
         /* GSI mode is only meaningful when all three trust inputs are present. */
         if (xcf->certificate.len == 0 || xcf->certificate_key.len == 0
@@ -310,45 +594,15 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
         }
 
         /* Build trusted CA X509_STORE */
+        if (xrootd_rebuild_gsi_store(xcf, cf->log) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        /* Compute CA hash (for kXRS_issuer_hash in kXGS_init) */
         {
             FILE  *fp;
             X509  *ca;
-            X509_LOOKUP *lookup;
 
-            /*
-             * Verification context used later during kXR_auth. Proxy certs are
-             * allowed explicitly because grid credentials are RFC 3820 proxies,
-             * not just end-entity certs.
-             */
-            xcf->gsi_store = X509_STORE_new();
-            if (xcf->gsi_store == NULL) {
-                return NGX_ERROR;
-            }
-
-            X509_STORE_set_flags(xcf->gsi_store,
-                                 X509_V_FLAG_ALLOW_PROXY_CERTS);
-
-            lookup = X509_STORE_add_lookup(xcf->gsi_store,
-                                           X509_LOOKUP_file());
-            if (lookup == NULL) {
-                return NGX_ERROR;
-            }
-
-            /*
-             * The CA bundle is loaded into the store once here and then reused
-             * by every GSI login handled by this listener.
-             */
-            if (!X509_LOOKUP_load_file(lookup,
-                                       (char *) xcf->trusted_ca.data,
-                                       X509_FILETYPE_PEM))
-            {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "xrootd: cannot load trusted CA \"%s\"",
-                    xcf->trusted_ca.data);
-                return NGX_ERROR;
-            }
-
-            /* Compute CA hash (for kXRS_issuer_hash in kXGS_init) */
             fp = fopen((char *) xcf->trusted_ca.data, "r");
             if (fp) {
                 ca = PEM_read_X509(fp, NULL, NULL, NULL);
@@ -365,8 +619,39 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
         }
 
         ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
-            "xrootd: GSI auth configured — cert=%s ca_hash=%08x",
+            "xrootd: GSI auth configured — cert=%s ca_hash=%08xd",
             xcf->certificate.data, xcf->gsi_ca_hash);
+
+        } /* end GSI setup */
+
+        /* ---- Token (JWT/WLCG) JWKS loading ---- */
+        if ((xcf->auth == XROOTD_AUTH_TOKEN || xcf->auth == XROOTD_AUTH_BOTH)
+            && xcf->token_jwks.len > 0)
+        {
+            if (xcf->token_issuer.len == 0 || xcf->token_audience.len == 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "xrootd_auth token/both requires "
+                    "xrootd_token_issuer and xrootd_token_audience");
+                return NGX_ERROR;
+            }
+
+            xcf->jwks_key_count = xrootd_jwks_load(
+                cf->log, (const char *) xcf->token_jwks.data,
+                xcf->jwks_keys, XROOTD_MAX_JWKS_KEYS);
+
+            if (xcf->jwks_key_count < 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "xrootd: failed to load JWKS from \"%s\"",
+                    xcf->token_jwks.data);
+                return NGX_ERROR;
+            }
+
+            ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
+                "xrootd: token auth configured — jwks=%s issuer=%s "
+                "audience=%s keys=%d",
+                xcf->token_jwks.data, xcf->token_issuer.data,
+                xcf->token_audience.data, xcf->jwks_key_count);
+        }
     }
 
     for (i = 0; i < cmcf->servers.nelts; i++) {
@@ -377,27 +662,29 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
             continue;
         }
 
-        if (xcf->vo_rules != NULL && xcf->auth != XROOTD_AUTH_GSI) {
+        if (xcf->vo_rules != NULL
+            && xcf->auth != XROOTD_AUTH_GSI
+            && xcf->auth != XROOTD_AUTH_TOKEN
+            && xcf->auth != XROOTD_AUTH_BOTH)
+        {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                "xrootd_require_vo requires xrootd_auth gsi");
+                "xrootd_require_vo requires xrootd_auth gsi, token or both");
             return NGX_ERROR;
         }
 
-#if !defined(XROOTD_HAVE_VOMS)
         if (xcf->vo_rules != NULL) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                "xrootd_require_vo requires nginx-xrootd to be built with libvomsapi");
-            return NGX_ERROR;
-        }
-#else
-        if (xcf->vo_rules != NULL) {
+            if (!xrootd_voms_available()) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "xrootd_require_vo requires libvomsapi.so.1 at runtime "
+                    "(install voms-libs on EL9)");
+                return NGX_ERROR;
+            }
             if (xcf->vomsdir.len == 0 || xcf->voms_cert_dir.len == 0) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                     "xrootd_require_vo requires xrootd_vomsdir and xrootd_voms_cert_dir");
                 return NGX_ERROR;
             }
         }
-#endif
 
         if (xrootd_finalize_vo_rules(cf->log, &xcf->root, xcf->vo_rules) != NGX_OK) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,

@@ -1,14 +1,14 @@
-# WebDAV / HTTPS+GSI
+# WebDAV / HTTPS+GSI/Bearer
 
-The `ngx_http_xrootd_webdav_module` adds a WebDAV content handler to nginx's HTTP layer. Together with TLS and GSI proxy-certificate support, it lets `xrdcp` use the `davs://host:8443/` URL scheme — the same transfer path used by Grid and WLCG workflows that prefer HTTP over the native `root://` protocol.
+The `ngx_http_xrootd_webdav_module` adds a WebDAV content handler to nginx's HTTP layer. Together with TLS, GSI proxy-certificate support, and optional JWT bearer-token validation, it lets `xrdcp` use the `davs://host:8443/` URL scheme — the same transfer path used by Grid and WLCG workflows that prefer HTTP over the native `root://` protocol.
 
 ---
 
 ## How it works
 
-`xrdcp --allow-http davs://host:8443/path` is handled by the `XrdClHttp` plugin, which speaks WebDAV (HTTP methods OPTIONS, GET with Range, HEAD, PUT, DELETE, MKCOL, PROPFIND) over TLS with mutual authentication via RFC 3820 proxy certificates.
+`xrdcp --allow-http davs://host:8443/path` is handled by the `XrdClHttp` plugin, which speaks WebDAV (HTTP methods OPTIONS, GET with Range, HEAD, PUT, DELETE, MKCOL, PROPFIND) over TLS. Authentication can come from RFC 3820 proxy certificates or from an `Authorization: Bearer <JWT>` header.
 
-nginx's built-in SSL stack does not accept RFC 3820 proxy certificates by default. This module patches the `SSL_CTX` in postconfiguration to set `X509_V_FLAG_ALLOW_PROXY_CERTS`, enabling proxy chains issued by your test CA. Per-request certificate verification is then performed using the configured CA directory.
+nginx's built-in SSL stack does not accept RFC 3820 proxy certificates by default. This module patches the `SSL_CTX` in postconfiguration to set `X509_V_FLAG_ALLOW_PROXY_CERTS`, enabling proxy chains issued by your test CA. Per-request certificate verification is then performed using the configured CA directory or CA file. Bearer tokens are verified against a local JWKS file without a network call to an identity provider.
 
 ---
 
@@ -44,6 +44,11 @@ http {
             xrootd_webdav_cadir   /etc/grid-security/certificates;
             xrootd_webdav_auth    optional;    # or: none | required
             xrootd_webdav_allow_write on;
+
+            # Optional bearer-token auth
+            xrootd_webdav_token_jwks     /etc/tokens/jwks.json;
+            xrootd_webdav_token_issuer   "https://idp.example.com";
+            xrootd_webdav_token_audience "my-storage";
         }
     }
 }
@@ -65,7 +70,7 @@ Activates the WebDAV content handler for this location.
 
 ### `xrootd_webdav_root <path>`
 
-**Context:** `location`
+**Context:** `location` · **Default:** `/`
 
 Filesystem directory that clients see as `/`. Path traversal and symlink-escape attempts are blocked.
 
@@ -73,11 +78,13 @@ Filesystem directory that clients see as `/`. Path traversal and symlink-escape 
 
 ### `xrootd_webdav_auth none|optional|required`
 
-**Context:** `location` · **Default:** `none`
+**Context:** `location` · **Default:** `optional`
 
-- `none` — serve all requests without checking for a client certificate
-- `optional` — check the client certificate if one is presented; unauthenticated requests are still served
-- `required` — reject requests that do not present a valid proxy certificate (returns 403)
+- `none` — serve all requests without checking client certificates or bearer tokens
+- `optional` — check a proxy certificate or bearer token if one is presented; unauthenticated requests are still served
+- `required` — reject requests that do not present a valid proxy certificate or bearer token (returns 403)
+
+With `optional`, an invalid bearer token is declined and the request may still proceed anonymously. Use `required` when token or proxy authentication must be mandatory.
 
 ---
 
@@ -97,21 +104,29 @@ Alternative to `xrootd_webdav_cadir`: a single PEM file containing one or more C
 
 ---
 
+### `xrootd_webdav_crl <path>`
+
+**Context:** `location`
+
+PEM CRL file used when verifying proxy-certificate chains. When configured, OpenSSL CRL checks are enabled for the full chain.
+
+---
+
 ### `xrootd_webdav_allow_write on|off`
 
 **Context:** `location` · **Default:** `off`
 
-Enables PUT, DELETE, and MKCOL. Off by default so read-only deployments are safe without extra configuration.
+Enables PUT, DELETE, and MKCOL. Off by default so read-only deployments are safe without extra configuration. When the request is accepted via a bearer token, `PUT` also requires a matching `storage.write` or `storage.create` scope for the request path.
 
 ---
 
 ### `xrootd_webdav_proxy_certs on|off`
 
-**Context:** `server` (HTTP) · **Default:** `off`
+**Context:** `server` or `location` (HTTP) · **Default:** `off`
 
 Sets `X509_V_FLAG_ALLOW_PROXY_CERTS` on the `SSL_CTX` for this server in postconfiguration. Without this, nginx's TLS layer rejects RFC 3820 proxy certificates with error 40 (`proxy certificates not allowed`) even when `ssl_verify_client optional_no_ca` is set.
 
-This directive must be in the `server {}` block, not inside `location {}`.
+In normal TLS deployments, put this in the `server {}` block so the SSL context is patched for the whole virtual server.
 
 ---
 
@@ -120,6 +135,30 @@ This directive must be in the `server {}` block, not inside `location {}`.
 **Context:** `location` · **Default:** `10`
 
 Maximum depth for proxy-certificate chain verification.
+
+---
+
+### `xrootd_webdav_token_jwks <path>`
+
+**Context:** `location`
+
+Path to a JWKS file containing public keys trusted for JWT/WLCG bearer-token validation.
+
+---
+
+### `xrootd_webdav_token_issuer <string>`
+
+**Context:** `location`
+
+Expected JWT `iss` claim.
+
+---
+
+### `xrootd_webdav_token_audience <string>`
+
+**Context:** `location`
+
+Expected JWT `aud` claim.
 
 ---
 
@@ -162,6 +201,19 @@ curl -sk --cert $PROXY --key $PROXY --cacert $CA \
 # Create directory
 curl -sk --cert $PROXY --key $PROXY --cacert $CA \
   -X MKCOL https://host:8443/newdir/
+```
+
+Bearer-token requests use a normal HTTP `Authorization` header:
+
+```bash
+TOKEN=$(python3 utils/make_token.py gen \
+  --scope "storage.read:/ storage.write:/" /tmp/xrd-test/tokens)
+
+curl -sk -H "Authorization: Bearer $TOKEN" \
+  https://host:8443/file.txt -o downloaded.txt
+
+curl -sk -X PUT -H "Authorization: Bearer $TOKEN" \
+  --data-binary @localfile.txt https://host:8443/file.txt
 ```
 
 ---
@@ -210,6 +262,7 @@ http {
         location / {
             xrootd_webdav      on;
             xrootd_webdav_root /data;   # same data directory
+            xrootd_webdav_auth optional;
         }
     }
 }

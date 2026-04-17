@@ -49,9 +49,11 @@
  * nginx's enum setter walks this table until it hits ngx_null_string.
  */
 static ngx_conf_enum_t xrootd_auth_modes[] = {
-    { ngx_string("none"), XROOTD_AUTH_NONE },
-    { ngx_string("gsi"),  XROOTD_AUTH_GSI  },
-    { ngx_null_string,    0                }
+    { ngx_string("none"),  XROOTD_AUTH_NONE  },
+    { ngx_string("gsi"),   XROOTD_AUTH_GSI   },
+    { ngx_string("token"), XROOTD_AUTH_TOKEN },
+    { ngx_string("both"),  XROOTD_AUTH_BOTH  },
+    { ngx_null_string,     0                 }
 };
 
 /*
@@ -137,6 +139,22 @@ static ngx_command_t ngx_stream_xrootd_commands[] = {
       offsetof(ngx_stream_xrootd_srv_conf_t, voms_cert_dir),
       NULL },
 
+    /* PEM file or directory containing CRLs for certificate revocation checking. */
+    { ngx_string("xrootd_crl"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_xrootd_srv_conf_t, crl),
+      NULL },
+
+    /* Interval (seconds) to re-scan xrootd_crl and rebuild the CA/CRL store. */
+    { ngx_string("xrootd_crl_reload"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_sec_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_xrootd_srv_conf_t, crl_reload),
+      NULL },
+
     { ngx_string("xrootd_require_vo"),
       NGX_STREAM_SRV_CONF | NGX_CONF_TAKE2,
       xrootd_conf_set_require_vo,
@@ -149,6 +167,28 @@ static ngx_command_t ngx_stream_xrootd_commands[] = {
       xrootd_conf_set_inherit_parent_group,
       NGX_STREAM_SRV_CONF_OFFSET,
       0,
+      NULL },
+
+    /* JWT / WLCG bearer-token directives (used when xrootd_auth = token|both). */
+    { ngx_string("xrootd_token_jwks"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_xrootd_srv_conf_t, token_jwks),
+      NULL },
+
+    { ngx_string("xrootd_token_issuer"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_xrootd_srv_conf_t, token_issuer),
+      NULL },
+
+    { ngx_string("xrootd_token_audience"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_xrootd_srv_conf_t, token_audience),
       NULL },
 
     /* Write handlers still perform per-op auth checks; this only enables the feature. */
@@ -220,6 +260,8 @@ ngx_module_t ngx_stream_xrootd_module = {
   ngx_stream_xrootd_commands,
   NGX_STREAM_MODULE,
   /* No master/module init hooks beyond the stream-specific callbacks above. */
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL,
+    ngx_stream_xrootd_init_process,         /* init process       */
+    NULL, NULL, NULL, NULL,
     NGX_MODULE_V1_PADDING
 };

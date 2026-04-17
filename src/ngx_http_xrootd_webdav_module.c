@@ -70,6 +70,8 @@
 #include <limits.h>
 #include <time.h>
 
+#include "ngx_xrootd_token.h"
+
 size_t xrootd_sanitize_log_string(const char *in, char *out, size_t outsz);
 
 /* Maximum path length we'll construct */
@@ -94,16 +96,29 @@ typedef struct {
     ngx_str_t      root;
     ngx_str_t      cadir;
     ngx_str_t      cafile;
+    ngx_str_t      crl;           /* xrootd_webdav_crl /path/to/crl.pem */
     ngx_uint_t     verify_depth;
     ngx_uint_t     auth;          /* webdav_auth_t */
     ngx_flag_t     proxy_certs;  /* set X509_V_FLAG_ALLOW_PROXY_CERTS on SSL CTX */
     ngx_flag_t     allow_write;
+
+    /* Token (JWT/WLCG) authentication */
+    ngx_str_t      token_jwks;
+    ngx_str_t      token_issuer;
+    ngx_str_t      token_audience;
+
+    /* Loaded JWKS keys (populated at postconfiguration) */
+    xrootd_jwks_key_t  jwks_keys[XROOTD_MAX_JWKS_KEYS];
+    int                 jwks_key_count;
 } ngx_http_xrootd_webdav_loc_conf_t;
 
 /* Per-request auth result: cached across sub-handlers */
 typedef struct {
     int            verified;      /* 1 = chain passed, 0 = failed/absent */
     char           dn[1024];
+    int            token_auth;    /* 1 = authenticated via bearer token */
+    int            token_scope_count;
+    xrootd_token_scope_t  token_scopes[XROOTD_MAX_TOKEN_SCOPES];
 } ngx_http_xrootd_webdav_req_ctx_t;
 
 /* ------------------------------------------------------------------ */
@@ -172,6 +187,13 @@ static ngx_command_t ngx_http_xrootd_webdav_commands[] = {
       offsetof(ngx_http_xrootd_webdav_loc_conf_t, cafile),
       NULL },
 
+    { ngx_string("xrootd_webdav_crl"),
+      NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_xrootd_webdav_loc_conf_t, crl),
+      NULL },
+
     { ngx_string("xrootd_webdav_verify_depth"),
       NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
       ngx_conf_set_num_slot,
@@ -198,6 +220,27 @@ static ngx_command_t ngx_http_xrootd_webdav_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_xrootd_webdav_loc_conf_t, allow_write),
+      NULL },
+
+    { ngx_string("xrootd_webdav_token_jwks"),
+      NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_xrootd_webdav_loc_conf_t, token_jwks),
+      NULL },
+
+    { ngx_string("xrootd_webdav_token_issuer"),
+      NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_xrootd_webdav_loc_conf_t, token_issuer),
+      NULL },
+
+    { ngx_string("xrootd_webdav_token_audience"),
+      NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_xrootd_webdav_loc_conf_t, token_audience),
       NULL },
 
     ngx_null_command
@@ -267,11 +310,30 @@ ngx_http_xrootd_webdav_merge_loc_conf(ngx_conf_t *cf,
     ngx_conf_merge_str_value(conf->root,     prev->root,         "/");
     ngx_conf_merge_str_value(conf->cadir,    prev->cadir,        "");
     ngx_conf_merge_str_value(conf->cafile,   prev->cafile,       "");
+    ngx_conf_merge_str_value(conf->crl,      prev->crl,          "");
     ngx_conf_merge_uint_value(conf->verify_depth, prev->verify_depth, 10);
     ngx_conf_merge_uint_value(conf->auth,    prev->auth,
                               WEBDAV_AUTH_OPTIONAL);
     ngx_conf_merge_value(conf->proxy_certs,  prev->proxy_certs,  0);
     ngx_conf_merge_value(conf->allow_write,  prev->allow_write,  0);
+
+    ngx_conf_merge_str_value(conf->token_jwks,     prev->token_jwks,     "");
+    ngx_conf_merge_str_value(conf->token_issuer,   prev->token_issuer,   "");
+    ngx_conf_merge_str_value(conf->token_audience,  prev->token_audience, "");
+
+    /* Load JWKS keys if token is configured. */
+    if (conf->token_jwks.len > 0) {
+        int rc = xrootd_jwks_load(cf->log,
+                                  (const char *) conf->token_jwks.data,
+                                  conf->jwks_keys, XROOTD_MAX_JWKS_KEYS);
+        if (rc < 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "xrootd_webdav: failed to load JWKS from \"%V\"",
+                               &conf->token_jwks);
+            return NGX_CONF_ERROR;
+        }
+        conf->jwks_key_count = rc;
+    }
 
     return NGX_CONF_OK;
 }
@@ -732,6 +794,124 @@ webdav_build_ca_store(ngx_log_t *log,
         X509_STORE_set_default_paths(store);
     }
 
+    /* Load CRL(s) if configured (file or directory) */
+    if (conf->crl.len > 0) {
+        char       crl_buf[PATH_MAX];
+        struct stat crl_st;
+        int        crl_count = 0;
+
+        if (conf->crl.len >= sizeof(crl_buf)) {
+            X509_STORE_free(store);
+            return NULL;
+        }
+        ngx_memcpy(crl_buf, conf->crl.data, conf->crl.len);
+        crl_buf[conf->crl.len] = '\0';
+
+        if (stat(crl_buf, &crl_st) != 0) {
+            ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                          "xrootd_webdav: cannot stat CRL path \"%s\"",
+                          crl_buf);
+            X509_STORE_free(store);
+            return NULL;
+        }
+
+        if (S_ISREG(crl_st.st_mode)) {
+            /* Single file */
+            FILE      *fp;
+            X509_CRL  *crl_obj;
+
+            fp = fopen(crl_buf, "r");
+            if (fp == NULL) {
+                ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                              "xrootd_webdav: cannot open CRL \"%s\"",
+                              crl_buf);
+                X509_STORE_free(store);
+                return NULL;
+            }
+
+            while ((crl_obj = PEM_read_X509_CRL(fp, NULL, NULL, NULL))
+                   != NULL)
+            {
+                if (!X509_STORE_add_crl(store, crl_obj)) {
+                    ngx_log_error(NGX_LOG_WARN, log, 0,
+                                  "xrootd_webdav: failed to add CRL from "
+                                  "\"%s\"", crl_buf);
+                }
+                crl_count++;
+                X509_CRL_free(crl_obj);
+            }
+            fclose(fp);
+        } else if (S_ISDIR(crl_st.st_mode)) {
+            /* Directory — scan *.pem and *.r0-*.r9 */
+            DIR           *dir;
+            struct dirent *ent;
+
+            dir = opendir(crl_buf);
+            if (dir == NULL) {
+                ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                              "xrootd_webdav: cannot open CRL directory "
+                              "\"%s\"", crl_buf);
+                X509_STORE_free(store);
+                return NULL;
+            }
+
+            while ((ent = readdir(dir)) != NULL) {
+                const char *name = ent->d_name;
+                size_t      nlen = strlen(name);
+                char        fpath[PATH_MAX];
+                int         match = 0;
+                FILE       *fp;
+                X509_CRL   *crl_obj;
+
+                if (nlen > 4
+                    && strcmp(name + nlen - 4, ".pem") == 0)
+                {
+                    match = 1;
+                }
+                if (nlen > 3 && name[nlen - 3] == '.'
+                    && name[nlen - 2] == 'r'
+                    && name[nlen - 1] >= '0' && name[nlen - 1] <= '9')
+                {
+                    match = 1;
+                }
+                if (!match) {
+                    continue;
+                }
+
+                if (snprintf(fpath, sizeof(fpath), "%s/%s", crl_buf, name)
+                    >= (int) sizeof(fpath))
+                {
+                    continue;
+                }
+
+                if (stat(fpath, &crl_st) != 0 || !S_ISREG(crl_st.st_mode)) {
+                    continue;
+                }
+
+                fp = fopen(fpath, "r");
+                if (fp == NULL) {
+                    continue;
+                }
+                while ((crl_obj = PEM_read_X509_CRL(fp, NULL, NULL, NULL))
+                       != NULL)
+                {
+                    if (X509_STORE_add_crl(store, crl_obj)) {
+                        crl_count++;
+                    }
+                    X509_CRL_free(crl_obj);
+                }
+                fclose(fp);
+            }
+            closedir(dir);
+        }
+
+        if (crl_count > 0) {
+            X509_STORE_set_flags(store,
+                                 X509_V_FLAG_CRL_CHECK |
+                                 X509_V_FLAG_CRL_CHECK_ALL);
+        }
+    }
+
     return store;
 }
 
@@ -839,6 +1019,97 @@ webdav_verify_proxy_cert(ngx_http_request_t *r,
     return NGX_OK;
 }
 
+/*
+ * webdav_verify_bearer_token — authenticate via Authorization: Bearer <JWT>.
+ *
+ * Returns NGX_OK on success, NGX_HTTP_UNAUTHORIZED/FORBIDDEN on failure,
+ * NGX_DECLINED if no Bearer header present.
+ */
+static ngx_int_t
+webdav_verify_bearer_token(ngx_http_request_t *r,
+                           ngx_http_xrootd_webdav_loc_conf_t *conf)
+{
+    ngx_http_xrootd_webdav_req_ctx_t *ctx;
+    xrootd_token_claims_t claims;
+    ngx_str_t auth_hdr;
+    const char *token;
+    size_t token_len;
+    int rc, i;
+
+    /* Must have JWKS configured. */
+    if (conf->jwks_key_count <= 0) {
+        return NGX_DECLINED;
+    }
+
+    /* Get or create request context. */
+    ctx = ngx_http_get_module_ctx(r, ngx_http_xrootd_webdav_module);
+    if (ctx == NULL) {
+        ctx = ngx_pcalloc(r->pool, sizeof(*ctx));
+        if (ctx == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        ngx_http_set_ctx(r, ctx, ngx_http_xrootd_webdav_module);
+    }
+
+    /* Already verified via token (cached)? */
+    if (ctx->token_auth) {
+        return NGX_OK;
+    }
+
+    /* Extract Authorization header. */
+    if (r->headers_in.authorization == NULL) {
+        return NGX_DECLINED;
+    }
+
+    auth_hdr = r->headers_in.authorization->value;
+
+    /* Must start with "Bearer " (case-sensitive per RFC 6750). */
+    if (auth_hdr.len < 7 ||
+        ngx_strncmp(auth_hdr.data, "Bearer ", 7) != 0)
+    {
+        return NGX_DECLINED;
+    }
+
+    token     = (const char *)(auth_hdr.data + 7);
+    token_len = auth_hdr.len - 7;
+
+    /* Skip leading whitespace after "Bearer ". */
+    while (token_len > 0 && *token == ' ') {
+        token++;
+        token_len--;
+    }
+
+    if (token_len == 0) {
+        return NGX_HTTP_UNAUTHORIZED;
+    }
+
+    rc = xrootd_token_validate(r->connection->log, token, token_len,
+                               conf->jwks_keys, conf->jwks_key_count,
+                               (const char *) conf->token_issuer.data,
+                               (const char *) conf->token_audience.data,
+                               &claims);
+    if (rc != 0) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "xrootd_webdav: bearer token validation failed");
+        return NGX_HTTP_UNAUTHORIZED;
+    }
+
+    /* Store identity. */
+    ctx->verified   = 1;
+    ctx->token_auth = 1;
+    ngx_cpystrn((u_char *) ctx->dn, (u_char *) claims.sub, sizeof(ctx->dn));
+
+    /* Store scopes for write authorization. */
+    ctx->token_scope_count = claims.scope_count;
+    for (i = 0; i < claims.scope_count && i < XROOTD_MAX_TOKEN_SCOPES; i++) {
+        ctx->token_scopes[i] = claims.scopes[i];
+    }
+
+    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                  "xrootd_webdav: token auth OK sub=\"%s\" scopes=%d",
+                  claims.sub, claims.scope_count);
+
+    return NGX_OK;
+}
+
 /* ------------------------------------------------------------------ */
 /* HTTP date formatting helper                                          */
 /* ------------------------------------------------------------------ */
@@ -874,6 +1145,10 @@ ngx_http_xrootd_webdav_handler(ngx_http_request_t *r)
     /* ----- Authentication ------------------------------------------ */
     if (conf->auth != WEBDAV_AUTH_NONE) {
         auth_rc = webdav_verify_proxy_cert(r, conf);
+        if (auth_rc != NGX_OK) {
+            /* Try bearer token as fallback. */
+            auth_rc = webdav_verify_bearer_token(r, conf);
+        }
         if (auth_rc != NGX_OK && conf->auth == WEBDAV_AUTH_REQUIRED) {
             ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                           "xrootd_webdav: unauthenticated request rejected"
@@ -896,6 +1171,27 @@ ngx_http_xrootd_webdav_handler(ngx_http_request_t *r)
         /* Write methods require explicit opt-in */
         if (!conf->allow_write) {
             return NGX_HTTP_FORBIDDEN;
+        }
+        /* Token scope check for writes */
+        {
+            ngx_http_xrootd_webdav_req_ctx_t *rctx;
+            rctx = ngx_http_get_module_ctx(r, ngx_http_xrootd_webdav_module);
+            if (rctx && rctx->token_auth) {
+                char uri_path[WEBDAV_MAX_PATH];
+                size_t ulen = r->uri.len < sizeof(uri_path) - 1
+                              ? r->uri.len : sizeof(uri_path) - 1;
+                ngx_memcpy(uri_path, r->uri.data, ulen);
+                uri_path[ulen] = '\0';
+                if (!xrootd_token_check_write(rctx->token_scopes,
+                                              rctx->token_scope_count,
+                                              uri_path))
+                {
+                    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                                  "xrootd_webdav: token scope denies write "
+                                  "to \"%s\"", uri_path);
+                    return NGX_HTTP_FORBIDDEN;
+                }
+            }
         }
         /* Delegate body reading; the handler finishes asynchronously */
         r->request_body_in_single_buf = 1;
