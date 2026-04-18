@@ -270,6 +270,14 @@ http {
 /tmp/nginx-1.28.3/objs/nginx -p /tmp/xrd-test -c conf/nginx.conf
 ```
 
+Or use the repository helper (also manages the reference `xrootd` server on
+port 11096 used by conformance tests):
+
+```bash
+cd /path/to/nginx-xrootd
+tests/manage_test_servers.sh start
+```
+
 Quick smoke test:
 
 ```bash

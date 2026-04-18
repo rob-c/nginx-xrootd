@@ -54,6 +54,17 @@ cd /path/to/nginx-xrootd
 pytest -q
 ```
 
+Helper launcher for local test services:
+
+```bash
+cd /path/to/nginx-xrootd
+tests/manage_test_servers.sh start      # nginx + reference xrootd
+tests/manage_test_servers.sh status
+tests/manage_test_servers.sh restart nginx
+tests/manage_test_servers.sh stop
+tests/manage_test_servers.sh force-stop ref   # kill unmanaged ref listener on 11096
+```
+
 The main test harness in `tests/` expects nginx already running on the base anonymous/GSI/WebDAV ports. Some focused suites start their own sidecar nginx or reference services: conformance and bridge tests use a reference `xrootd`, VO ACL tests use a dedicated VOMS listener, privilege tests use a read-only listener, CRL tests use a revoked-cert listener, and token tests use the token-auth listener described in [building.md](building.md).
 
 ---
