@@ -11,3 +11,12 @@ __pycache__/
 # editor
 *.swp
 .DS_Store
+
+# local scratch output
+.tmp/
+
+# local agent and test caches
+.claude/
+.codex/
+.pytest_cache/
+.venv/
