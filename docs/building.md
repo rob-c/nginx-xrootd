@@ -11,7 +11,7 @@ This guide covers building the nginx-xrootd module from a clean machine. It incl
 ```bash
 sudo dnf install -y gcc make pcre2-devel zlib-devel openssl-devel \
     xrootd-client xrootd-server \
-    voms-libs \
+    voms-libs curl \
     python3 python3-pip
 ```
 
@@ -20,7 +20,7 @@ sudo dnf install -y gcc make pcre2-devel zlib-devel openssl-devel \
 ```bash
 sudo apt install -y build-essential libpcre2-dev zlib1g-dev libssl-dev \
     xrootd-client xrootd-server \
-    libvomsapi1 \
+    libvomsapi1 curl \
     python3 python3-pip python3-venv
 ```
 
@@ -35,6 +35,7 @@ Key packages and why they are needed:
 | `voms-libs` / `libvomsapi1` | `libvomsapi.so.1` runtime library (VO ACL enforcement via dlopen) |
 | `xrootd-client` | `xrdcp`, `xrdfs` command-line tools for testing |
 | `xrootd-server` | Reference `xrootd` daemon for interoperability tests |
+| `curl` | Runtime helper for optional HTTP-TPC WebDAV COPY pulls |
 | Python `cryptography` | Test PKI, proxy, CRL, and JWT token generation |
 
 VOMS support is loaded at runtime via `dlopen("libvomsapi.so.1")` — no compile-time VOMS headers or link flags are needed. If the library is present at startup, VO ACL enforcement is available; if absent, the module starts normally but `xrootd_require_vo` directives will fail with an error telling you to install `voms-libs` (EL9) or `libvomsapi1` (Debian/Ubuntu).
@@ -327,11 +328,17 @@ pytest tests/test_crl.py -v
 # WebDAV / HTTPS
 pytest tests/test_webdav.py -v
 
+# WebDAV HTTP-TPC and XrdHttp interop
+pytest tests/test_webdav_tpc.py -v
+
+# Native root:// TPC behavior
+pytest tests/test_root_tpc.py -v
+
 # Everything
 pytest -v
 ```
 
-The VO ACL tests (`test_vo_acl.py`) start their own nginx instance on port 11103 with `xrootd_require_vo` directives. They auto-generate VOMS proxies if expired or missing using the Python `voms_proxy_fake.py` utility in `utils/`. Token tests use the configured port 11099. CRL tests start a dedicated nginx instance on port 11100 plus WebDAV on 8444 so they do not disturb the main listener.
+The VO ACL tests (`test_vo_acl.py`) start their own nginx instance on port 11103 with `xrootd_require_vo` directives. They auto-generate VOMS proxies if expired or missing using the Python `voms_proxy_fake.py` utility in `utils/`. Token tests use the configured port 11099. CRL tests start a dedicated nginx instance on port 11100 plus WebDAV on 8444 so they do not disturb the main listener. The HTTP-TPC tests (`test_webdav_tpc.py`) start isolated nginx WebDAV endpoints on dynamic ports and, when the local XrdHttp plugins are installed, a reference xrootd HTTPS/TPC endpoint. The native root TPC tests (`test_root_tpc.py`) start an isolated nginx root:// endpoint and a TPC-capable reference xrootd server on dynamic ports.
 
 ---
 

@@ -432,7 +432,14 @@ The WebDAV module (`ngx_http_xrootd_webdav_module`) handles `davs://` clients in
 | `xrootd_webdav_cadir <path>` | `location` | — | Hashed CA directory |
 | `xrootd_webdav_cafile <path>` | `location` | — | Single CA PEM file |
 | `xrootd_webdav_crl <path>` | `location` | — | PEM CRL file for proxy-cert revocation checks |
-| `xrootd_webdav_allow_write on\|off` | `location` | `off` | Enable PUT/DELETE/MKCOL |
+| `xrootd_webdav_allow_write on\|off` | `location` | `off` | Enable PUT/DELETE/MKCOL and TPC COPY writes |
+| `xrootd_webdav_tpc on\|off` | `location` | `off` | Enable HTTP-TPC COPY pull support |
+| `xrootd_webdav_tpc_curl <path>` | `location` | `/usr/bin/curl` | External curl helper for TPC pulls |
+| `xrootd_webdav_tpc_cert <path>` | `location` | — | X.509 cert/proxy used for outbound TPC source fetches |
+| `xrootd_webdav_tpc_key <path>` | `location` | `xrootd_webdav_tpc_cert` | Private key used with the TPC cert |
+| `xrootd_webdav_tpc_cadir <path>` | `location` | `xrootd_webdav_cadir` | CA directory for outbound source TLS verification |
+| `xrootd_webdav_tpc_cafile <path>` | `location` | `xrootd_webdav_cafile` | CA bundle for outbound source TLS verification |
+| `xrootd_webdav_tpc_timeout <seconds>` | `location` | `0` | Optional curl max-time for TPC pulls |
 | `xrootd_webdav_proxy_certs on\|off` | `server` or `location` (HTTP) | `off` | Accept RFC 3820 proxy certs |
 | `xrootd_webdav_verify_depth <n>` | `location` | `10` | Proxy chain depth limit |
 | `xrootd_webdav_token_jwks <path>` | `location` | — | JWKS for Bearer tokens |

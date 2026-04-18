@@ -217,22 +217,21 @@ def _build_voms_ac(
 
     # --- Holder (identifies the user cert) ---
     # holder ::= SEQUENCE {
-    #   baseCertificateID [0] {
-    #     issuer GeneralNames,
+    #   baseCertificateID [0] IMPLICIT IssuerSerial {
+    #     issuer GeneralNames,   -- user cert subject (VOMS convention)
     #     serial INTEGER
     #   }
     # }
-    holder_issuer_dn = _encode_general_names(user_cert.issuer)
+    holder_issuer_dn = _encode_general_names(user_cert.subject)
     holder_serial = _der_int(user_cert.serial_number)
-    base_cert_id = _der_seq(holder_issuer_dn + holder_serial)
-    holder = _der_seq(_der_explicit(0, base_cert_id))
+    holder = _der_seq(_der_explicit(0, holder_issuer_dn + holder_serial))
 
     # --- Issuer (v2Form — the VOMS server) ---
-    # AttCertIssuer ::= [0] SEQUENCE {
+    # AttCertIssuer ::= [0] IMPLICIT v2Form SEQUENCE {
     #   issuerName GeneralNames
     # }
     issuer_dn = _der_seq(_der_explicit(4, _encode_name(voms_cert.subject)))
-    ac_issuer = _der_explicit(0, _der_seq(issuer_dn))
+    ac_issuer = _der_explicit(0, issuer_dn)
 
     # --- Signature algorithm identifier ---
     sig_alg = _der_seq(_der_oid(OID_SHA256_RSA) + _der_null())
@@ -262,10 +261,11 @@ def _build_voms_ac(
 
     # --- Extensions ---
     # 1. Embedded VOMS signing cert (OID_VOMS_CERTS)
+    # Value is SEQUENCE OF SEQUENCE OF Certificate (chain-of-chains).
     voms_cert_der = voms_cert.public_bytes(serialization.Encoding.DER)
     certs_ext = _der_seq(
         _der_oid(OID_VOMS_CERTS) +
-        _der_octet_string(voms_cert_der)
+        _der_octet_string(_der_seq(_der_seq(voms_cert_der)))
     )
 
     # 2. noRevocationAvailable

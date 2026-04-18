@@ -84,7 +84,7 @@ Full setup: [docs/getting-started.md](docs/getting-started.md)
 ## Features
 
 - **XRootD operations:** `stat`, `open`, `read`, `readv`, `close`, `mkdir`, `rm`, `rmdir`, `mv`, `chmod`, `truncate`, checksum and space queries
-- **WebDAV operations:** OPTIONS, GET (with Range), HEAD, PUT, DELETE, MKCOL, PROPFIND — the full set required by `xrdcp` via `davs://`
+- **WebDAV operations:** OPTIONS, GET (with Range), HEAD, PUT, DELETE, MKCOL, PROPFIND, and opt-in HTTP-TPC COPY pull support for `https://` sources
 - **Authentication:** anonymous access, GSI/x509 proxy certificates, and WLCG/JWT bearer tokens
 - **Async I/O:** nginx thread-pool support so disk operations never block the event loop
 - **Observability:** per-request access logs and Prometheus metrics
@@ -113,7 +113,7 @@ Full setup: [docs/getting-started.md](docs/getting-started.md)
 
 ## Status
 
-The Python suite currently collects 459 tests for xrdcp / XRootD Python client v5.9.2 and nginx 1.28.3. Run `pytest -v` against the test nginx layout in [docs/building.md](docs/building.md) for a full pass/fail result.
+The Python suite covers xrdcp / XRootD Python client behavior, WebDAV, HTTP-TPC interop, auth, ACLs, and hardening paths against nginx 1.28.3. Run `pytest -v` against the test nginx layout in [docs/building.md](docs/building.md) for a full pass/fail result.
 
 ## License
 

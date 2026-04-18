@@ -650,7 +650,26 @@ xrootd_handle_token_auth(xrootd_ctx_t *ctx, ngx_connection_t *c,
 
 
 /*
- * xrootd_handle_auth — handle GSI authentication sub-steps.
+ * xrootd_handle_auth — top-level kXR_auth dispatcher.
+ *
+ * This function is the entry point for ALL authentication in the module.
+ * It routes to one of two paths based on the 4-byte credential type
+ * in the request header:
+ *
+ *   "ztn\0" → Bearer token (JWT/WLCG), handled by xrootd_handle_token_auth()
+ *   "gsi\0" → GSI/x509, handled inline below via a two-step exchange:
+ *
+ *     Step 1 (kXGC_certreq = 1000):
+ *       Client sends a DH public key + cipher list.
+ *       Server replies with its own DH public key + x509 certificate chain.
+ *
+ *     Step 2 (kXGS_cert = 2001):
+ *       Client sends its x509 proxy certificate chain + signed DH parameters.
+ *       Server verifies the chain against the CA store, extracts the subject
+ *       DN and optional VOMS attributes, and (if valid) marks auth_done=1.
+ *
+ * After authentication, ctx->dn holds the subject and ctx->vo_list holds
+ * any VOMS VOs.  These are used by VO ACL checks in the file handlers.
  */
 ngx_int_t
 xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c)

@@ -5,6 +5,24 @@
 /* ================================================================== */
 
 /*
+ * This file builds the wire-format response buffers for kXR_read and kXR_readv.
+ * The same code serves two execution models:
+ *
+ *   Synchronous (no thread pool): the handler in read_handlers.c calls
+ *   pread(2) directly, then calls xrootd_build_{read,readv}_response()
+ *   to frame the data into chunked kXR_oksofar / kXR_ok responses.
+ *
+ *   Asynchronous (NGX_THREADS): the handler posts a task to nginx's
+ *   thread pool.  The pread(2) runs on a worker thread, and the
+ *   completion callback calls the same response builders here.
+ *
+ * For kXR_readv, the wire format uses a readv_element array where each
+ * element pairs a (fhandle, length, offset) request with the corresponding
+ * data payload.  The response interleaves 16-byte kXR_readv_iov headers
+ * with the actual data segments.
+ */
+
+/*
  * xrootd_build_read_response — build the chunked kXR_read response buffer.
  */
 u_char *

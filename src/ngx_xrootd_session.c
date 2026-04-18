@@ -5,6 +5,18 @@
 /* ================================================================== */
 
 /*
+ * Session-level protocol operations:
+ *   - kXR_protocol — negotiate version and auth capabilities
+ *   - kXR_login    — establish a session (server assigns a session id)
+ *   - kXR_ping     — connection liveness check
+ *   - kXR_endsess  — tear down a session (close open handles, reset state)
+ *
+ * These run before any file I/O and establish the session identity.
+ * kXR_login must precede kXR_auth; kXR_auth (in gsi.c) must complete
+ * before file handlers will accept requests.
+ */
+
+/*
  * kXR_protocol — negotiate protocol capabilities.
  */
 ngx_int_t

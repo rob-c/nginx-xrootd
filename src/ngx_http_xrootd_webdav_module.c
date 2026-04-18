@@ -24,6 +24,10 @@
  *         MKCOL     – create directory
  *         PROPFIND  – WebDAV stat (Depth:0) and directory listing (Depth:1)
  *
+ *       COPY / HTTP-TPC is deliberately kept in ngx_http_xrootd_webdav_tpc.c.
+ *       The dispatcher below still performs the generic WebDAV checks
+ *       (auth, writes enabled, token scope) before delegating to that file.
+ *
  * nginx configuration:
  *
  *   server {
@@ -55,7 +59,6 @@
 #include <ngx_http.h>
 #include <ngx_http_ssl_module.h>
 
-#include <ctype.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
@@ -66,60 +69,18 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <time.h>
+#include <unistd.h>
 
-#include "ngx_xrootd_token.h"
+#include "ngx_http_xrootd_webdav_module.h"
 
 size_t xrootd_sanitize_log_string(const char *in, char *out, size_t outsz);
 
-/* Maximum path length we'll construct */
-#define WEBDAV_MAX_PATH   4096
 /* Maximum PUT body size (16 MiB) */
 #define WEBDAV_MAX_PUT    (16 * 1024 * 1024)
 /* PROPFIND response buffer initial size */
 #define WEBDAV_XML_CHUNK  4096
-
-/* ------------------------------------------------------------------ */
-/* Module config structs                                                */
-/* ------------------------------------------------------------------ */
-
-typedef enum {
-    WEBDAV_AUTH_NONE,
-    WEBDAV_AUTH_OPTIONAL,
-    WEBDAV_AUTH_REQUIRED,
-} webdav_auth_t;
-
-typedef struct {
-    ngx_flag_t     enable;
-    ngx_str_t      root;
-    ngx_str_t      cadir;
-    ngx_str_t      cafile;
-    ngx_str_t      crl;           /* xrootd_webdav_crl /path/to/crl.pem */
-    ngx_uint_t     verify_depth;
-    ngx_uint_t     auth;          /* webdav_auth_t */
-    ngx_flag_t     proxy_certs;  /* set X509_V_FLAG_ALLOW_PROXY_CERTS on SSL CTX */
-    ngx_flag_t     allow_write;
-
-    /* Token (JWT/WLCG) authentication */
-    ngx_str_t      token_jwks;
-    ngx_str_t      token_issuer;
-    ngx_str_t      token_audience;
-
-    /* Loaded JWKS keys (populated at postconfiguration) */
-    xrootd_jwks_key_t  jwks_keys[XROOTD_MAX_JWKS_KEYS];
-    int                 jwks_key_count;
-} ngx_http_xrootd_webdav_loc_conf_t;
-
-/* Per-request auth result: cached across sub-handlers */
-typedef struct {
-    int            verified;      /* 1 = chain passed, 0 = failed/absent */
-    char           dn[1024];
-    int            token_auth;    /* 1 = authenticated via bearer token */
-    int            token_scope_count;
-    xrootd_token_scope_t  token_scopes[XROOTD_MAX_TOKEN_SCOPES];
-} ngx_http_xrootd_webdav_req_ctx_t;
 
 /* ------------------------------------------------------------------ */
 /* Forward declarations                                                */
@@ -134,11 +95,10 @@ static ngx_int_t webdav_handle_delete(ngx_http_request_t *r);
 static ngx_int_t webdav_handle_mkcol(ngx_http_request_t *r);
 static ngx_int_t webdav_handle_propfind(ngx_http_request_t *r);
 
-static ngx_int_t webdav_resolve_path(ngx_http_request_t *r,
-                                     const ngx_str_t *root,
-                                     char *out, size_t outsz);
 static ngx_int_t webdav_verify_proxy_cert(ngx_http_request_t *r,
                                           ngx_http_xrootd_webdav_loc_conf_t *cf);
+static ngx_int_t webdav_check_token_write_scope(ngx_http_request_t *r,
+                                                const char *method_name);
 
 static void     *ngx_http_xrootd_webdav_create_loc_conf(ngx_conf_t *cf);
 static char     *ngx_http_xrootd_webdav_merge_loc_conf(ngx_conf_t *cf,
@@ -222,6 +182,60 @@ static ngx_command_t ngx_http_xrootd_webdav_commands[] = {
       offsetof(ngx_http_xrootd_webdav_loc_conf_t, allow_write),
       NULL },
 
+    /*
+     * HTTP-TPC directives are declared here because nginx requires all
+     * directives for a module to live in that module's command table.  Their
+     * defaulting and request handling live in ngx_http_xrootd_webdav_tpc.c.
+     */
+    { ngx_string("xrootd_webdav_tpc"),
+      NGX_HTTP_LOC_CONF | NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_xrootd_webdav_loc_conf_t, tpc),
+      NULL },
+
+    { ngx_string("xrootd_webdav_tpc_curl"),
+      NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_xrootd_webdav_loc_conf_t, tpc_curl),
+      NULL },
+
+    { ngx_string("xrootd_webdav_tpc_cert"),
+      NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_xrootd_webdav_loc_conf_t, tpc_cert),
+      NULL },
+
+    { ngx_string("xrootd_webdav_tpc_key"),
+      NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_xrootd_webdav_loc_conf_t, tpc_key),
+      NULL },
+
+    { ngx_string("xrootd_webdav_tpc_cadir"),
+      NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_xrootd_webdav_loc_conf_t, tpc_cadir),
+      NULL },
+
+    { ngx_string("xrootd_webdav_tpc_cafile"),
+      NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_xrootd_webdav_loc_conf_t, tpc_cafile),
+      NULL },
+
+    { ngx_string("xrootd_webdav_tpc_timeout"),
+      NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_xrootd_webdav_loc_conf_t, tpc_timeout),
+      NULL },
+
     { ngx_string("xrootd_webdav_token_jwks"),
       NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
@@ -295,6 +309,7 @@ ngx_http_xrootd_webdav_create_loc_conf(ngx_conf_t *cf)
     conf->auth        = NGX_CONF_UNSET_UINT;
     conf->proxy_certs = NGX_CONF_UNSET;
     conf->allow_write = NGX_CONF_UNSET;
+    ngx_http_xrootd_webdav_tpc_create_loc_conf(conf);
 
     return conf;
 }
@@ -316,6 +331,7 @@ ngx_http_xrootd_webdav_merge_loc_conf(ngx_conf_t *cf,
                               WEBDAV_AUTH_OPTIONAL);
     ngx_conf_merge_value(conf->proxy_certs,  prev->proxy_certs,  0);
     ngx_conf_merge_value(conf->allow_write,  prev->allow_write,  0);
+    ngx_http_xrootd_webdav_tpc_merge_loc_conf(conf, prev);
 
     ngx_conf_merge_str_value(conf->token_jwks,     prev->token_jwks,     "");
     ngx_conf_merge_str_value(conf->token_issuer,   prev->token_issuer,   "");
@@ -433,9 +449,10 @@ webdav_hex_digit(u_char value)
                         : (u_char) ('A' + (value - 10));
 }
 
-static void
-webdav_log_safe_path(ngx_log_t *log, ngx_uint_t level, ngx_err_t err,
-                     const char *prefix, const char *path)
+void
+ngx_http_xrootd_webdav_log_safe_path(ngx_log_t *log, ngx_uint_t level,
+                                     ngx_err_t err, const char *prefix,
+                                     const char *path)
 {
     char safe_path[512];
 
@@ -600,9 +617,10 @@ webdav_escape_xml_text(ngx_pool_t *pool, const char *src)
 /* on traversal attack or other error.                                  */
 /* ------------------------------------------------------------------ */
 
-static ngx_int_t
-webdav_resolve_path(ngx_http_request_t *r, const ngx_str_t *root,
-                    char *out, size_t outsz)
+ngx_int_t
+ngx_http_xrootd_webdav_resolve_path(ngx_http_request_t *r,
+                                    const ngx_str_t *root,
+                                    char *out, size_t outsz)
 {
     char   root_buf[PATH_MAX];
     char   root_canon[PATH_MAX];
@@ -646,9 +664,11 @@ webdav_resolve_path(ngx_http_request_t *r, const ngx_str_t *root,
     }
 
     if (webdav_path_has_forbidden_components(uri_decoded)) {
-        webdav_log_safe_path(r->connection->log, NGX_LOG_WARN, 0,
-                             "xrootd_webdav: path traversal attempt",
-                             uri_decoded);
+        ngx_http_xrootd_webdav_log_safe_path(r->connection->log,
+                                             NGX_LOG_WARN, 0,
+                                             "xrootd_webdav: path traversal "
+                                             "attempt",
+                                             uri_decoded);
         return NGX_HTTP_FORBIDDEN;
     }
 
@@ -687,16 +707,20 @@ webdav_resolve_path(ngx_http_request_t *r, const ngx_str_t *root,
             ngx_memcpy(filename, slash + 1, fname_len + 1);
 
             if (realpath(parent, parent_canon) == NULL) {
-                webdav_log_safe_path(r->connection->log, NGX_LOG_WARN, errno,
-                                     "xrootd_webdav: cannot resolve parent of",
-                                     combined);
+                ngx_http_xrootd_webdav_log_safe_path(r->connection->log,
+                                                     NGX_LOG_WARN, errno,
+                                                     "xrootd_webdav: cannot "
+                                                     "resolve parent of",
+                                                     combined);
                 return NGX_HTTP_NOT_FOUND;
             }
 
             if (!webdav_path_within_root(root_canon, parent_canon)) {
-                webdav_log_safe_path(r->connection->log, NGX_LOG_WARN, 0,
-                                     "xrootd_webdav: path traversal blocked",
-                                     parent_canon);
+                ngx_http_xrootd_webdav_log_safe_path(r->connection->log,
+                                                     NGX_LOG_WARN, 0,
+                                                     "xrootd_webdav: path "
+                                                     "traversal blocked",
+                                                     parent_canon);
                 return NGX_HTTP_FORBIDDEN;
             }
 
@@ -705,18 +729,22 @@ webdav_resolve_path(ngx_http_request_t *r, const ngx_str_t *root,
                 return NGX_HTTP_REQUEST_URI_TOO_LARGE;
             }
         } else {
-            webdav_log_safe_path(r->connection->log, NGX_LOG_WARN, errno,
-                                 "xrootd_webdav: cannot resolve",
-                                 combined);
+            ngx_http_xrootd_webdav_log_safe_path(r->connection->log,
+                                                 NGX_LOG_WARN, errno,
+                                                 "xrootd_webdav: cannot "
+                                                 "resolve",
+                                                 combined);
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
     }
 
     /* Traverse-attack check: resolved path must remain under root */
     if (!webdav_path_within_root(root_canon, resolved)) {
-        webdav_log_safe_path(r->connection->log, NGX_LOG_WARN, 0,
-                             "xrootd_webdav: path traversal blocked",
-                             resolved);
+        ngx_http_xrootd_webdav_log_safe_path(r->connection->log,
+                                             NGX_LOG_WARN, 0,
+                                             "xrootd_webdav: path traversal "
+                                             "blocked",
+                                             resolved);
         return NGX_HTTP_FORBIDDEN;
     }
 
@@ -1020,6 +1048,43 @@ webdav_verify_proxy_cert(ngx_http_request_t *r,
 }
 
 /*
+ * Bearer-token write authorization used by WebDAV mutating methods that carry
+ * object data or fetch object data from elsewhere.  The x509 path does not
+ * have WLCG scopes, so there is nothing to check for certificate-authenticated
+ * requests.
+ */
+static ngx_int_t
+webdav_check_token_write_scope(ngx_http_request_t *r, const char *method_name)
+{
+    ngx_http_xrootd_webdav_req_ctx_t *rctx;
+    char                              uri_path[WEBDAV_MAX_PATH];
+    size_t                            ulen;
+
+    rctx = ngx_http_get_module_ctx(r, ngx_http_xrootd_webdav_module);
+    if (rctx == NULL || !rctx->token_auth) {
+        return NGX_OK;
+    }
+
+    ulen = r->uri.len < sizeof(uri_path) - 1
+           ? r->uri.len : sizeof(uri_path) - 1;
+    ngx_memcpy(uri_path, r->uri.data, ulen);
+    uri_path[ulen] = '\0';
+
+    if (xrootd_token_check_write(rctx->token_scopes,
+                                 rctx->token_scope_count,
+                                 uri_path))
+    {
+        return NGX_OK;
+    }
+
+    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                  "xrootd_webdav: token scope denies %s write to \"%s\"",
+                  method_name, uri_path);
+
+    return NGX_HTTP_FORBIDDEN;
+}
+
+/*
  * webdav_verify_bearer_token — authenticate via Authorization: Bearer <JWT>.
  *
  * Returns NGX_OK on success, NGX_HTTP_UNAUTHORIZED/FORBIDDEN on failure,
@@ -1168,35 +1233,20 @@ ngx_http_xrootd_webdav_handler(ngx_http_request_t *r)
         return webdav_handle_get(r);
     }
     if (r->method == NGX_HTTP_PUT) {
+        ngx_int_t rc;
+
         /* Write methods require explicit opt-in */
         if (!conf->allow_write) {
             return NGX_HTTP_FORBIDDEN;
         }
-        /* Token scope check for writes */
-        {
-            ngx_http_xrootd_webdav_req_ctx_t *rctx;
-            rctx = ngx_http_get_module_ctx(r, ngx_http_xrootd_webdav_module);
-            if (rctx && rctx->token_auth) {
-                char uri_path[WEBDAV_MAX_PATH];
-                size_t ulen = r->uri.len < sizeof(uri_path) - 1
-                              ? r->uri.len : sizeof(uri_path) - 1;
-                ngx_memcpy(uri_path, r->uri.data, ulen);
-                uri_path[ulen] = '\0';
-                if (!xrootd_token_check_write(rctx->token_scopes,
-                                              rctx->token_scope_count,
-                                              uri_path))
-                {
-                    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                                  "xrootd_webdav: token scope denies write "
-                                  "to \"%s\"", uri_path);
-                    return NGX_HTTP_FORBIDDEN;
-                }
-            }
+        rc = webdav_check_token_write_scope(r, "PUT");
+        if (rc != NGX_OK) {
+            return rc;
         }
+
         /* Delegate body reading; the handler finishes asynchronously */
         r->request_body_in_single_buf = 1;
-        ngx_int_t rc = ngx_http_read_client_request_body(
-                           r, webdav_handle_put_body);
+        rc = ngx_http_read_client_request_body(r, webdav_handle_put_body);
         if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
             return rc;
         }
@@ -1216,6 +1266,24 @@ ngx_http_xrootd_webdav_handler(ngx_http_request_t *r)
             return NGX_HTTP_FORBIDDEN;
         }
         return webdav_handle_mkcol(r);
+    }
+    /* COPY - HTTP/WebDAV third-party-copy pull into this endpoint */
+    if (r->method_name.len == 4 &&
+        ngx_strncmp(r->method_name.data, "COPY", 4) == 0)
+    {
+        ngx_int_t rc;
+
+        if (!conf->allow_write) {
+            return NGX_HTTP_FORBIDDEN;
+        }
+        if (!conf->tpc) {
+            return NGX_HTTP_NOT_ALLOWED;
+        }
+        rc = webdav_check_token_write_scope(r, "COPY");
+        if (rc != NGX_OK) {
+            return rc;
+        }
+        return ngx_http_xrootd_webdav_tpc_handle_copy(r);
     }
     /* PROPFIND */
     if (r->method_name.len == 8 &&
@@ -1254,7 +1322,10 @@ webdav_handle_options(ngx_http_request_t *r)
     if (h == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
     h->hash = 1;
     ngx_str_set(&h->key, "Allow");
-    if (conf->allow_write) {
+    if (conf->allow_write && conf->tpc) {
+        ngx_str_set(&h->value,
+            "OPTIONS, GET, HEAD, PUT, DELETE, MKCOL, COPY, PROPFIND");
+    } else if (conf->allow_write) {
         ngx_str_set(&h->value,
             "OPTIONS, GET, HEAD, PUT, DELETE, MKCOL, PROPFIND");
     } else {
@@ -1287,7 +1358,8 @@ webdav_handle_head(ngx_http_request_t *r, int send_body)
 
     conf = ngx_http_get_module_loc_conf(r, ngx_http_xrootd_webdav_module);
 
-    rc = webdav_resolve_path(r, &conf->root, path, sizeof(path));
+    rc = ngx_http_xrootd_webdav_resolve_path(r, &conf->root, path,
+                                             sizeof(path));
     if (rc != NGX_OK) return (ngx_int_t) rc;
 
     if (stat(path, &sb) != 0) {
@@ -1351,7 +1423,8 @@ webdav_handle_get(ngx_http_request_t *r)
 
     conf = ngx_http_get_module_loc_conf(r, ngx_http_xrootd_webdav_module);
 
-    rc = webdav_resolve_path(r, &conf->root, path, sizeof(path));
+    rc = ngx_http_xrootd_webdav_resolve_path(r, &conf->root, path,
+                                             sizeof(path));
     if (rc != NGX_OK) return (ngx_int_t) rc;
 
     if (stat(path, &sb) != 0) {
@@ -1422,8 +1495,11 @@ webdav_handle_get(ngx_http_request_t *r)
 
     fd = ngx_open_file(path, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
     if (fd == NGX_INVALID_FILE) {
-        webdav_log_safe_path(r->connection->log, NGX_LOG_ERR, ngx_errno,
-                             "xrootd_webdav: open() failed for", path);
+        ngx_http_xrootd_webdav_log_safe_path(r->connection->log, NGX_LOG_ERR,
+                                             ngx_errno,
+                                             "xrootd_webdav: open() failed "
+                                             "for",
+                                             path);
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
@@ -1512,7 +1588,8 @@ webdav_handle_put_body(ngx_http_request_t *r)
 
     conf = ngx_http_get_module_loc_conf(r, ngx_http_xrootd_webdav_module);
 
-    rc = webdav_resolve_path(r, &conf->root, path, sizeof(path));
+    rc = ngx_http_xrootd_webdav_resolve_path(r, &conf->root, path,
+                                             sizeof(path));
     if (rc != NGX_OK) {
         ngx_http_finalize_request(r, (ngx_int_t) rc);
         return;
@@ -1526,9 +1603,11 @@ webdav_handle_put_body(ngx_http_request_t *r)
                        NGX_FILE_CREATE_OR_OPEN | NGX_FILE_TRUNCATE,
                        NGX_FILE_DEFAULT_ACCESS);
     if (fd == NGX_INVALID_FILE) {
-        webdav_log_safe_path(r->connection->log, NGX_LOG_ERR, ngx_errno,
-                             "xrootd_webdav: open() for write failed for",
-                             path);
+        ngx_http_xrootd_webdav_log_safe_path(r->connection->log, NGX_LOG_ERR,
+                                             ngx_errno,
+                                             "xrootd_webdav: open() for write "
+                                             "failed for",
+                                             path);
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
@@ -1548,10 +1627,10 @@ webdav_handle_put_body(ngx_http_request_t *r)
                     ssize_t rd = pread(buf->file->fd, tmp, chunk, off);
                     if (rd <= 0) break;
                     if (write(fd, tmp, (size_t) rd) != rd) {
-                        webdav_log_safe_path(r->connection->log, NGX_LOG_ERR,
-                                             ngx_errno,
-                                             "xrootd_webdav: write() failed for",
-                                             path);
+                        ngx_http_xrootd_webdav_log_safe_path(
+                            r->connection->log, NGX_LOG_ERR, ngx_errno,
+                            "xrootd_webdav: write() failed for",
+                            path);
                         ngx_close_file(fd);
                         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
                         return;
@@ -1562,10 +1641,10 @@ webdav_handle_put_body(ngx_http_request_t *r)
             } else if (buf->pos < buf->last) {
                 n = write(fd, buf->pos, (size_t)(buf->last - buf->pos));
                 if (n < 0) {
-                    webdav_log_safe_path(r->connection->log, NGX_LOG_ERR,
-                                         ngx_errno,
-                                         "xrootd_webdav: write() failed for",
-                                         path);
+                    ngx_http_xrootd_webdav_log_safe_path(
+                        r->connection->log, NGX_LOG_ERR, ngx_errno,
+                        "xrootd_webdav: write() failed for",
+                        path);
                     ngx_close_file(fd);
                     ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
                     return;
@@ -1596,7 +1675,8 @@ webdav_handle_delete(ngx_http_request_t *r)
 
     conf = ngx_http_get_module_loc_conf(r, ngx_http_xrootd_webdav_module);
 
-    rc = webdav_resolve_path(r, &conf->root, path, sizeof(path));
+    rc = ngx_http_xrootd_webdav_resolve_path(r, &conf->root, path,
+                                             sizeof(path));
     if (rc != NGX_OK) return (ngx_int_t) rc;
 
     if (stat(path, &sb) != 0) {
@@ -1634,7 +1714,8 @@ webdav_handle_mkcol(ngx_http_request_t *r)
 
     conf = ngx_http_get_module_loc_conf(r, ngx_http_xrootd_webdav_module);
 
-    rc = webdav_resolve_path(r, &conf->root, path, sizeof(path));
+    rc = ngx_http_xrootd_webdav_resolve_path(r, &conf->root, path,
+                                             sizeof(path));
     /* 404 from resolve means the parent directory doesn't exist → 409 Conflict */
     if (rc == (ngx_int_t) NGX_HTTP_NOT_FOUND) return NGX_HTTP_CONFLICT;
     if (rc != NGX_OK) return (ngx_int_t) rc;
@@ -1780,7 +1861,8 @@ webdav_handle_propfind(ngx_http_request_t *r)
 
     conf = ngx_http_get_module_loc_conf(r, ngx_http_xrootd_webdav_module);
 
-    rc = webdav_resolve_path(r, &conf->root, path, sizeof(path));
+    rc = ngx_http_xrootd_webdav_resolve_path(r, &conf->root, path,
+                                             sizeof(path));
     if (rc != NGX_OK) return (ngx_int_t) rc;
 
     if (stat(path, &sb) != 0) {

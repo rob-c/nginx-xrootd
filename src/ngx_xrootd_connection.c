@@ -205,6 +205,25 @@ ngx_stream_xrootd_recv(ngx_event_t *rev)
 
             if (ctx->state == XRD_ST_HANDSHAKE) {
                 ctx->hdr_pos += avail;
+
+                /*
+                 * Fast-reject non-XRootD clients (HTTP crawlers, port scanners).
+                 *
+                 * A valid XRootD handshake is 20 bytes whose first 12 are all
+                 * zero.  HTTP requests always start with a printable ASCII byte
+                 * ('G' for GET, 'P' for POST/PUT, 'H' for HEAD, etc.).  We can
+                 * therefore reject any connection whose first byte is non-zero
+                 * without waiting for the full 20-byte frame, avoiding pool
+                 * allocations and all downstream processing that would normally
+                 * happen before the magic-value check in xrootd_process_handshake.
+                 */
+                if (ctx->hdr_pos >= 1 && ctx->hdr_buf[0] != 0) {
+                    ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                                   "xrootd: non-XRootD client (first byte 0x%02xd)"
+                                   " — closing immediately",
+                                   (unsigned) ctx->hdr_buf[0]);
+                    break;
+                }
             } else if (ctx->state == XRD_ST_REQ_HEADER) {
                 ctx->hdr_pos += avail;
             } else {

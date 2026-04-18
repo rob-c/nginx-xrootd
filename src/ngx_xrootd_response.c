@@ -4,6 +4,18 @@
 /*  Response builders                                                   */
 /* ================================================================== */
 
+/*
+ * Low-level response construction for the XRootD wire protocol:
+ *   - xrootd_build_resp_hdr — fill the 8-byte response header
+ *   - xrootd_send_ok        — send a kXR_ok with optional body
+ *   - xrootd_send_error     — send a kXR_error with errcode + message
+ *   - xrootd_send_pgwrite_status — send a kXR_ok with pgwrite offset
+ *   - xrootd_crc32c          — software CRC32c (Castagnoli) for pgwrite
+ *
+ * All response framing goes through xrootd_queue_response() in
+ * connection.c, which handles partial writes and EAGAIN buffering.
+ */
+
 void
 xrootd_build_resp_hdr(const u_char *streamid, uint16_t status,
                       uint32_t dlen, ServerResponseHdr *out)

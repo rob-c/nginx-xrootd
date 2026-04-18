@@ -45,6 +45,11 @@ http {
             xrootd_webdav_auth    optional;    # or: none | required
             xrootd_webdav_allow_write on;
 
+            # Optional HTTP-TPC pull support (COPY with a Source header)
+            xrootd_webdav_tpc       on;
+            xrootd_webdav_tpc_cert  /etc/grid-security/xrd/xrdcert.pem;
+            xrootd_webdav_tpc_key   /etc/grid-security/xrd/xrdkey.pem;
+
             # Optional bearer-token auth
             xrootd_webdav_token_jwks     /etc/tokens/jwks.json;
             xrootd_webdav_token_issuer   "https://idp.example.com";
@@ -116,7 +121,65 @@ PEM CRL file used when verifying proxy-certificate chains. When configured, Open
 
 **Context:** `location` · **Default:** `off`
 
-Enables PUT, DELETE, and MKCOL. Off by default so read-only deployments are safe without extra configuration. When the request is accepted via a bearer token, `PUT` also requires a matching `storage.write` or `storage.create` scope for the request path.
+Enables PUT, DELETE, MKCOL, and HTTP-TPC COPY when `xrootd_webdav_tpc on` is also configured. Off by default so read-only deployments are safe without extra configuration. When the request is accepted via a bearer token, `PUT` and TPC `COPY` also require a matching `storage.write` or `storage.create` scope for the request path.
+
+---
+
+### `xrootd_webdav_tpc on|off`
+
+**Context:** `location` · **Default:** `off`
+
+Enables HTTP third-party copy pull requests using WebDAV `COPY` with a remote `Source` header. The destination is the request URI on this server.
+
+This is an explicit opt-in because the nginx worker starts an external `curl` helper and the server makes an outbound HTTPS request to the `Source` URL. Only `https://` sources are accepted. The request waits for `curl` to finish, so set `xrootd_webdav_tpc_timeout` and size nginx workers accordingly for production transfers.
+
+---
+
+### `xrootd_webdav_tpc_curl <path>`
+
+**Context:** `location` · **Default:** `/usr/bin/curl`
+
+Path to the `curl` executable used for HTTP-TPC pulls. The helper is run without a shell.
+
+---
+
+### `xrootd_webdav_tpc_cert <path>`
+
+**Context:** `location`
+
+PEM certificate or proxy certificate used by the server when it pulls from the remote HTTPS source. For proxy PEM files that contain both certificate and private key, set only this directive or set `xrootd_webdav_tpc_key` to the same path.
+
+---
+
+### `xrootd_webdav_tpc_key <path>`
+
+**Context:** `location` · **Default:** `xrootd_webdav_tpc_cert`
+
+PEM private key used with `xrootd_webdav_tpc_cert`.
+
+---
+
+### `xrootd_webdav_tpc_cadir <path>`
+
+**Context:** `location` · **Default:** `xrootd_webdav_cadir`
+
+CA directory passed to `curl --capath` when verifying the source HTTPS endpoint.
+
+---
+
+### `xrootd_webdav_tpc_cafile <path>`
+
+**Context:** `location` · **Default:** `xrootd_webdav_cafile`
+
+CA bundle passed to `curl --cacert` when verifying the source HTTPS endpoint.
+
+---
+
+### `xrootd_webdav_tpc_timeout <seconds>`
+
+**Context:** `location` · **Default:** `0` (curl default)
+
+Maximum wall-clock time passed to `curl --max-time` for a single HTTP-TPC pull.
 
 ---
 
@@ -172,6 +235,7 @@ Expected JWT `aud` claim.
 | `PUT` | Upload; returns 201 on create, 204 on overwrite |
 | `DELETE` | Removes files and empty directories |
 | `MKCOL` | Creates a directory; trailing slash in URL is accepted |
+| `COPY` | HTTP-TPC pull when `xrootd_webdav_tpc on`; remote source comes from the `Source` header |
 | `PROPFIND` | `Depth: 0` for stat, `Depth: 1` for directory listing; returns `207 Multi-Status` XML |
 
 ---
@@ -215,6 +279,29 @@ curl -sk -H "Authorization: Bearer $TOKEN" \
 curl -sk -X PUT -H "Authorization: Bearer $TOKEN" \
   --data-binary @localfile.txt https://host:8443/file.txt
 ```
+
+---
+
+## HTTP-TPC pull
+
+With `xrootd_webdav_tpc on`, this module accepts the WLCG-style WebDAV `COPY` pull shape:
+
+```bash
+curl -sk --cert /tmp/x509up_u$(id -u) --key /tmp/x509up_u$(id -u) \
+  --capath /etc/grid-security/certificates \
+  -X COPY \
+  -H "Credential: none" \
+  -H "Source: https://source.example.org:8443//store/input.dat" \
+  https://dest.example.org:8443//store/output.dat
+```
+
+The server writes to a temporary file next to the destination and then renames it into place after `curl` succeeds. `Overwrite: F` fails with HTTP 412 if the destination exists; the default is overwrite (`Overwrite: T`).
+
+`TransferHeader*` request headers are forwarded to the source request without the prefix. For example, `TransferHeaderAuthorization: Bearer <token>` becomes `Authorization: Bearer <token>` in the outbound source request.
+
+This implementation does not implement GridSite or OIDC delegation endpoints. Requests that explicitly set `Credential: gridsite` or `Credential: oidc` are rejected with HTTP 400. Use `Credential: none` with configured service X.509 credentials or forwarded `TransferHeader*` authorization.
+
+Native `root://` third-party copy is not the same protocol. It requires XRootD rendezvous-key handling and, for delegated copies, GSI credential delegation on the stream protocol. The current nginx stream module serves normal `root://` reads and writes, but does not yet implement native XRootD TPC.
 
 ---
 

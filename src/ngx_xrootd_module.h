@@ -5,6 +5,20 @@
  *
  * Shared internal header for the nginx XRootD stream module.
  * Included by all .c files in the module.
+ *
+ * Maintainer map for non-XRootD specialists:
+ *   - connection.c owns nginx event wiring and the byte-accumulation state
+ *     machine.  It parses complete request headers/payloads into xrootd_ctx_t.
+ *   - handshake.c owns the initial client hello and the opcode dispatcher.
+ *     Look there first when adding or changing an XRootD request type.
+ *   - session.c owns protocol/login/auth-advertisement/liveness requests.
+ *   - read_handlers.c owns file-handle lifecycle: stat/open/read/readv/close.
+ *   - query.c owns kXR_query (checksum, space, config queries).
+ *   - dirlist.c owns kXR_dirlist (directory listing with optional dStat).
+ *   - write_handlers.c owns storage mutation: write/pgwrite/sync/truncate/
+ *     mkdir/rm/rmdir/mv/chmod.
+ *   - path.c is the only place that should translate untrusted client paths
+ *     into canonical paths under xrootd_root.
  */
 
 #include <ngx_config.h>
@@ -150,7 +164,12 @@ typedef struct {
     u_char    *payload;       /* allocated from pool */
     size_t     payload_pos;   /* bytes accumulated so far */
 
-    /* Session */
+    /*
+     * Session auth state.  XRootD separates kXR_login from real auth: login
+     * establishes a server-issued session id, while auth_done means the
+     * configured auth mode has actually completed.  Most file opcodes require
+     * both flags.
+     */
     u_char     sessid[XROOTD_SESSION_ID_LEN];
     ngx_flag_t logged_in;    /* kXR_login received */
     ngx_flag_t auth_done;    /* authentication completed */
@@ -170,7 +189,12 @@ typedef struct {
     /* GSI handshake state */
     EVP_PKEY  *gsi_dh_key;   /* freed after kXGC_cert processing */
 
-    /* Token authentication state */
+    /*
+     * Token authentication state.  The dispatcher decides whether a session is
+     * authenticated; individual write/open handlers check token scopes against
+     * the canonical target path when a token-authenticated session mutates
+     * storage.
+     */
     int                   token_auth;  /* 1 if authenticated via bearer token */
     int                   token_scope_count;
     xrootd_token_scope_t  token_scopes[XROOTD_MAX_TOKEN_SCOPES];
@@ -314,7 +338,7 @@ ngx_int_t xrootd_handle_auth(xrootd_ctx_t *ctx, ngx_connection_t *c);
 
 /* ngx_xrootd_token.c — see ngx_xrootd_token.h for types and API */
 
-/* ngx_xrootd_read_handlers.c */
+/* ngx_xrootd_read_handlers.c — file-handle lifecycle: stat/open/read/readv/close */
 ngx_int_t xrootd_handle_stat(xrootd_ctx_t *ctx, ngx_connection_t *c,
     ngx_stream_xrootd_srv_conf_t *conf);
 ngx_int_t xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
@@ -322,9 +346,13 @@ ngx_int_t xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
 ngx_int_t xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c);
 ngx_int_t xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c);
 ngx_int_t xrootd_handle_close(xrootd_ctx_t *ctx, ngx_connection_t *c);
-ngx_int_t xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
-    ngx_stream_xrootd_srv_conf_t *conf);
+
+/* ngx_xrootd_query.c — kXR_query: checksum (adler32), space, config queries */
 ngx_int_t xrootd_handle_query(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    ngx_stream_xrootd_srv_conf_t *conf);
+
+/* ngx_xrootd_dirlist.c — kXR_dirlist: directory listing with optional dStat */
+ngx_int_t xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
     ngx_stream_xrootd_srv_conf_t *conf);
 
 /* ngx_xrootd_write_handlers.c */

@@ -4,6 +4,23 @@
 /*  Write handlers                                                      */
 /* ================================================================== */
 
+/*
+ * Storage-mutation handlers for the XRootD protocol:
+ *   - kXR_write    — write data at offset into an open file
+ *   - kXR_pgwrite  — page-checksummed write (CRC32c per 4096-byte page)
+ *   - kXR_sync     — fsync an open file handle
+ *   - kXR_truncate — truncate a file to a given length
+ *   - kXR_mkdir    — create a directory (optionally recursive)
+ *   - kXR_rm       — remove a file by path
+ *   - kXR_rmdir    — remove an empty directory by path
+ *   - kXR_mv       — rename/move a file or directory
+ *   - kXR_chmod    — change permissions on a path
+ *
+ * Every handler here requires either an open writable file handle or
+ * conf->allow_write to be true (for path-based ops like mkdir/rm/mv).
+ * Token-scoped sessions additionally check that the token's scope covers
+ * the canonical target path before proceeding.
+ */
 
 
 ngx_int_t
