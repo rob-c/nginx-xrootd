@@ -17,6 +17,10 @@ Instead of running a separate `xrootd` daemon, you add this module to your exist
 
 Both protocols support anonymous access, GSI/x509 proxy-certificate authentication, and WLCG/JWT bearer-token authentication when configured.
 
+Configuration is fail-fast: missing/unreadable certs, JWKS files, CRLs, or
+required directories are validated during `nginx -t`/startup with explicit
+`emerg` errors in the nginx log.
+
 ---
 
 ## Quick start
@@ -114,6 +118,17 @@ Full setup: [docs/getting-started.md](docs/getting-started.md)
 ## Status
 
 The Python suite covers xrdcp / XRootD Python client behavior, WebDAV, HTTP-TPC interop, auth, ACLs, and hardening paths against nginx 1.28.3. Run `pytest -v` against the test nginx layout in [docs/building.md](docs/building.md) for a full pass/fail result.
+
+For local test bring-up/teardown, use [`tests/manage_test_servers.sh`](tests/manage_test_servers.sh):
+
+```bash
+# start nginx test listener + reference xrootd (for conformance)
+tests/manage_test_servers.sh start
+
+# show status / stop both
+tests/manage_test_servers.sh status
+tests/manage_test_servers.sh stop
+```
 
 ## License
 

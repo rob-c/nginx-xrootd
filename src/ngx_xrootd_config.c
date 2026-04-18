@@ -4,6 +4,68 @@
 /*  Configuration management                                            */
 /* ================================================================== */
 
+typedef enum {
+    XROOTD_PATH_REGULAR_FILE,
+    XROOTD_PATH_DIRECTORY,
+    XROOTD_PATH_FILE_OR_DIRECTORY
+} xrootd_path_kind_t;
+
+static ngx_int_t
+xrootd_validate_path(ngx_conf_t *cf, const char *label, const ngx_str_t *path,
+                     xrootd_path_kind_t kind, int access_mode)
+{
+    struct stat st;
+
+    if (path == NULL || path->len == 0 || path->data == NULL) {
+        return NGX_OK;
+    }
+
+    if (stat((char *) path->data, &st) != 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                           "xrootd: %s path \"%s\" is not accessible",
+                           label, path->data);
+        return NGX_ERROR;
+    }
+
+    switch (kind) {
+    case XROOTD_PATH_REGULAR_FILE:
+        if (!S_ISREG(st.st_mode)) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "xrootd: %s path \"%s\" must be a regular file",
+                               label, path->data);
+            return NGX_ERROR;
+        }
+        break;
+
+    case XROOTD_PATH_DIRECTORY:
+        if (!S_ISDIR(st.st_mode)) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "xrootd: %s path \"%s\" must be a directory",
+                               label, path->data);
+            return NGX_ERROR;
+        }
+        break;
+
+    case XROOTD_PATH_FILE_OR_DIRECTORY:
+        if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "xrootd: %s path \"%s\" must be a file or directory",
+                               label, path->data);
+            return NGX_ERROR;
+        }
+        break;
+    }
+
+    if (access_mode != 0 && access((char *) path->data, access_mode) != 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                           "xrootd: %s path \"%s\" failed permission check",
+                           label, path->data);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
 static char *
 xrootd_copy_conf_string(ngx_conf_t *cf, const ngx_str_t *src, ngx_str_t *dst)
 {
@@ -518,6 +580,15 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
             continue;
         }
 
+        if (xrootd_validate_path(cf, "xrootd_root", &xcf->root,
+                                 XROOTD_PATH_DIRECTORY,
+                                 xcf->allow_write ? (R_OK | W_OK | X_OK)
+                                                  : (R_OK | X_OK))
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
         /*
          * Access log handling mirrors nginx conventions: empty means disabled by
          * default, the literal string "off" suppresses logging explicitly, and
@@ -552,6 +623,19 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                 "xrootd_auth gsi requires xrootd_certificate, "
                 "xrootd_certificate_key and xrootd_trusted_ca");
+            return NGX_ERROR;
+        }
+
+        if (xrootd_validate_path(cf, "xrootd_certificate", &xcf->certificate,
+                                 XROOTD_PATH_REGULAR_FILE, R_OK) != NGX_OK
+            || xrootd_validate_path(cf, "xrootd_certificate_key",
+                                    &xcf->certificate_key,
+                                    XROOTD_PATH_REGULAR_FILE, R_OK) != NGX_OK
+            || xrootd_validate_path(cf, "xrootd_trusted_ca", &xcf->trusted_ca,
+                                    XROOTD_PATH_REGULAR_FILE, R_OK) != NGX_OK
+            || xrootd_validate_path(cf, "xrootd_crl", &xcf->crl,
+                                    XROOTD_PATH_FILE_OR_DIRECTORY, R_OK) != NGX_OK)
+        {
             return NGX_ERROR;
         }
 
@@ -626,12 +710,23 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
 
         /* ---- Token (JWT/WLCG) JWKS loading ---- */
         if ((xcf->auth == XROOTD_AUTH_TOKEN || xcf->auth == XROOTD_AUTH_BOTH)
-            && xcf->token_jwks.len > 0)
+            )
         {
-            if (xcf->token_issuer.len == 0 || xcf->token_audience.len == 0) {
+            if (xcf->token_jwks.len == 0 || xcf->token_issuer.len == 0
+                || xcf->token_audience.len == 0)
+            {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                     "xrootd_auth token/both requires "
+                    "xrootd_token_jwks, "
                     "xrootd_token_issuer and xrootd_token_audience");
+                return NGX_ERROR;
+            }
+
+            if (xrootd_validate_path(cf, "xrootd_token_jwks",
+                                     &xcf->token_jwks,
+                                     XROOTD_PATH_REGULAR_FILE, R_OK)
+                != NGX_OK)
+            {
                 return NGX_ERROR;
             }
 
@@ -682,6 +777,17 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
             if (xcf->vomsdir.len == 0 || xcf->voms_cert_dir.len == 0) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                     "xrootd_require_vo requires xrootd_vomsdir and xrootd_voms_cert_dir");
+                return NGX_ERROR;
+            }
+
+            if (xrootd_validate_path(cf, "xrootd_vomsdir", &xcf->vomsdir,
+                                     XROOTD_PATH_DIRECTORY, R_OK | X_OK)
+                != NGX_OK
+                || xrootd_validate_path(cf, "xrootd_voms_cert_dir",
+                                        &xcf->voms_cert_dir,
+                                        XROOTD_PATH_DIRECTORY, R_OK | X_OK)
+                   != NGX_OK)
+            {
                 return NGX_ERROR;
             }
         }

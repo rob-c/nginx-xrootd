@@ -106,6 +106,68 @@ static char     *ngx_http_xrootd_webdav_merge_loc_conf(ngx_conf_t *cf,
                                                         void *child);
 static ngx_int_t ngx_http_xrootd_webdav_postconfiguration(ngx_conf_t *cf);
 
+typedef enum {
+    WEBDAV_PATH_REGULAR_FILE,
+    WEBDAV_PATH_DIRECTORY,
+    WEBDAV_PATH_FILE_OR_DIRECTORY
+} webdav_path_kind_t;
+
+static ngx_int_t
+webdav_validate_path(ngx_conf_t *cf, const char *label, const ngx_str_t *path,
+                     webdav_path_kind_t kind, int access_mode)
+{
+    struct stat st;
+
+    if (path == NULL || path->len == 0 || path->data == NULL) {
+        return NGX_OK;
+    }
+
+    if (stat((char *) path->data, &st) != 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                           "xrootd_webdav: %s path \"%s\" is not accessible",
+                           label, path->data);
+        return NGX_ERROR;
+    }
+
+    switch (kind) {
+    case WEBDAV_PATH_REGULAR_FILE:
+        if (!S_ISREG(st.st_mode)) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "xrootd_webdav: %s path \"%s\" must be a regular file",
+                               label, path->data);
+            return NGX_ERROR;
+        }
+        break;
+
+    case WEBDAV_PATH_DIRECTORY:
+        if (!S_ISDIR(st.st_mode)) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "xrootd_webdav: %s path \"%s\" must be a directory",
+                               label, path->data);
+            return NGX_ERROR;
+        }
+        break;
+
+    case WEBDAV_PATH_FILE_OR_DIRECTORY:
+        if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "xrootd_webdav: %s path \"%s\" must be a file or directory",
+                               label, path->data);
+            return NGX_ERROR;
+        }
+        break;
+    }
+
+    if (access_mode != 0 && access((char *) path->data, access_mode) != 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                           "xrootd_webdav: %s path \"%s\" failed permission check",
+                           label, path->data);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
 /* ------------------------------------------------------------------ */
 /* Config directives                                                    */
 /* ------------------------------------------------------------------ */
@@ -336,6 +398,78 @@ ngx_http_xrootd_webdav_merge_loc_conf(ngx_conf_t *cf,
     ngx_conf_merge_str_value(conf->token_jwks,     prev->token_jwks,     "");
     ngx_conf_merge_str_value(conf->token_issuer,   prev->token_issuer,   "");
     ngx_conf_merge_str_value(conf->token_audience,  prev->token_audience, "");
+
+    if (conf->enable) {
+        if (webdav_validate_path(cf, "xrootd_webdav_root", &conf->root,
+                                 WEBDAV_PATH_DIRECTORY,
+                                 conf->allow_write ? (R_OK | W_OK | X_OK)
+                                                   : (R_OK | X_OK))
+            != NGX_OK)
+        {
+            return NGX_CONF_ERROR;
+        }
+
+        if (conf->auth == WEBDAV_AUTH_OPTIONAL || conf->auth == WEBDAV_AUTH_REQUIRED) {
+            if (conf->cadir.len == 0 && conf->cafile.len == 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "xrootd_webdav: auth optional/required needs xrootd_webdav_cadir or xrootd_webdav_cafile");
+                return NGX_CONF_ERROR;
+            }
+        }
+
+        if (webdav_validate_path(cf, "xrootd_webdav_cadir", &conf->cadir,
+                                 WEBDAV_PATH_DIRECTORY, R_OK | X_OK)
+            != NGX_OK
+            || webdav_validate_path(cf, "xrootd_webdav_cafile", &conf->cafile,
+                                    WEBDAV_PATH_REGULAR_FILE, R_OK) != NGX_OK
+            || webdav_validate_path(cf, "xrootd_webdav_crl", &conf->crl,
+                                    WEBDAV_PATH_REGULAR_FILE, R_OK) != NGX_OK)
+        {
+            return NGX_CONF_ERROR;
+        }
+
+        if (conf->token_jwks.len > 0) {
+            if (conf->token_issuer.len == 0 || conf->token_audience.len == 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "xrootd_webdav: xrootd_webdav_token_jwks requires xrootd_webdav_token_issuer and xrootd_webdav_token_audience");
+                return NGX_CONF_ERROR;
+            }
+
+            if (webdav_validate_path(cf, "xrootd_webdav_token_jwks",
+                                     &conf->token_jwks,
+                                     WEBDAV_PATH_REGULAR_FILE, R_OK)
+                != NGX_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+        }
+
+        if (conf->tpc) {
+            if (webdav_validate_path(cf, "xrootd_webdav_tpc_curl",
+                                     &conf->tpc_curl,
+                                     WEBDAV_PATH_REGULAR_FILE, X_OK)
+                != NGX_OK
+                || webdav_validate_path(cf, "xrootd_webdav_tpc_cert",
+                                        &conf->tpc_cert,
+                                        WEBDAV_PATH_REGULAR_FILE, R_OK)
+                   != NGX_OK
+                || webdav_validate_path(cf, "xrootd_webdav_tpc_key",
+                                        &conf->tpc_key,
+                                        WEBDAV_PATH_REGULAR_FILE, R_OK)
+                   != NGX_OK
+                || webdav_validate_path(cf, "xrootd_webdav_tpc_cadir",
+                                        &conf->tpc_cadir,
+                                        WEBDAV_PATH_DIRECTORY, R_OK | X_OK)
+                   != NGX_OK
+                || webdav_validate_path(cf, "xrootd_webdav_tpc_cafile",
+                                        &conf->tpc_cafile,
+                                        WEBDAV_PATH_REGULAR_FILE, R_OK)
+                   != NGX_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+        }
+    }
 
     /* Load JWKS keys if token is configured. */
     if (conf->token_jwks.len > 0) {
