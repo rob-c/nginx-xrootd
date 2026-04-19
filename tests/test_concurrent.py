@@ -243,6 +243,7 @@ class TestConcurrent:
 
     # ---- scalability assertion -------------------------------------------
 
+    @pytest.mark.timeout(240)
     def test_aggregate_throughput_scales_with_connections(self):
         """
         Aggregate throughput with 4 connections should be at least 1.5× that

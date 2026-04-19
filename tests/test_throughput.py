@@ -16,6 +16,9 @@ import time
 import pytest
 from XRootD import client
 
+# All tests in this module transfer 200 MB files — give them ample time.
+pytestmark = pytest.mark.timeout(240)
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------

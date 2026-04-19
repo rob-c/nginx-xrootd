@@ -27,6 +27,7 @@ import datetime
 import os
 import struct
 import sys
+import tempfile
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -425,10 +426,27 @@ def build_voms_proxy(
 
     combined = proxy_cert_pem + proxy_key_pem + user_cert_pem
 
-    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o400)
-    os.write(fd, combined)
-    os.close(fd)
+    out_dir = os.path.dirname(out_path) or '.'
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Existing proxy files are intentionally mode 0400. Replacing them via
+    # O_TRUNC fails once the file is no longer owner-writable, so write a new
+    # file in the same directory and atomically swap it into place instead.
+    fd, tmp_path = tempfile.mkstemp(prefix='.voms-proxy-', dir=out_dir)
+    try:
+        try:
+            os.write(fd, combined)
+            os.fchmod(fd, 0o400)
+        finally:
+            os.close(fd)
+
+        os.replace(tmp_path, out_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
     not_after = now + datetime.timedelta(hours=hours)
     print(f"Your proxy is valid until {not_after.strftime('%c %Z')}")

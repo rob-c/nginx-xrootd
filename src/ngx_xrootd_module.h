@@ -94,6 +94,14 @@ extern ngx_module_t ngx_stream_xrootd_module;
 /* TCP receive buffer (sized to hold the largest expected request) */
 #define XROOTD_RECV_BUF      (XROOTD_MAX_PATH + XRD_REQUEST_HDR_LEN + 64)
 
+/*
+ * Maximum immediate send_chain continuations before yielding through nginx's
+ * posted-event queue.  This keeps large sendfile responses moving without
+ * forcing a fresh epoll_wait after each partial chain advance, while still
+ * giving other ready connections a chance to run.
+ */
+#define XROOTD_SEND_CHAIN_SPIN_MAX  16
+
 /* Increment a per-operation metric counter.  No-ops when metrics are disabled. */
 #define XROOTD_OP_OK(ctx, op)  \
     do { if ((ctx)->metrics) { \
@@ -122,11 +130,12 @@ extern ngx_module_t ngx_stream_xrootd_module;
  * AIO: entered when a pread(2)/pwrite(2) is posted to the thread pool.
  */
 typedef enum {
-    XRD_ST_HANDSHAKE,   /* accumulating the 20-byte client hello  */
-    XRD_ST_REQ_HEADER,  /* accumulating a 24-byte request header  */
-    XRD_ST_REQ_PAYLOAD, /* accumulating dlen bytes of payload     */
-    XRD_ST_SENDING,     /* draining a large pending write buffer  */
-    XRD_ST_AIO,         /* async file I/O posted to thread pool   */
+    XRD_ST_HANDSHAKE,     /* accumulating the 20-byte client hello  */
+    XRD_ST_REQ_HEADER,    /* accumulating a 24-byte request header  */
+    XRD_ST_REQ_PAYLOAD,   /* accumulating dlen bytes of payload     */
+    XRD_ST_SENDING,       /* draining a large pending write buffer  */
+    XRD_ST_AIO,           /* async file I/O posted to thread pool   */
+    XRD_ST_TLS_HANDSHAKE, /* kXR_ableTLS: TLS accept in progress    */
 } xrootd_state_t;
 
 /* ------------------------------------------------------------------ */
@@ -140,6 +149,7 @@ typedef struct {
     size_t     bytes_written;      /* bytes successfully written to this handle */
     ngx_msec_t open_time;          /* ngx_current_msec when file was opened */
     int        writable;           /* 1 if opened for writing, 0 if read-only */
+    int        readable;           /* 1 if opened with read permission      */
 } xrootd_file_t;
 
 /* ------------------------------------------------------------------ */
@@ -186,6 +196,21 @@ typedef struct {
     size_t     wbuf_pos;
     u_char    *wbuf_base;     /* base of wbuf allocation */
 
+    /* Pending chain send (used by read/readv vectored response path) */
+    ngx_chain_t *wchain;
+    u_char      *wchain_base; /* optional data buffer to free after send */
+
+    /*
+     * Reusable response workspace for read-heavy sessions.  The stream state
+     * machine never parses the next request while a chain response is pending,
+     * so read/readv can safely retain and reuse these pool allocations instead
+     * of growing the connection pool on every transfer chunk.
+     */
+    u_char      *read_scratch;
+    size_t       read_scratch_size;
+    u_char      *read_hdr_scratch;
+    size_t       read_hdr_scratch_size;
+
     /* GSI handshake state */
     EVP_PKEY  *gsi_dh_key;   /* freed after kXGC_cert processing */
 
@@ -212,6 +237,10 @@ typedef struct {
 
     /* Async I/O guard */
     ngx_uint_t                  destroyed;
+
+    /* kXR_ableTLS: set after sending a protocol response with kXR_haveTLS;
+     * cleared once the TLS handshake completes successfully. */
+    ngx_uint_t                  tls_pending;
 
 } xrootd_ctx_t;
 
@@ -280,6 +309,10 @@ typedef struct {
     /* Prometheus metrics */
     ngx_int_t    metrics_slot;
 
+    /* kXR_ableTLS in-protocol TLS upgrade */
+    ngx_flag_t   tls;              /* xrootd_tls on|off                          */
+    ngx_ssl_t   *tls_ctx;          /* SSL context; populated at postconfiguration */
+
 #if (NGX_THREADS)
     ngx_thread_pool_t  *thread_pool;
     ngx_str_t           thread_pool_name;
@@ -307,10 +340,15 @@ char *xrootd_conf_set_inherit_parent_group(ngx_conf_t *cf, ngx_command_t *cmd,
 void ngx_stream_xrootd_handler(ngx_stream_session_t *s);
 void ngx_stream_xrootd_recv(ngx_event_t *rev);
 void ngx_stream_xrootd_send(ngx_event_t *wev);
+void xrootd_tls_handshake_done(ngx_connection_t *c);
+ngx_int_t xrootd_schedule_read_resume(ngx_connection_t *c);
+ngx_int_t xrootd_schedule_write_resume(ngx_connection_t *c);
 ngx_int_t xrootd_queue_response_base(xrootd_ctx_t *ctx, ngx_connection_t *c,
     u_char *buf, size_t len, u_char *base);
 ngx_int_t xrootd_queue_response(xrootd_ctx_t *ctx, ngx_connection_t *c,
     u_char *buf, size_t len);
+ngx_int_t xrootd_queue_response_chain(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    ngx_chain_t *cl, u_char *base);
 ngx_int_t xrootd_flush_pending(xrootd_ctx_t *ctx, ngx_connection_t *c);
 void xrootd_on_disconnect(xrootd_ctx_t *ctx, ngx_connection_t *c);
 void xrootd_close_all_files(xrootd_ctx_t *ctx);
@@ -434,6 +472,17 @@ u_char *xrootd_build_read_response(xrootd_ctx_t *ctx, ngx_connection_t *c,
     u_char *databuf, size_t data_total, size_t *rsp_total_out);
 u_char *xrootd_build_readv_response(xrootd_ctx_t *ctx, ngx_connection_t *c,
     u_char *databuf, size_t rsp_total, size_t *out_size);
+ngx_chain_t *xrootd_build_chunked_chain(xrootd_ctx_t *ctx,
+    ngx_connection_t *c, u_char *databuf, size_t data_total);
+ngx_chain_t *xrootd_build_sendfile_chain(xrootd_ctx_t *ctx,
+    ngx_connection_t *c, int fd, const char *path, off_t offset,
+    size_t data_total, u_char **base_out);
+u_char *xrootd_get_read_scratch(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    size_t need);
+u_char *xrootd_get_read_header_scratch(xrootd_ctx_t *ctx,
+    ngx_connection_t *c, size_t need);
+void xrootd_release_read_buffer(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    u_char *buf);
 
 #if (NGX_THREADS)
 

@@ -16,6 +16,14 @@
  * before file handlers will accept requests.
  */
 
+static void
+xrootd_count_login_ok(xrootd_ctx_t *ctx)
+{
+    if (ctx->metrics) {
+        ngx_atomic_fetch_add(&ctx->metrics->op_ok[XROOTD_OP_LOGIN], 1);
+    }
+}
+
 /*
  * kXR_protocol — negotiate protocol capabilities.
  */
@@ -36,13 +44,17 @@ xrootd_handle_protocol(xrootd_ctx_t *ctx, ngx_connection_t *c,
     int want_token = (conf->auth == XROOTD_AUTH_TOKEN
                       || conf->auth == XROOTD_AUTH_BOTH);
 
+    /* Advertise TLS capability when the client offers it and we have a TLS context. */
+    int offer_tls = (conf->tls && conf->tls_ctx != NULL
+                     && (client_flags & kXR_ableTLS));
+
     /*
      * Base kXR_protocol reply is the fixed 8-byte ServerProtocolBody.
      * If the client advertised security negotiation support, append the small
      * SecurityInfo trailer describing which auth protocols we offer.
      */
     bodylen = sizeof(body);
-    if (client_flags & 0x01) {                  /* kXR_secreqs */
+    if (client_flags & kXR_secreqs) {
         int sec_count = (want_gsi ? 1 : 0) + (want_token ? 1 : 0);
         bodylen += 4;                            /* SecurityInfo header */
         bodylen += (size_t) sec_count * 8;       /* 8 bytes per SecurityProtocol entry */
@@ -59,12 +71,12 @@ xrootd_handle_protocol(xrootd_ctx_t *ctx, ngx_connection_t *c,
                            (ServerResponseHdr *) buf);
 
     body.pval  = htonl(kXR_PROTOCOLVERSION);
-    body.flags = htonl(kXR_isServer);
+    body.flags = htonl(kXR_isServer | (offer_tls ? kXR_haveTLS : 0));
 
     /* Fixed 8-byte prefix every protocol reply starts with after the response header. */
     ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN, &body, sizeof(body));
 
-    if (client_flags & 0x01) {
+    if (client_flags & kXR_secreqs) {
         /*
          * SecurityInfo header:
          *   byte 1 advertises whether security is required,
@@ -92,13 +104,18 @@ xrootd_handle_protocol(xrootd_ctx_t *ctx, ngx_connection_t *c,
         }
     }
 
-    ngx_log_debug3(NGX_LOG_DEBUG_STREAM, c->log, 0,
+    ngx_log_debug4(NGX_LOG_DEBUG_STREAM, c->log, 0,
                    "xrootd: kXR_protocol ok (client_flags=0x%02x "
-                   "bodylen=%uz auth=%s)",
+                   "bodylen=%uz auth=%s tls=%d)",
                    (int) client_flags, bodylen,
                    want_gsi && want_token ? "both" :
                    want_gsi ? "gsi" :
-                   want_token ? "token" : "none");
+                   want_token ? "token" : "none",
+                   offer_tls);
+
+    if (offer_tls) {
+        ctx->tls_pending = 1;
+    }
 
     return xrootd_queue_response(ctx, c, buf, total);
 }
@@ -152,7 +169,7 @@ xrootd_handle_login(xrootd_ctx_t *ctx, ngx_connection_t *c,
         /* Session timing starts at successful login so later disconnect stats have an origin. */
         ctx->session_start = ngx_current_msec;
         xrootd_log_access(ctx, c, "LOGIN", "-", user, 1, 0, NULL, 0);
-        XROOTD_OP_OK(ctx, XROOTD_OP_LOGIN);
+        xrootd_count_login_ok(ctx);
 
         return xrootd_queue_response(ctx, c, buf, total);
     }
@@ -210,7 +227,7 @@ xrootd_handle_login(xrootd_ctx_t *ctx, ngx_connection_t *c,
         /* Successful login still marks the start of the session even though auth continues. */
         ctx->session_start = ngx_current_msec;
         xrootd_log_access(ctx, c, "LOGIN", "-", user, 1, 0, NULL, 0);
-        XROOTD_OP_OK(ctx, XROOTD_OP_LOGIN);
+        xrootd_count_login_ok(ctx);
 
         return xrootd_queue_response(ctx, c, buf, total);
     }

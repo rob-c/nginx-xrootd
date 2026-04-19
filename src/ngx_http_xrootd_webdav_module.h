@@ -17,6 +17,8 @@
 
 #include "ngx_xrootd_token.h"
 
+typedef struct x509_store_st X509_STORE;
+
 /* Maximum path length we'll construct */
 #define WEBDAV_MAX_PATH   4096
 
@@ -42,6 +44,7 @@ typedef struct {
     ngx_uint_t     verify_depth;
     ngx_uint_t     auth;          /* webdav_auth_t */
     ngx_flag_t     proxy_certs;   /* set X509_V_FLAG_ALLOW_PROXY_CERTS on SSL CTX */
+    X509_STORE    *ca_store;      /* cached CA/CRL store for manual validation */
 
     /*
      * Generic write opt-in plus HTTP-TPC-specific settings.  COPY handling is
@@ -71,6 +74,7 @@ typedef struct {
 typedef struct {
     int            verified;      /* 1 = chain passed, 0 = failed/absent */
     char           dn[1024];
+    const char    *auth_source;   /* manual, nginx, tls-connection, tls-session, token */
     int            token_auth;    /* 1 = authenticated via bearer token */
     int            token_scope_count;
     xrootd_token_scope_t  token_scopes[XROOTD_MAX_TOKEN_SCOPES];

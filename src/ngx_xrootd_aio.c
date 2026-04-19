@@ -8,19 +8,80 @@
  * This file builds the wire-format response buffers for kXR_read and kXR_readv.
  * The same code serves two execution models:
  *
- *   Synchronous (no thread pool): the handler in read_handlers.c calls
- *   pread(2) directly, then calls xrootd_build_{read,readv}_response()
- *   to frame the data into chunked kXR_oksofar / kXR_ok responses.
+ *   Synchronous: the handler in read_handlers.c either builds file-backed
+ *   chains for regular kXR_read responses, or fills a reusable memory buffer
+ *   and calls the chunked-chain builder for readv/fallback responses.
  *
  *   Asynchronous (NGX_THREADS): the handler posts a task to nginx's
- *   thread pool.  The pread(2) runs on a worker thread, and the
- *   completion callback calls the same response builders here.
+ *   thread pool.  The pread(2) calls run on a worker thread, and the
+ *   completion callback calls the same chunked-chain builder here.
+ *
+ * For kXR_read, the normal response path builds nginx file-backed buffers so
+ * send_chain can use the platform sendfile implementation.  The memory-backed
+ * builders remain for readv and for non-regular-file fallbacks.
  *
  * For kXR_readv, the wire format uses a readv_element array where each
  * element pairs a (fhandle, length, offset) request with the corresponding
  * data payload.  The response interleaves 16-byte kXR_readv_iov headers
  * with the actual data segments.
  */
+
+static u_char *
+xrootd_get_pool_scratch(ngx_pool_t *pool, u_char **slot, size_t *slot_size,
+    size_t need)
+{
+    u_char *p;
+
+    if (need == 0) {
+        need = 1;
+    }
+
+    if (*slot != NULL && *slot_size >= need) {
+        return *slot;
+    }
+
+    p = ngx_palloc(pool, need);
+    if (p == NULL) {
+        return NULL;
+    }
+
+    if (*slot != NULL) {
+        (void) ngx_pfree(pool, *slot);
+    }
+
+    *slot = p;
+    *slot_size = need;
+    return p;
+}
+
+u_char *
+xrootd_get_read_scratch(xrootd_ctx_t *ctx, ngx_connection_t *c, size_t need)
+{
+    return xrootd_get_pool_scratch(c->pool, &ctx->read_scratch,
+                                   &ctx->read_scratch_size, need);
+}
+
+u_char *
+xrootd_get_read_header_scratch(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    size_t need)
+{
+    return xrootd_get_pool_scratch(c->pool, &ctx->read_hdr_scratch,
+                                   &ctx->read_hdr_scratch_size, need);
+}
+
+void
+xrootd_release_read_buffer(xrootd_ctx_t *ctx, ngx_connection_t *c, u_char *buf)
+{
+    if (buf == NULL) {
+        return;
+    }
+
+    if (buf == ctx->read_scratch || buf == ctx->read_hdr_scratch) {
+        return;
+    }
+
+    (void) ngx_pfree(c->pool, buf);
+}
 
 /*
  * xrootd_build_read_response — build the chunked kXR_read response buffer.
@@ -37,8 +98,8 @@ xrootd_build_read_response(xrootd_ctx_t *ctx, ngx_connection_t *c,
      * XRootD replies larger than XROOTD_READ_MAX are streamed as a sequence of
      * response-header + payload chunks. Every chunk except the last is marked
      * kXR_oksofar so the client keeps consuming until the final kXR_ok frame.
-        * A zero-byte read still emits one empty kXR_ok frame so EOF is expressed
-        * as a normal successful response, not as "no response at all".
+     * A zero-byte read still emits one empty kXR_ok frame so EOF is expressed
+     * as a normal successful response, not as "no response at all".
      */
     n_chunks = (data_total + XROOTD_READ_MAX - 1) / XROOTD_READ_MAX;
     if (n_chunks == 0) { n_chunks = 1; }
@@ -82,8 +143,8 @@ xrootd_build_readv_response(xrootd_ctx_t *ctx, ngx_connection_t *c,
     /*
      * readv has already packed segment descriptors and data into databuf; the
      * only job here is to split that logical response into wire-sized chunks.
-        * The same zero-length rule applies here: the client still expects a final
-        * header even if the logical body happens to be empty.
+     * The same zero-length rule applies here: the client still expects a final
+     * header even if the logical body happens to be empty.
      */
     n_chunks = (rsp_total + XROOTD_READ_MAX - 1) / XROOTD_READ_MAX;
     if (n_chunks == 0) { n_chunks = 1; }
@@ -110,6 +171,194 @@ xrootd_build_readv_response(xrootd_ctx_t *ctx, ngx_connection_t *c,
 
     *out_size = buf_size;
     return rspbuf;
+}
+
+ngx_chain_t *
+xrootd_build_chunked_chain(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    u_char *databuf, size_t data_total)
+{
+    size_t      n_chunks, last_size;
+    u_char     *hdrbuf;
+    ngx_chain_t *head = NULL, *tail = NULL;
+    size_t      di = 0;
+    size_t      chunk;
+
+    n_chunks = (data_total + XROOTD_READ_MAX - 1) / XROOTD_READ_MAX;
+    if (n_chunks == 0) { n_chunks = 1; }
+    last_size = data_total % XROOTD_READ_MAX;
+    if (last_size == 0 && data_total > 0) { last_size = XROOTD_READ_MAX; }
+
+    hdrbuf = xrootd_get_read_header_scratch(ctx, c,
+                                            n_chunks * XRD_RESPONSE_HDR_LEN);
+    if (hdrbuf == NULL) {
+        return NULL;
+    }
+
+    for (chunk = 0; chunk < n_chunks; chunk++) {
+        size_t        chunk_data;
+        uint16_t      status;
+        ngx_chain_t  *clh;
+        ngx_buf_t    *bh;
+        u_char       *hptr;
+
+        chunk_data = (chunk < n_chunks - 1) ? XROOTD_READ_MAX : last_size;
+        status     = (chunk == n_chunks - 1) ? kXR_ok : kXR_oksofar;
+        hptr       = hdrbuf + chunk * XRD_RESPONSE_HDR_LEN;
+
+        xrootd_build_resp_hdr(ctx->cur_streamid, status,
+                              (uint32_t) chunk_data,
+                              (ServerResponseHdr *) hptr);
+
+        clh = ngx_alloc_chain_link(c->pool);
+        bh = ngx_calloc_buf(c->pool);
+        if (clh == NULL || bh == NULL) {
+            return NULL;
+        }
+
+        bh->pos = hptr;
+        bh->last = hptr + XRD_RESPONSE_HDR_LEN;
+        bh->memory = 1;
+        bh->temporary = 1;
+        clh->buf = bh;
+        clh->next = NULL;
+
+        if (head == NULL) {
+            head = clh;
+        } else {
+            tail->next = clh;
+        }
+        tail = clh;
+
+        if (chunk_data > 0) {
+            ngx_chain_t *cld;
+            ngx_buf_t   *bd;
+
+            cld = ngx_alloc_chain_link(c->pool);
+            bd = ngx_calloc_buf(c->pool);
+            if (cld == NULL || bd == NULL) {
+                return NULL;
+            }
+
+            bd->pos = databuf + di;
+            bd->last = databuf + di + chunk_data;
+            bd->memory = 1;
+            bd->temporary = 1;
+            cld->buf = bd;
+            cld->next = NULL;
+
+            tail->next = cld;
+            tail = cld;
+            di += chunk_data;
+        }
+    }
+
+    if (tail != NULL) {
+        tail->buf->last_buf = 1;
+    }
+
+    return head;
+}
+
+ngx_chain_t *
+xrootd_build_sendfile_chain(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    int fd, const char *path, off_t offset, size_t data_total,
+    u_char **base_out)
+{
+    size_t       n_chunks, last_size;
+    u_char     *hdrbuf;
+    ngx_chain_t *head = NULL, *tail = NULL;
+    size_t       di = 0;
+    size_t       chunk;
+
+    if (base_out != NULL) {
+        *base_out = NULL;
+    }
+
+    n_chunks = (data_total + XROOTD_READ_MAX - 1) / XROOTD_READ_MAX;
+    if (n_chunks == 0) { n_chunks = 1; }
+    last_size = data_total % XROOTD_READ_MAX;
+    if (last_size == 0 && data_total > 0) { last_size = XROOTD_READ_MAX; }
+
+    hdrbuf = xrootd_get_read_header_scratch(ctx, c,
+                                            n_chunks * XRD_RESPONSE_HDR_LEN);
+    if (hdrbuf == NULL) {
+        return NULL;
+    }
+    if (base_out != NULL) {
+        *base_out = hdrbuf;
+    }
+
+    for (chunk = 0; chunk < n_chunks; chunk++) {
+        size_t        chunk_data;
+        uint16_t      status;
+        ngx_chain_t  *clh;
+        ngx_buf_t    *bh;
+        u_char       *hptr;
+
+        chunk_data = (chunk < n_chunks - 1) ? XROOTD_READ_MAX : last_size;
+        status     = (chunk == n_chunks - 1) ? kXR_ok : kXR_oksofar;
+        hptr       = hdrbuf + chunk * XRD_RESPONSE_HDR_LEN;
+
+        xrootd_build_resp_hdr(ctx->cur_streamid, status,
+                              (uint32_t) chunk_data,
+                              (ServerResponseHdr *) hptr);
+
+        clh = ngx_alloc_chain_link(c->pool);
+        bh = ngx_calloc_buf(c->pool);
+        if (clh == NULL || bh == NULL) {
+            return NULL;
+        }
+
+        bh->pos = hptr;
+        bh->last = hptr + XRD_RESPONSE_HDR_LEN;
+        bh->memory = 1;
+        bh->temporary = 1;
+        clh->buf = bh;
+        clh->next = NULL;
+
+        if (head == NULL) {
+            head = clh;
+        } else {
+            tail->next = clh;
+        }
+        tail = clh;
+
+        if (chunk_data > 0) {
+            ngx_chain_t *clf;
+            ngx_buf_t   *bf;
+            ngx_file_t  *file;
+
+            clf = ngx_alloc_chain_link(c->pool);
+            bf = ngx_calloc_buf(c->pool);
+            file = ngx_pcalloc(c->pool, sizeof(ngx_file_t));
+            if (clf == NULL || bf == NULL || file == NULL) {
+                return NULL;
+            }
+
+            file->fd = fd;
+            file->name.data = (u_char *) path;
+            file->name.len = path ? ngx_strlen(path) : 0;
+            file->log = c->log;
+
+            bf->file = file;
+            bf->in_file = 1;
+            bf->file_pos = offset + (off_t) di;
+            bf->file_last = bf->file_pos + (off_t) chunk_data;
+            clf->buf = bf;
+            clf->next = NULL;
+
+            tail->next = clf;
+            tail = clf;
+            di += chunk_data;
+        }
+    }
+
+    if (tail != NULL) {
+        tail->buf->last_buf = 1;
+        tail->buf->last_in_chain = 1;
+    }
+
+    return head;
 }
 
 /* ================================================================== */
@@ -205,25 +454,40 @@ xrootd_readv_aio_thread(void *data, ngx_log_t *log)
 void
 xrootd_aio_resume(ngx_connection_t *c)
 {
-    ngx_event_t *rev = c->read;
+    ngx_stream_session_t *s;
+    xrootd_ctx_t         *ctx;
 
     /*
-     * AIO completion runs outside the normal recv path. Re-arm the read event
-     * if nginx has cleared it, then post the read event so the connection can
-     * continue parsing the next request once any queued response is flushed.
+     * AIO completion runs outside the normal recv path.  If the completion
+     * queued a response that still has bytes pending, resume the write side
+     * first; posting a read event in that state only wakes a handler that must
+     * immediately return.  Once there is no pending response, post the read side
+     * so already-arrived pipelined requests run before the next epoll_wait.
      */
-    ngx_log_error(NGX_LOG_INFO, c->log, 0,
-                  "xrootd: aio_resume avail=%d ready=%d active=%d posted=%d",
-                  rev->available, (int)rev->ready,
-                  (int)rev->active, (int)rev->posted);
-    if (!rev->active && !rev->ready) {
-        /* nginx has no pending read interest left, so register it again. */
-        if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+
+    s = c->data;
+    ctx = ngx_stream_get_module_ctx(s, ngx_stream_xrootd_module);
+    if (ctx == NULL || ctx->destroyed) {
+        return;
+    }
+
+    ngx_log_debug5(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                   "xrootd: aio_resume state=%d ravail=%d rready=%d "
+                   "wready=%d wposted=%d",
+                   (int) ctx->state, c->read->available,
+                   (int) c->read->ready, (int) c->write->ready,
+                   (int) c->write->posted);
+
+    if (ctx->state == XRD_ST_SENDING) {
+        if (xrootd_schedule_write_resume(c) != NGX_OK) {
             ngx_stream_finalize_session(c->data, NGX_STREAM_INTERNAL_SERVER_ERROR);
         }
+        return;
     }
-    /* Even if the event is already active, posting nudges the state machine forward. */
-    ngx_post_event(rev, &ngx_posted_events);
+
+    if (xrootd_schedule_read_resume(c) != NGX_OK) {
+        ngx_stream_finalize_session(c->data, NGX_STREAM_INTERNAL_SERVER_ERROR);
+    }
 }
 
 void
@@ -233,8 +497,7 @@ xrootd_read_aio_done(ngx_event_t *ev)
     xrootd_read_aio_t  *t   = task->ctx;
     xrootd_ctx_t       *ctx = t->ctx;
     ngx_connection_t   *c   = t->c;
-    size_t              rsp_total;
-    u_char             *rspbuf;
+    ngx_chain_t        *rsp_chain;
 
     if (ctx->destroyed) {
         /* The session closed while the worker was running; drop the result. */
@@ -249,8 +512,7 @@ xrootd_read_aio_done(ngx_event_t *ev)
         /* Reset parsing first so the connection is in a sane state on error. */
         ctx->state = XRD_ST_REQ_HEADER;
         ctx->hdr_pos = 0;
-        /* databuf was scratch storage for this request only. */
-        ngx_pfree(c->pool, t->databuf);
+        xrootd_release_read_buffer(ctx, c, t->databuf);
         XROOTD_OP_ERR(ctx, XROOTD_OP_READ);
         xrootd_send_error(ctx, c, kXR_IOError,
                           t->io_errno ? strerror(t->io_errno) : "async read error");
@@ -262,13 +524,11 @@ xrootd_read_aio_done(ngx_event_t *ev)
     ctx->session_bytes                   += (size_t) t->nread;
     XROOTD_OP_OK(ctx, XROOTD_OP_READ);
 
-    /* Convert the raw read buffer into one or more XRootD response frames. */
-    rspbuf = xrootd_build_read_response(ctx, c,
-                                        t->databuf, (size_t) t->nread,
-                                        &rsp_total);
-    ngx_pfree(c->pool, t->databuf);
-
-    if (rspbuf == NULL) {
+    /* Build a header+data chain to avoid copying payload into a second buffer. */
+    rsp_chain = xrootd_build_chunked_chain(ctx, c,
+                                           t->databuf, (size_t) t->nread);
+    if (rsp_chain == NULL) {
+        xrootd_release_read_buffer(ctx, c, t->databuf);
         ctx->state = XRD_ST_REQ_HEADER;
         xrootd_aio_resume(c);
         return;
@@ -277,10 +537,9 @@ xrootd_read_aio_done(ngx_event_t *ev)
     ctx->state   = XRD_ST_REQ_HEADER;
     ctx->hdr_pos = 0;
 
-    /* Queue takes ownership only if it transitions the connection into SENDING. */
-    xrootd_queue_response_base(ctx, c, rspbuf, rsp_total, rspbuf);
+    xrootd_queue_response_chain(ctx, c, rsp_chain, t->databuf);
     if (ctx->state != XRD_ST_SENDING) {
-        ngx_pfree(c->pool, rspbuf);
+        xrootd_release_read_buffer(ctx, c, t->databuf);
     }
     xrootd_aio_resume(c);
 }
@@ -358,8 +617,7 @@ xrootd_readv_aio_done(ngx_event_t *ev)
     xrootd_readv_aio_t  *t   = task->ctx;
     xrootd_ctx_t        *ctx = t->ctx;
     ngx_connection_t    *c   = t->c;
-    size_t               out_size;
-    u_char              *rspbuf;
+    ngx_chain_t         *rsp_chain;
 
     if (ctx->destroyed) { return; }
 
@@ -370,8 +628,7 @@ xrootd_readv_aio_done(ngx_event_t *ev)
     ctx->hdr_pos = 0;
 
     if (t->io_error) {
-        /* The packed readv scratch buffer is no longer needed on failure. */
-        ngx_pfree(c->pool, t->databuf);
+        xrootd_release_read_buffer(ctx, c, t->databuf);
         XROOTD_OP_ERR(ctx, XROOTD_OP_READV);
         xrootd_send_error(ctx, c, kXR_IOError, t->err_msg);
         xrootd_aio_resume(c);
@@ -381,21 +638,18 @@ xrootd_readv_aio_done(ngx_event_t *ev)
     XROOTD_OP_OK(ctx, XROOTD_OP_READV);
     ctx->session_bytes += t->bytes_total;
 
-    /* databuf already contains readv segment headers followed by payload data. */
-    rspbuf = xrootd_build_readv_response(ctx, c,
-                                         t->databuf, t->rsp_total,
-                                         &out_size);
-    ngx_pfree(c->pool, t->databuf);
-
-    if (rspbuf == NULL) {
+    /* datapack is already contiguous; send as chunked header+data chain. */
+    rsp_chain = xrootd_build_chunked_chain(ctx, c,
+                                           t->databuf, t->rsp_total);
+    if (rsp_chain == NULL) {
+        xrootd_release_read_buffer(ctx, c, t->databuf);
         xrootd_aio_resume(c);
         return;
     }
 
-    /* Same ownership contract as plain read: free locally unless send queue keeps it. */
-    xrootd_queue_response_base(ctx, c, rspbuf, out_size, rspbuf);
+    xrootd_queue_response_chain(ctx, c, rsp_chain, t->databuf);
     if (ctx->state != XRD_ST_SENDING) {
-        ngx_pfree(c->pool, rspbuf);
+        xrootd_release_read_buffer(ctx, c, t->databuf);
     }
     xrootd_aio_resume(c);
 }

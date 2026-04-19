@@ -192,14 +192,21 @@ typedef int64_t   kXR_int64;
 #define kXR_bkpexist    128   /* a backup copy exists      */
 
 /* ------------------------------------------------------------------ */
+/* Protocol request flags (client capability bits in kXR_protocol)    */
+/* ------------------------------------------------------------------ */
+
+#define kXR_secreqs     0x01u   /* client wants security-protocol list */
+#define kXR_ableTLS     0x02u   /* client can upgrade to in-protocol TLS */
+
+/* ------------------------------------------------------------------ */
 /* Protocol response flags (server capability bits)                    */
 /* ------------------------------------------------------------------ */
 
 #define kXR_isServer    0x00000001u   /* we are a data server */
 #define kXR_isManager   0x00000002u   /* we are a manager/redirector */
-#define kXR_haveTLS     0x80000000u
-#define kXR_gotoTLS     0x40000000u
-#define kXR_tlsLogin    0x04000000u
+#define kXR_haveTLS     0x80000000u   /* server can accept kXR_ableTLS upgrade */
+#define kXR_gotoTLS     0x40000000u   /* client must upgrade now */
+#define kXR_tlsLogin    0x04000000u   /* login exchange requires TLS */
 
 /* ------------------------------------------------------------------ */
 /* Login capver / ability flags                                         */

@@ -191,6 +191,14 @@ static ngx_command_t ngx_stream_xrootd_commands[] = {
       offsetof(ngx_stream_xrootd_srv_conf_t, token_audience),
       NULL },
 
+    /* Enable kXR_ableTLS in-protocol TLS upgrade using xrootd_certificate/key. */
+    { ngx_string("xrootd_tls"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_xrootd_srv_conf_t, tls),
+      NULL },
+
     /* Write handlers still perform per-op auth checks; this only enables the feature. */
     { ngx_string("xrootd_allow_write"),
       NGX_STREAM_SRV_CONF | NGX_CONF_FLAG,

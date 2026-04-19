@@ -1,8 +1,74 @@
 #include "ngx_xrootd_module.h"
 
+/* forward declaration — defined in the TLS section below */
+static void xrootd_start_tls(xrootd_ctx_t *ctx, ngx_connection_t *c,
+                              ngx_stream_xrootd_srv_conf_t *conf);
+
 /* ================================================================== */
 /*  Connection entry point                                              */
 /* ================================================================== */
+
+static off_t
+xrootd_chain_pending_bytes(ngx_chain_t *cl)
+{
+    off_t total = 0;
+
+    for (; cl != NULL; cl = cl->next) {
+        off_t n = ngx_buf_size(cl->buf);
+
+        if (n > 0) {
+            total += n;
+        }
+    }
+
+    return total;
+}
+
+ngx_int_t
+xrootd_schedule_read_resume(ngx_connection_t *c)
+{
+    ngx_event_t *rev = c->read;
+
+    /*
+     * Thread-pool completions and fully flushed responses often discover that
+     * the peer already sent the next request while this connection was busy.
+     * Posting the read event lets nginx run that parser pass from the current
+     * posted-events drain instead of falling through to another epoll_wait.
+     */
+    if (!rev->active && !rev->ready) {
+        if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+            return NGX_ERROR;
+        }
+    }
+
+    if (!rev->posted) {
+        ngx_post_event(rev, &ngx_posted_events);
+    }
+
+    return NGX_OK;
+}
+
+ngx_int_t
+xrootd_schedule_write_resume(ngx_connection_t *c)
+{
+    ngx_event_t *wev = c->write;
+
+    /*
+     * A partial chain send can stop because nginx reached an internal chunk
+     * boundary even though the socket is still writable.  Keep the descriptor
+     * armed for the real EAGAIN case, but post the write event immediately when
+     * nginx still considers it ready so we do not pay for an extra poll cycle.
+     */
+    if (ngx_handle_write_event(wev, 0) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if (wev->ready && !wev->posted) {
+        ngx_post_event(wev, &ngx_posted_events);
+    }
+
+    return NGX_OK;
+}
 
 void
 ngx_stream_xrootd_handler(ngx_stream_session_t *s)
@@ -147,6 +213,11 @@ ngx_stream_xrootd_recv(ngx_event_t *rev)
             if (ngx_handle_read_event(rev, 0) != NGX_OK) {
                 break;
             }
+            return;
+        }
+
+        if (ctx->state == XRD_ST_TLS_HANDSHAKE) {
+            /* ngx_ssl_handshake() owns the connection events during handshake. */
             return;
         }
 
@@ -327,6 +398,11 @@ ngx_stream_xrootd_recv(ngx_event_t *rev)
                 return;
             }
             if (ctx->state != XRD_ST_SENDING) {
+                /* kXR_protocol may have set tls_pending while sending synchronously. */
+                if (ctx->tls_pending) {
+                    xrootd_start_tls(ctx, c, conf);
+                    return;
+                }
                 /* Most handlers complete synchronously and return to header parsing. */
                 ctx->state   = XRD_ST_REQ_HEADER;
                 ctx->hdr_pos = 0;
@@ -359,20 +435,91 @@ ngx_stream_xrootd_recv(ngx_event_t *rev)
 }
 
 /* ================================================================== */
+/*  kXR_ableTLS in-protocol TLS upgrade                                */
+/* ================================================================== */
+
+void
+xrootd_tls_handshake_done(ngx_connection_t *c)
+{
+    ngx_stream_session_t *s   = c->data;
+    xrootd_ctx_t         *ctx = ngx_stream_get_module_ctx(s,
+                                                          ngx_stream_xrootd_module);
+
+    if (!c->ssl->handshaked) {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "xrootd: kXR_ableTLS handshake failed");
+        xrootd_on_disconnect(ctx, c);
+        xrootd_close_all_files(ctx);
+        ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                  "xrootd: kXR_ableTLS TLS handshake complete (%s)",
+                  SSL_get_cipher(c->ssl->connection));
+
+    ctx->tls_pending = 0;
+    ctx->state       = XRD_ST_REQ_HEADER;
+    ctx->hdr_pos     = 0;
+
+    ngx_stream_xrootd_recv(c->read);
+}
+
+static void
+xrootd_start_tls(xrootd_ctx_t *ctx, ngx_connection_t *c,
+                 ngx_stream_xrootd_srv_conf_t *conf)
+{
+    ngx_stream_session_t *s  = c->data;
+    ngx_int_t             rc;
+
+    ctx->state = XRD_ST_TLS_HANDSHAKE;
+
+    if (ngx_ssl_create_connection(conf->tls_ctx, c, NGX_SSL_BUFFER) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "xrootd: ngx_ssl_create_connection failed");
+        xrootd_on_disconnect(ctx, c);
+        xrootd_close_all_files(ctx);
+        ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    c->ssl->handler = xrootd_tls_handshake_done;
+
+    rc = ngx_ssl_handshake(c);
+    if (rc == NGX_AGAIN) {
+        /* Handshake is non-blocking; xrootd_tls_handshake_done fires on completion. */
+        return;
+    }
+
+    if (rc == NGX_OK) {
+        xrootd_tls_handshake_done(c);
+        return;
+    }
+
+    ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                  "xrootd: kXR_ableTLS ngx_ssl_handshake error");
+    xrootd_on_disconnect(ctx, c);
+    xrootd_close_all_files(ctx);
+    ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
+}
+
+/* ================================================================== */
 /*  Write event handler                                                 */
 /* ================================================================== */
 
 void
 ngx_stream_xrootd_send(ngx_event_t *wev)
 {
-    ngx_connection_t     *c;
-    ngx_stream_session_t *s;
-    xrootd_ctx_t         *ctx;
-    ngx_int_t             rc;
+    ngx_connection_t              *c;
+    ngx_stream_session_t          *s;
+    ngx_stream_xrootd_srv_conf_t  *conf;
+    xrootd_ctx_t                  *ctx;
+    ngx_int_t                      rc;
 
-    c   = wev->data;
-    s   = c->data;
-    ctx = ngx_stream_get_module_ctx(s, ngx_stream_xrootd_module);
+    c    = wev->data;
+    s    = c->data;
+    ctx  = ngx_stream_get_module_ctx(s, ngx_stream_xrootd_module);
+    conf = ngx_stream_get_module_srv_conf(s, ngx_stream_xrootd_module);
 
     if (wev->timedout) {
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT,
@@ -411,6 +558,14 @@ ngx_stream_xrootd_send(ngx_event_t *wev)
     ngx_log_error(NGX_LOG_INFO, c->log, 0,
                   "xrootd: send_done avail=%d ready=%d active=%d",
                   c->read->available, (int)c->read->ready, (int)c->read->active);
+
+    /* If the just-sent response was kXR_protocol with kXR_haveTLS, start the
+     * TLS accept handshake now before processing any further XRootD requests. */
+    if (ctx->tls_pending) {
+        xrootd_start_tls(ctx, c, conf);
+        return;
+    }
+
     /* Continue draining any bytes the client already pipelined behind this reply. */
     ngx_stream_xrootd_recv(c->read);
 }
@@ -449,8 +604,8 @@ xrootd_queue_response_base(xrootd_ctx_t *ctx, ngx_connection_t *c,
             ctx->wbuf_base = base;
             ctx->state     = XRD_ST_SENDING;
 
-            /* Ask nginx to wake the write handler once the socket is writable again. */
-            if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+            /* Wake via posted event if still ready; otherwise wait for epoll. */
+            if (xrootd_schedule_write_resume(c) != NGX_OK) {
                 return NGX_ERROR;
             }
             return NGX_OK;
@@ -469,9 +624,88 @@ xrootd_queue_response(xrootd_ctx_t *ctx, ngx_connection_t *c,
 }
 
 ngx_int_t
+xrootd_queue_response_chain(xrootd_ctx_t *ctx, ngx_connection_t *c,
+                            ngx_chain_t *cl, u_char *base)
+{
+    ngx_chain_t *out;
+    ngx_uint_t   spins = 0;
+
+    out = cl;
+
+    for (;;) {
+        off_t before, after;
+
+        before = xrootd_chain_pending_bytes(out);
+        out = c->send_chain(c, out, 0);
+
+        if (out == NGX_CHAIN_ERROR) {
+            return NGX_ERROR;
+        }
+
+        if (out == NULL) {
+            return NGX_OK;
+        }
+
+        after = xrootd_chain_pending_bytes(out);
+        if (after < before && ++spins < XROOTD_SEND_CHAIN_SPIN_MAX) {
+            continue;
+        }
+
+        ctx->wchain = out;
+        ctx->wchain_base = base;
+        ctx->state = XRD_ST_SENDING;
+
+        if (xrootd_schedule_write_resume(c) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        return NGX_OK;
+    }
+}
+
+ngx_int_t
 xrootd_flush_pending(xrootd_ctx_t *ctx, ngx_connection_t *c)
 {
     ssize_t n;
+    ngx_chain_t *out;
+
+    if (ctx->wchain != NULL) {
+        ngx_uint_t spins = 0;
+
+        for (;;) {
+            off_t before, after;
+
+            before = xrootd_chain_pending_bytes(ctx->wchain);
+            out = c->send_chain(c, ctx->wchain, 0);
+            if (out == NGX_CHAIN_ERROR) {
+                return NGX_ERROR;
+            }
+
+            if (out == NULL) {
+                break;
+            }
+
+            after = xrootd_chain_pending_bytes(out);
+            ctx->wchain = out;
+
+            if (after < before && ++spins < XROOTD_SEND_CHAIN_SPIN_MAX) {
+                continue;
+            }
+
+            if (xrootd_schedule_write_resume(c) != NGX_OK) {
+                return NGX_ERROR;
+            }
+            return NGX_AGAIN;
+        }
+
+        if (ctx->wchain_base) {
+            xrootd_release_read_buffer(ctx, c, ctx->wchain_base);
+            ctx->wchain_base = NULL;
+        }
+
+        ctx->wchain = NULL;
+        return NGX_OK;
+    }
 
     while (ctx->wbuf_pos < ctx->wbuf_len) {
         /* Resume exactly where the previous short write stopped. */
@@ -484,7 +718,7 @@ xrootd_flush_pending(xrootd_ctx_t *ctx, ngx_connection_t *c)
         }
         if (n == NGX_AGAIN) {
             /* Still blocked; keep the remaining suffix and wait for the next write event. */
-            if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+            if (xrootd_schedule_write_resume(c) != NGX_OK) {
                 return NGX_ERROR;
             }
             return NGX_AGAIN;
@@ -494,7 +728,7 @@ xrootd_flush_pending(xrootd_ctx_t *ctx, ngx_connection_t *c)
 
     if (ctx->wbuf_base) {
         /* Some callers keep a separate base pointer because wbuf may be advanced. */
-        ngx_pfree(c->pool, ctx->wbuf_base);
+        xrootd_release_read_buffer(ctx, c, ctx->wbuf_base);
         ctx->wbuf_base = NULL;
     }
 
@@ -502,6 +736,7 @@ xrootd_flush_pending(xrootd_ctx_t *ctx, ngx_connection_t *c)
     ctx->wbuf     = NULL;
     ctx->wbuf_len = 0;
     ctx->wbuf_pos = 0;
+    ctx->wchain   = NULL;
     return NGX_OK;
 }
 
@@ -531,8 +766,10 @@ xrootd_free_fhandle(xrootd_ctx_t *ctx, int idx)
     if (idx >= 0 && idx < XROOTD_MAX_FILES && ctx->files[idx].fd >= 0) {
         /* Close first, then mark the slot reusable for future opens. */
         close(ctx->files[idx].fd);
-        ctx->files[idx].fd      = -1;
-        ctx->files[idx].path[0] = '\0';
+        ctx->files[idx].fd       = -1;
+        ctx->files[idx].readable = 0;
+        ctx->files[idx].writable = 0;
+        ctx->files[idx].path[0]  = '\0';
     }
 }
 

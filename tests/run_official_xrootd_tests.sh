@@ -234,10 +234,14 @@ test_stress_adapted() {
 # ── main ────────────────────────────────────────────────────────────────
 mkdir -p "${LOCALDIR}"
 
-export XRD_REQUESTTIMEOUT=15
-export XRD_STREAMTIMEOUT=10
-export XRD_TIMEOUTRESOLUTION=1
-export XRD_LOGLEVEL=Warning
+: "${XRD_REQUESTTIMEOUT:=60}"
+: "${XRD_STREAMTIMEOUT:=30}"
+: "${XRD_TIMEOUTRESOLUTION:=1}"
+: "${XRD_LOGLEVEL:=Warning}"
+export XRD_REQUESTTIMEOUT
+export XRD_STREAMTIMEOUT
+export XRD_TIMEOUTRESOLUTION
+export XRD_LOGLEVEL
 export SOURCE_DIR="${TEST_DIR}"
 
 echo "═══════════════════════════════════════════════════════════════"

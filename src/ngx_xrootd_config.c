@@ -185,6 +185,8 @@ ngx_stream_xrootd_create_srv_conf(ngx_conf_t *cf)
     conf->group_rules  = NULL;
     conf->access_log_fd = NGX_INVALID_FILE;
     conf->metrics_slot = -1;
+    conf->tls          = NGX_CONF_UNSET;
+    conf->tls_ctx      = NULL;
 
     return conf;
 }
@@ -217,6 +219,7 @@ ngx_stream_xrootd_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_str_value(conf->token_jwks,      prev->token_jwks,      "");
     ngx_conf_merge_str_value(conf->token_issuer,    prev->token_issuer,    "");
     ngx_conf_merge_str_value(conf->token_audience,  prev->token_audience,  "");
+    ngx_conf_merge_value(conf->tls,             prev->tls,             0);
 
     child_vo_rules = conf->vo_rules;
     conf->vo_rules = xrootd_merge_arrays(cf, prev->vo_rules, child_vo_rules,
@@ -707,6 +710,41 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
             xcf->certificate.data, xcf->gsi_ca_hash);
 
         } /* end GSI setup */
+
+        /* ---- kXR_ableTLS in-protocol TLS context ---- */
+        if (xcf->tls) {
+            if (xcf->certificate.len == 0 || xcf->certificate_key.len == 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "xrootd_tls requires xrootd_certificate and "
+                    "xrootd_certificate_key");
+                return NGX_ERROR;
+            }
+
+            xcf->tls_ctx = ngx_pcalloc(cf->pool, sizeof(ngx_ssl_t));
+            if (xcf->tls_ctx == NULL) {
+                return NGX_ERROR;
+            }
+            xcf->tls_ctx->log = cf->log;
+
+            if (ngx_ssl_create(xcf->tls_ctx,
+                               NGX_SSL_TLSv1_2 | NGX_SSL_TLSv1_3,
+                               NULL) != NGX_OK)
+            {
+                return NGX_ERROR;
+            }
+
+            if (ngx_ssl_certificate(cf, xcf->tls_ctx,
+                                    &xcf->certificate,
+                                    &xcf->certificate_key,
+                                    NULL) != NGX_OK)
+            {
+                return NGX_ERROR;
+            }
+
+            ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
+                "xrootd: kXR_ableTLS enabled — cert=%s",
+                xcf->certificate.data);
+        }
 
         /* ---- Token (JWT/WLCG) JWKS loading ---- */
         if ((xcf->auth == XROOTD_AUTH_TOKEN || xcf->auth == XROOTD_AUTH_BOTH)

@@ -67,6 +67,7 @@
 #include <openssl/x509_vfy.h>
 
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <dirent.h>
 #include <limits.h>
@@ -81,6 +82,20 @@ size_t xrootd_sanitize_log_string(const char *in, char *out, size_t outsz);
 #define WEBDAV_MAX_PUT    (16 * 1024 * 1024)
 /* PROPFIND response buffer initial size */
 #define WEBDAV_XML_CHUNK  4096
+/* Buffered PUT fallback copy size when copy_file_range is unavailable */
+#define WEBDAV_PUT_COPY_BUFSZ   (1024 * 1024)
+/* Large copy_file_range requests reduce syscall count on spooled uploads */
+#define WEBDAV_PUT_COPY_CHUNK   (16 * 1024 * 1024)
+
+typedef struct {
+    ngx_http_xrootd_webdav_loc_conf_t *conf;
+    X509_STORE                        *store;
+    ngx_uint_t                         verify_depth;
+    char                               dn[1024];
+} ngx_http_xrootd_webdav_tls_auth_cache_t;
+
+static int webdav_ssl_auth_cache_index = -1;
+static int webdav_ssl_session_auth_cache_index = -1;
 
 /* ------------------------------------------------------------------ */
 /* Forward declarations                                                */
@@ -99,12 +114,22 @@ static ngx_int_t webdav_verify_proxy_cert(ngx_http_request_t *r,
                                           ngx_http_xrootd_webdav_loc_conf_t *cf);
 static ngx_int_t webdav_check_token_write_scope(ngx_http_request_t *r,
                                                 const char *method_name);
+static ngx_int_t webdav_write_full(ngx_fd_t fd, u_char *buf, size_t len);
+static ngx_int_t webdav_copy_spooled_file(ngx_http_request_t *r, ngx_fd_t dst_fd,
+                                          ngx_buf_t *buf, const char *path,
+                                          u_char **scratch);
 
 static void     *ngx_http_xrootd_webdav_create_loc_conf(ngx_conf_t *cf);
 static char     *ngx_http_xrootd_webdav_merge_loc_conf(ngx_conf_t *cf,
                                                         void *parent,
                                                         void *child);
 static ngx_int_t ngx_http_xrootd_webdav_postconfiguration(ngx_conf_t *cf);
+
+static void webdav_x509_store_cleanup(void *data);
+static void webdav_tls_auth_cache_free(void *parent, void *ptr,
+    CRYPTO_EX_DATA *ad, int idx, long argl, void *argp);
+static X509_STORE *webdav_build_ca_store(ngx_log_t *log,
+    ngx_http_xrootd_webdav_loc_conf_t *conf, int *crl_count_out);
 
 typedef enum {
     WEBDAV_PATH_REGULAR_FILE,
@@ -163,6 +188,188 @@ webdav_validate_path(ngx_conf_t *cf, const char *label, const ngx_str_t *path,
                            "xrootd_webdav: %s path \"%s\" failed permission check",
                            label, path->data);
         return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+static void
+webdav_x509_store_cleanup(void *data)
+{
+    X509_STORE *store = data;
+
+    if (store != NULL) {
+        X509_STORE_free(store);
+    }
+}
+
+static void
+webdav_tls_auth_cache_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
+                           int idx, long argl, void *argp)
+{
+    (void) parent;
+    (void) ad;
+    (void) idx;
+    (void) argl;
+    (void) argp;
+
+    if (ptr != NULL) {
+        OPENSSL_free(ptr);
+    }
+}
+
+static ngx_int_t
+webdav_str_equal(const ngx_str_t *a, const ngx_str_t *b)
+{
+    if (a->len != b->len) {
+        return 0;
+    }
+
+    if (a->len == 0) {
+        return 1;
+    }
+
+    return ngx_memcmp(a->data, b->data, a->len) == 0;
+}
+
+static ngx_int_t
+webdav_write_full(ngx_fd_t fd, u_char *buf, size_t len)
+{
+    while (len > 0) {
+        ssize_t nwritten;
+
+        nwritten = write(fd, buf, len);
+        if (nwritten < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return NGX_ERROR;
+        }
+
+        if (nwritten == 0) {
+            errno = EIO;
+            return NGX_ERROR;
+        }
+
+        buf += (size_t) nwritten;
+        len -= (size_t) nwritten;
+    }
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+webdav_copy_spooled_file(ngx_http_request_t *r, ngx_fd_t dst_fd, ngx_buf_t *buf,
+                         const char *path, u_char **scratch)
+{
+    off_t   src_off;
+    size_t  remaining;
+
+    if (buf->file == NULL || buf->file->fd == NGX_INVALID_FILE) {
+        errno = EINVAL;
+        return NGX_ERROR;
+    }
+
+    src_off = buf->file_pos;
+    remaining = (size_t) (buf->file_last - buf->file_pos);
+
+#if defined(__linux__) && defined(SYS_copy_file_range)
+    while (remaining > 0) {
+        size_t  want;
+        ssize_t copied;
+
+        want = remaining > WEBDAV_PUT_COPY_CHUNK
+                   ? WEBDAV_PUT_COPY_CHUNK
+                   : remaining;
+
+        copied = syscall(SYS_copy_file_range, buf->file->fd, &src_off,
+                         dst_fd, NULL, want, 0);
+        if (copied > 0) {
+            remaining -= (size_t) copied;
+            continue;
+        }
+
+        if (copied == 0) {
+            errno = EIO;
+            ngx_http_xrootd_webdav_log_safe_path(
+                r->connection->log, NGX_LOG_ERR, errno,
+                "xrootd_webdav: copy_file_range() hit unexpected EOF for",
+                path);
+            return NGX_ERROR;
+        }
+
+        if (errno == EINTR) {
+            continue;
+        }
+
+        if (errno != ENOSYS
+            && errno != EOPNOTSUPP
+            && errno != EINVAL
+            && errno != EXDEV
+            && errno != EPERM)
+        {
+            ngx_http_xrootd_webdav_log_safe_path(
+                r->connection->log, NGX_LOG_ERR, errno,
+                "xrootd_webdav: copy_file_range() failed for",
+                path);
+            return NGX_ERROR;
+        }
+
+        break;
+    }
+
+    if (remaining == 0) {
+        return NGX_OK;
+    }
+#endif
+
+    if (*scratch == NULL) {
+        *scratch = ngx_palloc(r->pool, WEBDAV_PUT_COPY_BUFSZ);
+        if (*scratch == NULL) {
+            return NGX_ERROR;
+        }
+    }
+
+    while (remaining > 0) {
+        size_t  chunk;
+        ssize_t nread;
+
+        chunk = remaining > WEBDAV_PUT_COPY_BUFSZ
+                    ? WEBDAV_PUT_COPY_BUFSZ
+                    : remaining;
+
+        nread = pread(buf->file->fd, *scratch, chunk, src_off);
+        if (nread < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            ngx_http_xrootd_webdav_log_safe_path(
+                r->connection->log, NGX_LOG_ERR, errno,
+                "xrootd_webdav: pread() failed for",
+                path);
+            return NGX_ERROR;
+        }
+
+        if (nread == 0) {
+            errno = EIO;
+            ngx_http_xrootd_webdav_log_safe_path(
+                r->connection->log, NGX_LOG_ERR, errno,
+                "xrootd_webdav: short temp-file body read for",
+                path);
+            return NGX_ERROR;
+        }
+
+        if (webdav_write_full(dst_fd, *scratch, (size_t) nread) != NGX_OK) {
+            ngx_http_xrootd_webdav_log_safe_path(
+                r->connection->log, NGX_LOG_ERR, ngx_errno,
+                "xrootd_webdav: write() failed for",
+                path);
+            return NGX_ERROR;
+        }
+
+        src_off += (off_t) nread;
+        remaining -= (size_t) nread;
     }
 
     return NGX_OK;
@@ -371,6 +578,7 @@ ngx_http_xrootd_webdav_create_loc_conf(ngx_conf_t *cf)
     conf->auth        = NGX_CONF_UNSET_UINT;
     conf->proxy_certs = NGX_CONF_UNSET;
     conf->allow_write = NGX_CONF_UNSET;
+    conf->ca_store    = NULL;
     ngx_http_xrootd_webdav_tpc_create_loc_conf(conf);
 
     return conf;
@@ -423,9 +631,39 @@ ngx_http_xrootd_webdav_merge_loc_conf(ngx_conf_t *cf,
             || webdav_validate_path(cf, "xrootd_webdav_cafile", &conf->cafile,
                                     WEBDAV_PATH_REGULAR_FILE, R_OK) != NGX_OK
             || webdav_validate_path(cf, "xrootd_webdav_crl", &conf->crl,
-                                    WEBDAV_PATH_REGULAR_FILE, R_OK) != NGX_OK)
+                                    WEBDAV_PATH_FILE_OR_DIRECTORY, R_OK) != NGX_OK)
         {
             return NGX_CONF_ERROR;
+        }
+
+        if (conf->auth == WEBDAV_AUTH_OPTIONAL
+            || conf->auth == WEBDAV_AUTH_REQUIRED)
+        {
+            X509_STORE         *store;
+            ngx_pool_cleanup_t *cln;
+            int                 crl_count = 0;
+
+            store = webdav_build_ca_store(cf->log, conf, &crl_count);
+            if (store == NULL) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "xrootd_webdav: failed to build cached CA store");
+                return NGX_CONF_ERROR;
+            }
+
+            cln = ngx_pool_cleanup_add(cf->pool, 0);
+            if (cln == NULL) {
+                X509_STORE_free(store);
+                return NGX_CONF_ERROR;
+            }
+
+            cln->handler = webdav_x509_store_cleanup;
+            cln->data = store;
+            conf->ca_store = store;
+
+            ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
+                               "xrootd_webdav: cached CA store built"
+                               " for root=\"%V\" crls=%d",
+                               &conf->root, crl_count);
         }
 
         if (conf->token_jwks.len > 0) {
@@ -506,6 +744,27 @@ ngx_http_xrootd_webdav_postconfiguration(ngx_conf_t *cf)
     ngx_http_xrootd_webdav_loc_conf_t *wdcf;
     ngx_uint_t                  s;
     X509_VERIFY_PARAM           *param;
+
+    if (webdav_ssl_auth_cache_index < 0) {
+        webdav_ssl_auth_cache_index = SSL_get_ex_new_index(0, NULL, NULL,
+                                                           NULL, NULL);
+        if (webdav_ssl_auth_cache_index < 0) {
+            ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                          "xrootd_webdav: SSL_get_ex_new_index() failed");
+            return NGX_ERROR;
+        }
+    }
+
+    if (webdav_ssl_session_auth_cache_index < 0) {
+        webdav_ssl_session_auth_cache_index =
+            SSL_SESSION_get_ex_new_index(0, NULL, NULL, NULL,
+                                         webdav_tls_auth_cache_free);
+        if (webdav_ssl_session_auth_cache_index < 0) {
+            ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                          "xrootd_webdav: SSL_SESSION_get_ex_new_index() failed");
+            return NGX_ERROR;
+        }
+    }
 
     /* Register as a content-phase handler */
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
@@ -896,11 +1155,9 @@ ngx_http_xrootd_webdav_resolve_path(ngx_http_request_t *r,
 /* ------------------------------------------------------------------ */
 
 static void
-webdav_free_verify_resources(X509_STORE_CTX *vctx, X509_STORE *store,
-                             X509 *leaf)
+webdav_free_verify_resources(X509_STORE_CTX *vctx, X509 *leaf)
 {
     if (vctx)  X509_STORE_CTX_free(vctx);
-    if (store) X509_STORE_free(store);
     if (leaf)  X509_free(leaf);
     /* chain is owned by the SSL session — do not free */
 }
@@ -911,11 +1168,16 @@ webdav_free_verify_resources(X509_STORE_CTX *vctx, X509_STORE *store,
  */
 static X509_STORE *
 webdav_build_ca_store(ngx_log_t *log,
-                      ngx_http_xrootd_webdav_loc_conf_t *conf)
+                      ngx_http_xrootd_webdav_loc_conf_t *conf,
+                      int *crl_count_out)
 {
     X509_STORE *store;
     char        cadir_buf[PATH_MAX];
     char        cafile_buf[PATH_MAX];
+
+    if (crl_count_out != NULL) {
+        *crl_count_out = 0;
+    }
 
     store = X509_STORE_new();
     if (store == NULL) {
@@ -1072,9 +1334,206 @@ webdav_build_ca_store(ngx_log_t *log,
                                  X509_V_FLAG_CRL_CHECK |
                                  X509_V_FLAG_CRL_CHECK_ALL);
         }
+
+        if (crl_count_out != NULL) {
+            *crl_count_out = crl_count;
+        }
     }
 
     return store;
+}
+
+static ngx_int_t
+webdav_cache_matches(ngx_http_xrootd_webdav_tls_auth_cache_t *cache,
+                     ngx_http_xrootd_webdav_loc_conf_t *conf)
+{
+    return cache != NULL
+           && cache->conf == conf
+           && cache->store == conf->ca_store
+           && cache->verify_depth == conf->verify_depth
+           && cache->dn[0] != '\0';
+}
+
+static void
+webdav_mark_req_verified(ngx_http_xrootd_webdav_req_ctx_t *ctx,
+                         const char *dn, const char *source)
+{
+    if (dn != NULL) {
+        ngx_cpystrn((u_char *) ctx->dn, (u_char *) dn, sizeof(ctx->dn));
+    }
+
+    ctx->verified = 1;
+    ctx->auth_source = source;
+}
+
+static ngx_int_t
+webdav_store_tls_auth_cache(ngx_http_request_t *r, SSL *ssl,
+                            ngx_http_xrootd_webdav_loc_conf_t *conf,
+                            const char *dn)
+{
+    ngx_http_xrootd_webdav_tls_auth_cache_t *cache;
+    SSL_SESSION                             *sess;
+
+    if (webdav_ssl_auth_cache_index < 0 || dn == NULL || dn[0] == '\0') {
+        return NGX_OK;
+    }
+
+    cache = SSL_get_ex_data(ssl, webdav_ssl_auth_cache_index);
+    if (!webdav_cache_matches(cache, conf)) {
+        cache = ngx_pcalloc(r->connection->pool, sizeof(*cache));
+        if (cache == NULL) {
+            return NGX_ERROR;
+        }
+
+        cache->conf = conf;
+        cache->store = conf->ca_store;
+        cache->verify_depth = conf->verify_depth;
+        ngx_cpystrn((u_char *) cache->dn, (u_char *) dn, sizeof(cache->dn));
+
+        if (SSL_set_ex_data(ssl, webdav_ssl_auth_cache_index, cache) == 0) {
+            return NGX_ERROR;
+        }
+    }
+
+    if (webdav_ssl_session_auth_cache_index < 0) {
+        return NGX_OK;
+    }
+
+    sess = SSL_get0_session(ssl);
+    if (sess != NULL) {
+        ngx_http_xrootd_webdav_tls_auth_cache_t *scache;
+
+        scache = SSL_SESSION_get_ex_data(sess,
+                                         webdav_ssl_session_auth_cache_index);
+        if (scache == NULL) {
+            scache = OPENSSL_malloc(sizeof(*scache));
+            if (scache == NULL) {
+                return NGX_ERROR;
+            }
+            ngx_memzero(scache, sizeof(*scache));
+
+            scache->conf = conf;
+            scache->store = conf->ca_store;
+            scache->verify_depth = conf->verify_depth;
+            ngx_cpystrn((u_char *) scache->dn, (u_char *) dn,
+                        sizeof(scache->dn));
+
+            if (SSL_SESSION_set_ex_data(sess,
+                                        webdav_ssl_session_auth_cache_index,
+                                        scache) == 0)
+            {
+                OPENSSL_free(scache);
+                return NGX_ERROR;
+            }
+        }
+
+        if (!webdav_cache_matches(scache, conf)) {
+            scache->conf = conf;
+            scache->store = conf->ca_store;
+            scache->verify_depth = conf->verify_depth;
+            ngx_cpystrn((u_char *) scache->dn, (u_char *) dn,
+                        sizeof(scache->dn));
+        }
+    }
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+webdav_try_cached_tls_auth(ngx_http_request_t *r, SSL *ssl,
+                           ngx_http_xrootd_webdav_loc_conf_t *conf,
+                           ngx_http_xrootd_webdav_req_ctx_t *ctx)
+{
+    ngx_http_xrootd_webdav_tls_auth_cache_t *cache;
+    SSL_SESSION                             *sess;
+
+    if (webdav_ssl_auth_cache_index >= 0) {
+        cache = SSL_get_ex_data(ssl, webdav_ssl_auth_cache_index);
+        if (webdav_cache_matches(cache, conf)) {
+            webdav_mark_req_verified(ctx, cache->dn, "tls-connection");
+            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                          "xrootd_webdav: GSI auth reused from TLS connection cache");
+            return NGX_OK;
+        }
+    }
+
+    if (webdav_ssl_session_auth_cache_index >= 0) {
+        sess = SSL_get0_session(ssl);
+        if (sess != NULL) {
+            cache = SSL_SESSION_get_ex_data(
+                sess, webdav_ssl_session_auth_cache_index);
+            if (webdav_cache_matches(cache, conf)) {
+                webdav_mark_req_verified(ctx, cache->dn, "tls-session");
+                if (webdav_store_tls_auth_cache(r, ssl, conf, cache->dn)
+                    != NGX_OK)
+                {
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                              "xrootd_webdav: GSI auth reused from TLS session cache");
+                return NGX_OK;
+            }
+        }
+    }
+
+    return NGX_DECLINED;
+}
+
+static ngx_int_t
+webdav_nginx_verify_compatible(ngx_http_request_t *r,
+                               ngx_http_xrootd_webdav_loc_conf_t *conf)
+{
+    ngx_http_ssl_srv_conf_t *sslcf;
+
+    if (conf->cadir.len != 0 || conf->cafile.len == 0) {
+        return 0;
+    }
+
+    sslcf = ngx_http_get_module_srv_conf(r, ngx_http_ssl_module);
+    if (sslcf == NULL || sslcf->verify == 0) {
+        return 0;
+    }
+
+    if (!webdav_str_equal(&conf->cafile, &sslcf->client_certificate)
+        && !webdav_str_equal(&conf->cafile, &sslcf->trusted_certificate))
+    {
+        return 0;
+    }
+
+    if (conf->crl.len != 0 && !webdav_str_equal(&conf->crl, &sslcf->crl)) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static ngx_int_t
+webdav_finish_verified_cert(ngx_http_request_t *r,
+                            ngx_http_xrootd_webdav_loc_conf_t *conf,
+                            ngx_http_xrootd_webdav_req_ctx_t *ctx,
+                            SSL *ssl, X509 *leaf, const char *source)
+{
+    char *dn;
+
+    dn = X509_NAME_oneline(X509_get_subject_name(leaf), NULL, 0);
+    if (dn != NULL) {
+        webdav_mark_req_verified(ctx, dn, source);
+        (void) webdav_store_tls_auth_cache(r, ssl, conf, dn);
+        OPENSSL_free(dn);
+    } else {
+        webdav_mark_req_verified(ctx, "", source);
+    }
+
+    {
+        char dn_log[1024];
+
+        xrootd_sanitize_log_string(ctx->dn, dn_log, sizeof(dn_log));
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "xrootd_webdav: GSI auth OK source=%s dn=\"%s\"",
+                      source, dn_log);
+    }
+
+    return NGX_OK;
 }
 
 static ngx_int_t
@@ -1085,10 +1544,10 @@ webdav_verify_proxy_cert(ngx_http_request_t *r,
     SSL              *ssl;
     X509             *leaf = NULL;
     STACK_OF(X509)   *chain = NULL;
-    X509_STORE       *store = NULL;
     X509_STORE_CTX   *vctx  = NULL;
-    char             *dn    = NULL;
     int               ok    = 0;
+    long              verify_result;
+    ngx_int_t         cache_rc;
 
     /* Check for cached result from a previous sub-request phase */
     ctx = ngx_http_get_module_ctx(r, ngx_http_xrootd_webdav_module);
@@ -1110,6 +1569,15 @@ webdav_verify_proxy_cert(ngx_http_request_t *r,
     }
 
     ssl  = r->connection->ssl->connection;
+
+    cache_rc = webdav_try_cached_tls_auth(r, ssl, conf, ctx);
+    if (cache_rc == NGX_OK) {
+        return NGX_OK;
+    }
+    if (cache_rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+        return cache_rc;
+    }
+
     leaf = SSL_get_peer_certificate(ssl);
     if (leaf == NULL) {
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -1117,18 +1585,30 @@ webdav_verify_proxy_cert(ngx_http_request_t *r,
         return NGX_HTTP_FORBIDDEN;
     }
 
+    verify_result = SSL_get_verify_result(ssl);
+    if (verify_result == X509_V_OK
+        && webdav_nginx_verify_compatible(r, conf))
+    {
+        ngx_int_t rc;
+
+        rc = webdav_finish_verified_cert(r, conf, ctx, ssl, leaf, "nginx");
+        webdav_free_verify_resources(NULL, leaf);
+        return rc;
+    }
+
     /* chain includes the leaf at index 0 plus any intermediate certs */
     chain = SSL_get_peer_cert_chain(ssl);
 
-    store = webdav_build_ca_store(r->connection->log, conf);
-    if (store == NULL) {
-        webdav_free_verify_resources(NULL, NULL, leaf);
+    if (conf->ca_store == NULL) {
+        webdav_free_verify_resources(NULL, leaf);
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "xrootd_webdav: cached CA store is unavailable");
         return NGX_HTTP_FORBIDDEN;
     }
 
     vctx = X509_STORE_CTX_new();
     if (vctx == NULL) {
-        webdav_free_verify_resources(NULL, store, leaf);
+        webdav_free_verify_resources(NULL, leaf);
         return NGX_HTTP_FORBIDDEN;
     }
 
@@ -1137,8 +1617,8 @@ webdav_verify_proxy_cert(ngx_http_request_t *r,
      * expects leaf + chain separately, but SSL_get_peer_cert_chain includes the
      * leaf so we can pass it directly as the untrusted set.
      */
-    if (!X509_STORE_CTX_init(vctx, store, leaf, chain)) {
-        webdav_free_verify_resources(vctx, store, leaf);
+    if (!X509_STORE_CTX_init(vctx, conf->ca_store, leaf, chain)) {
+        webdav_free_verify_resources(vctx, leaf);
         return NGX_HTTP_FORBIDDEN;
     }
 
@@ -1156,29 +1636,13 @@ webdav_verify_proxy_cert(ngx_http_request_t *r,
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                       "xrootd_webdav: proxy cert verification failed: %s",
                       X509_verify_cert_error_string(verr));
-        webdav_free_verify_resources(vctx, store, leaf);
+        webdav_free_verify_resources(vctx, leaf);
         return NGX_HTTP_FORBIDDEN;
     }
 
-    /* Extract the subject DN for logging / downstream use */
-    dn = X509_NAME_oneline(X509_get_subject_name(leaf), NULL, 0);
-    if (dn != NULL) {
-        ngx_cpystrn((u_char *) ctx->dn, (u_char *) dn, sizeof(ctx->dn));
-        OPENSSL_free(dn);
-    }
-
-    ctx->verified = 1;
-
-    {
-        char dn_log[1024];
-
-        xrootd_sanitize_log_string(ctx->dn, dn_log, sizeof(dn_log));
-        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                      "xrootd_webdav: GSI auth OK dn=\"%s\"", dn_log);
-    }
-
-    webdav_free_verify_resources(vctx, store, leaf);
-    return NGX_OK;
+    cache_rc = webdav_finish_verified_cert(r, conf, ctx, ssl, leaf, "manual");
+    webdav_free_verify_resources(vctx, leaf);
+    return cache_rc;
 }
 
 /*
@@ -1294,6 +1758,7 @@ webdav_verify_bearer_token(ngx_http_request_t *r,
     /* Store identity. */
     ctx->verified   = 1;
     ctx->token_auth = 1;
+    ctx->auth_source = "token";
     ngx_cpystrn((u_char *) ctx->dn, (u_char *) claims.sub, sizeof(ctx->dn));
 
     /* Store scopes for write authorization. */
@@ -1715,10 +2180,10 @@ webdav_handle_put_body(ngx_http_request_t *r)
     ngx_fd_t        fd;
     ngx_buf_t      *buf;
     ngx_chain_t    *chain;
-    ssize_t         n;
     int             created = 0;
     struct stat     sb;
     ngx_int_t       status;
+    u_char         *copy_scratch = NULL;
 
     conf = ngx_http_get_module_loc_conf(r, ngx_http_xrootd_webdav_module);
 
@@ -1751,30 +2216,25 @@ webdav_handle_put_body(ngx_http_request_t *r)
         for (chain = r->request_body->bufs; chain != NULL; chain = chain->next) {
             buf = chain->buf;
             if (buf->in_file) {
-                /* Body was spooled to disk by nginx */
-                off_t off  = buf->file_pos;
-                size_t len = (size_t)(buf->file_last - buf->file_pos);
-                u_char *tmp = ngx_palloc(r->pool, 65536);
-                if (!tmp) { ngx_close_file(fd); ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR); return; }
-                while (len > 0) {
-                    size_t chunk = len > 65536 ? 65536 : len;
-                    ssize_t rd = pread(buf->file->fd, tmp, chunk, off);
-                    if (rd <= 0) break;
-                    if (write(fd, tmp, (size_t) rd) != rd) {
-                        ngx_http_xrootd_webdav_log_safe_path(
-                            r->connection->log, NGX_LOG_ERR, ngx_errno,
-                            "xrootd_webdav: write() failed for",
-                            path);
-                        ngx_close_file(fd);
-                        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-                        return;
-                    }
-                    off += rd;
-                    len -= (size_t) rd;
+                /*
+                 * Large HTTPS uploads are commonly spooled to a temp file by
+                 * nginx before this callback runs.  Prefer a kernel-side
+                 * file-to-file copy so we do not bounce every 64 KiB through
+                 * userspace on the way into the final destination.
+                 */
+                if (webdav_copy_spooled_file(r, fd, buf, path, &copy_scratch)
+                    != NGX_OK)
+                {
+                    ngx_close_file(fd);
+                    ngx_http_finalize_request(r,
+                                              NGX_HTTP_INTERNAL_SERVER_ERROR);
+                    return;
                 }
             } else if (buf->pos < buf->last) {
-                n = write(fd, buf->pos, (size_t)(buf->last - buf->pos));
-                if (n < 0) {
+                if (webdav_write_full(fd, buf->pos,
+                                      (size_t) (buf->last - buf->pos))
+                    != NGX_OK)
+                {
                     ngx_http_xrootd_webdav_log_safe_path(
                         r->connection->log, NGX_LOG_ERR, ngx_errno,
                         "xrootd_webdav: write() failed for",
