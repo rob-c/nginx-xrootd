@@ -396,6 +396,35 @@ xrootd_find_group_rule(const char *resolved_path, ngx_array_t *rules)
     return best;
 }
 
+const xrootd_manager_map_t *
+xrootd_find_manager_map(const char *reqpath, ngx_array_t *map)
+{
+    const xrootd_manager_map_t *best = NULL;
+    xrootd_manager_map_t       *entry;
+    size_t                      best_len = 0;
+    ngx_uint_t                  i;
+
+    if (reqpath == NULL || map == NULL) {
+        return NULL;
+    }
+
+    entry = map->elts;
+    for (i = 0; i < map->nelts; i++) {
+        size_t prefix_len = entry[i].prefix.len;
+
+        if (!xrootd_path_prefix_match((const char *) entry[i].prefix.data, reqpath)) {
+            continue;
+        }
+
+        if (prefix_len >= best_len) {
+            best = &entry[i];
+            best_len = prefix_len;
+        }
+    }
+
+    return best;
+}
+
 ngx_flag_t
 xrootd_vo_list_contains(const char *vo_list, const char *required_vo)
 {

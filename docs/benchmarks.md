@@ -195,6 +195,9 @@ WebDAV syscall notes for large transfers:
 - Downloads over `davs://` use `ssl_buffer_size 1m`, which reduces the number of `SSL_write()` calls nginx makes while streaming large HTTPS responses.
 - Uploads that nginx has already spooled to `client_body_temp_path` now take a kernel-side fast path (`copy_file_range()` on Linux when available) from the temp file into the destination file. When that fast path is unavailable, the fallback copy buffer is 1 MiB rather than the older 64 KiB loop, which still cuts `pread()` / `write()` call volume sharply for 1 GiB uploads.
 
+For the broader list of code-level fast paths behind these numbers, see
+[optimizations.md](optimizations.md).
+
 ### xrootd perf config (`tests/xrootd.perf.conf`)
 
 One xrootd instance serves two protocols from the same `/tmp/xrd-test/data` tree:

@@ -9,6 +9,9 @@ These notes are useful if you are:
 
 If you just want to use the module, you can skip this page.
 
+If you want the higher-level design trade-offs rather than the byte-level wire
+details, see [quirks.md](quirks.md).
+
 ---
 
 ## 1. XRootD v5 handshake uses a different response format

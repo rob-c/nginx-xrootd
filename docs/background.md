@@ -53,7 +53,7 @@ The standard XRootD server (`xrootd` daemon) is purpose-built and very capable, 
 
 If you already operate nginx, you get several things for free by using this module instead:
 
-- **TLS termination** — nginx handles SSL/TLS; the module runs behind it
+- **TLS policy and termination** — nginx's SSL stack provides the HTTPS and `roots://` transport layer, and the native stream module can also trigger the XRootD in-protocol TLS upgrade
 - **IP-based access control** — use `allow`/`deny` in nginx config
 - **Rate limiting** — `limit_conn` and `limit_req` from nginx
 - **Load balancing** — put multiple nginx-xrootd backends behind an nginx upstream
@@ -78,7 +78,6 @@ The trade-off: this is an nginx module, not the full xrootd daemon. It implement
 
 **Not supported:**
 
-- TLS at the XRootD protocol level (`roots://`) — terminate TLS externally at nginx
 - `kXR_locate` (redirect to optimal replica)
 - XRootD federation / redirector role (`kXR_Manager`)
 - Remote storage backends (HDFS, EOS, etc.)

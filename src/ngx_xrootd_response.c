@@ -30,7 +30,7 @@ xrootd_build_resp_hdr(const u_char *streamid, uint16_t status,
 /*
  * xrootd_crc32c — software CRC32c (Castagnoli polynomial 0x1EDC6F41).
  */
-static uint32_t
+uint32_t
 xrootd_crc32c(const void *buf, size_t len)
 {
     /* Precomputed Castagnoli table indexed by the next low byte of the CRC state. */
@@ -162,6 +162,43 @@ xrootd_send_pgwrite_status(xrootd_ctx_t *ctx, ngx_connection_t *c,
 }
 
 /*
+ * xrootd_send_pgread_status — build the kXR_status header prefix for kXR_pgread.
+ *
+ * The 32-byte header is written to *out (caller-supplied).  The interleaved
+ * data+CRC payload must follow immediately in the same chain.
+ *
+ * total_with_crcs: total bytes of interleaved (data+CRC) that follow this header.
+ * file_offset:     file byte offset of first data byte in the response.
+ */
+void
+xrootd_build_pgread_status(xrootd_ctx_t *ctx, int64_t file_offset,
+                            uint32_t total_with_crcs,
+                            ServerStatusResponse_pgRead *out)
+{
+    size_t   crc_len = sizeof(out->bdy) - sizeof(out->bdy.crc32c)
+                       + sizeof(out->pgr);
+    uint32_t crc;
+
+    out->hdr.streamid[0] = ctx->cur_streamid[0];
+    out->hdr.streamid[1] = ctx->cur_streamid[1];
+    out->hdr.status      = htons(kXR_status);
+    out->hdr.dlen        = htonl((uint32_t)(sizeof(out->bdy) + sizeof(out->pgr)
+                                            + total_with_crcs));
+
+    out->bdy.streamID[0] = ctx->cur_streamid[0];
+    out->bdy.streamID[1] = ctx->cur_streamid[1];
+    out->bdy.requestid   = (kXR_char)(kXR_pgread - kXR_1stRequest);
+    out->bdy.resptype    = 0;
+    ngx_memzero(out->bdy.reserved, sizeof(out->bdy.reserved));
+    out->bdy.dlen        = htonl(total_with_crcs);
+
+    out->pgr.offset = (kXR_int64) htobe64((uint64_t) file_offset);
+
+    crc = xrootd_crc32c(&out->bdy.streamID[0], crc_len);
+    out->bdy.crc32c = htonl(crc);
+}
+
+/*
  * xrootd_send_ok — build and queue a kXR_ok response.
  */
 ngx_int_t
@@ -186,6 +223,39 @@ xrootd_send_ok(xrootd_ctx_t *ctx, ngx_connection_t *c,
     }
 
     /* queue_response may send synchronously or retain the buffer until write-ready. */
+    return xrootd_queue_response(ctx, c, buf, total);
+}
+
+
+/*
+ * xrootd_send_redirect — send a kXR_redirect response with 4-byte port + host
+ */
+ngx_int_t
+xrootd_send_redirect(xrootd_ctx_t *ctx, ngx_connection_t *c,
+                      const char *host, uint16_t port)
+{
+    size_t   hostlen = (host != NULL) ? strlen(host) : 0;
+    uint32_t bodylen = (uint32_t)(sizeof(uint32_t) + hostlen);
+    size_t   total   = XRD_RESPONSE_HDR_LEN + bodylen;
+    u_char  *buf     = ngx_palloc(c->pool, total);
+
+    if (buf == NULL) {
+        return NGX_ERROR;
+    }
+
+    xrootd_build_resp_hdr(ctx->cur_streamid, kXR_redirect, bodylen,
+                           (ServerResponseHdr *) buf);
+
+    uint32_t pbe = htonl((uint32_t) port);
+    ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN, &pbe, sizeof(pbe));
+    if (hostlen > 0) {
+        ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN + sizeof(pbe), host, hostlen);
+    }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                   "xrootd: sending redirect to %s:%d",
+                   host ? host : "", (int) port);
+
     return xrootd_queue_response(ctx, c, buf, total);
 }
 

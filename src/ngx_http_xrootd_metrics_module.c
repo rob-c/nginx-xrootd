@@ -54,6 +54,15 @@ static const char *xrootd_op_names[XROOTD_NOPS] = {
     "query_cksum",  /* XROOTD_OP_QUERY_CKSUM  */
     "query_space",  /* XROOTD_OP_QUERY_SPACE  */
     "readv",        /* XROOTD_OP_READV        */
+    "pgread",       /* XROOTD_OP_PGREAD       */
+    "writev",       /* XROOTD_OP_WRITEV       */
+    "locate",       /* XROOTD_OP_LOCATE       */
+    "statx",        /* XROOTD_OP_STATX        */
+    "fattr",        /* XROOTD_OP_FATTR        */
+    "query_stats",  /* XROOTD_OP_QUERY_STATS  */
+    "query_xattr",  /* XROOTD_OP_QUERY_XATTR  */
+    "query_finfo",  /* XROOTD_OP_QUERY_FINFO  */
+    "query_fsinfo", /* XROOTD_OP_QUERY_FSINFO */
 };
 
 /* ------------------------------------------------------------------ */

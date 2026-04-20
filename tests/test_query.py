@@ -17,6 +17,7 @@ import re
 import struct
 import tempfile
 import zlib
+import hashlib
 
 import pytest
 from XRootD import client
@@ -152,6 +153,61 @@ class TestChecksum:
         _, resp1 = self.fs.query(QueryCode.CHECKSUM, r1)
         _, resp2 = self.fs.query(QueryCode.CHECKSUM, r2)
         assert resp1 != resp2, "different files must not collide"
+
+    def test_checksum_md5_known_file(self):
+        """MD5 checksum request via algorithm prefix must return md5 hex."""
+        payload = b"hello checksum test\n" * 100
+        remote  = "/test_query_cksum_md5_known.bin"
+        _upload(ANON_URL, remote, payload)
+
+        # Request MD5 explicitly using "md5:<path>"
+        status, resp = self.fs.query(QueryCode.CHECKSUM, f"md5:{remote}")
+        assert status.ok, f"md5 checksum query failed: {status.message}"
+
+        text = resp.rstrip(b"\x00").decode()
+        algo, hexval = text.split()
+        assert algo == "md5"
+        expected = hashlib.md5(payload).hexdigest()
+        assert hexval == expected, f"md5 mismatch: got={hexval} expected={expected}"
+
+    def test_checksum_sha1_known_file(self):
+        """SHA1 checksum request via algorithm prefix must return sha1 hex."""
+        payload = b"hello checksum test\n" * 100
+        remote  = "/test_query_cksum_sha1_known.bin"
+        _upload(ANON_URL, remote, payload)
+
+        status, resp = self.fs.query(QueryCode.CHECKSUM, f"sha1:{remote}")
+        assert status.ok, f"sha1 checksum query failed: {status.message}"
+
+        text = resp.rstrip(b"\x00").decode()
+        algo, hexval = text.split()
+        assert algo == "sha1"
+        expected = hashlib.sha1(payload).hexdigest()
+        assert hexval == expected, f"sha1 mismatch: got={hexval} expected={expected}"
+
+    def test_checksum_sha256_known_file(self):
+        """SHA256 checksum request via algorithm prefix must return sha256 hex."""
+        payload = b"hello checksum test\n" * 100
+        remote  = "/test_query_cksum_sha256_known.bin"
+        _upload(ANON_URL, remote, payload)
+
+        status, resp = self.fs.query(QueryCode.CHECKSUM, f"sha256:{remote}")
+        assert status.ok, f"sha256 checksum query failed: {status.message}"
+
+        text = resp.rstrip(b"\x00").decode()
+        algo, hexval = text.split()
+        assert algo == "sha256"
+        expected = hashlib.sha256(payload).hexdigest()
+        assert hexval == expected, f"sha256 mismatch: got={hexval} expected={expected}"
+
+    def test_checksum_invalid_algorithm(self):
+        """Unknown algorithm must return an error."""
+        payload = b"abc"
+        remote = "/test_query_cksum_invalidalg.bin"
+        _upload(ANON_URL, remote, payload)
+
+        status, resp = self.fs.query(QueryCode.CHECKSUM, f"bogus:{remote}")
+        assert not status.ok, "expected error for unsupported algorithm"
 
 
 # ---------------------------------------------------------------------------

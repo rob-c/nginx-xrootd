@@ -71,7 +71,9 @@ xrootd_handle_protocol(xrootd_ctx_t *ctx, ngx_connection_t *c,
                            (ServerResponseHdr *) buf);
 
     body.pval  = htonl(kXR_PROTOCOLVERSION);
-    body.flags = htonl(kXR_isServer | (offer_tls ? kXR_haveTLS : 0));
+    body.flags = htonl(kXR_isServer
+                       | (conf->manager_map ? kXR_isManager : 0)
+                       | (offer_tls ? (kXR_haveTLS | kXR_gotoTLS | kXR_tlsLogin) : 0));
 
     /* Fixed 8-byte prefix every protocol reply starts with after the response header. */
     ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN, &body, sizeof(body));
@@ -269,5 +271,22 @@ xrootd_handle_endsess(xrootd_ctx_t *ctx, ngx_connection_t *c)
     ctx->logged_in = 0;
     ctx->auth_done = 0;
 
+    return xrootd_send_ok(ctx, c, NULL, 0);
+}
+
+/*
+ * xrootd_handle_sigver — accept and ignore request signing.
+ *
+ * We do not advertise kXR_secreqs in the kXR_protocol response, so a
+ * conforming client will never send kXR_sigver.  Non-conforming clients
+ * that do send it receive kXR_ok so the session can continue; the following
+ * request is processed without cryptographic verification.
+ */
+ngx_int_t
+xrootd_handle_sigver(xrootd_ctx_t *ctx, ngx_connection_t *c)
+{
+    ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                   "xrootd: kXR_sigver received — accepted without verification");
+    xrootd_log_access(ctx, c, "SIGVER", "-", "-", 1, 0, NULL, 0);
     return xrootd_send_ok(ctx, c, NULL, 0);
 }

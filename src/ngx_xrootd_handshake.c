@@ -238,7 +238,6 @@ xrootd_dispatch(xrootd_ctx_t *ctx, ngx_connection_t *c,
     /* ----- Unsupported or less common mutating opcodes still obey the same gate ----- */
 
     case kXR_writev:
-        /* Keep unsupported mutating ops behind the same auth gate as writes. */
         if (!ctx->logged_in || !ctx->auth_done) {
             return xrootd_send_error(ctx, c, kXR_NotAuthorized,
                                      "authentication required");
@@ -247,8 +246,7 @@ xrootd_dispatch(xrootd_ctx_t *ctx, ngx_connection_t *c,
             return xrootd_send_error(ctx, c, kXR_fsReadOnly,
                                      "this is a read-only server");
         }
-        return xrootd_send_error(ctx, c, kXR_Unsupported,
-                                 "operation not implemented");
+        return xrootd_handle_writev(ctx, c);
 
     case kXR_rmdir:
         /* These path-mutating ops used to skip auth; treat them like rm/mkdir. */
@@ -293,6 +291,42 @@ xrootd_dispatch(xrootd_ctx_t *ctx, ngx_connection_t *c,
                                      "authentication required");
         }
         return xrootd_handle_query(ctx, c, conf);
+
+    case kXR_pgread:
+        if (!ctx->logged_in || !ctx->auth_done) {
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "authentication required");
+        }
+        return xrootd_handle_pgread(ctx, c);
+
+    case kXR_locate:
+        if (!ctx->logged_in || !ctx->auth_done) {
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "authentication required");
+        }
+        return xrootd_handle_locate(ctx, c, conf);
+
+    case kXR_statx:
+        if (!ctx->logged_in || !ctx->auth_done) {
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "authentication required");
+        }
+        return xrootd_handle_statx(ctx, c, conf);
+
+    case kXR_sigver:
+        /* sigver requires login; may arrive before auth_done in signing flows. */
+        if (!ctx->logged_in) {
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "login required");
+        }
+        return xrootd_handle_sigver(ctx, c);
+
+    case kXR_fattr:
+        if (!ctx->logged_in || !ctx->auth_done) {
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "authentication required");
+        }
+        return xrootd_handle_fattr(ctx, c, conf);
 
     default:
         /* Unknown opcodes stay visible in debug logs before returning kXR_Unsupported. */

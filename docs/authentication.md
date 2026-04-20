@@ -258,14 +258,22 @@ This is the recommended production configuration for sites transitioning from GS
 
 ## TLS / encrypted transport
 
-The module does not implement XRootD-level TLS (`kXR_haveTLS` / `roots://`). To encrypt the connection:
+The project now supports three encrypted transport patterns:
 
-**Option 1: stunnel in front of nginx**
+- `davs://` via nginx HTTP TLS in the WebDAV module
+- `root://` plus the native XRootD in-protocol TLS upgrade with `xrootd_tls on`
+- `roots://` via nginx stream SSL (`listen ... ssl`)
 
-Run stunnel on port 1093 (or any port) that wraps the XRootD connection and forwards it to nginx on 1094.
+Those modes are implemented in different code paths and have different auth and
+performance trade-offs, so they are documented in one place here:
 
-**Option 2: nginx `ssl_preread` (layer-4 TLS termination)**
+- [tls.md](tls.md)
 
-Add an nginx `stream` block with `ssl_preread on` that terminates TLS and proxies the inner TCP connection to the XRootD server block. Clients use `roots://` (XRootD's TLS scheme), which is just XRootD over TLS.
+If you only need the short version:
 
-This is currently outside the scope of this module.
+- GSI by itself protects the auth exchange but does not automatically encrypt
+  the whole native XRootD session
+- `xrootd_tls on` upgrades a `root://` connection to TLS after
+  `kXR_protocol`
+- `roots://` uses nginx stream SSL from the first byte
+- `davs://` uses nginx HTTP SSL plus the WebDAV module's proxy-cert handling

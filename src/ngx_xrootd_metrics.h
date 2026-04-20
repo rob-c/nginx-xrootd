@@ -43,8 +43,17 @@
 #define XROOTD_OP_QUERY_CKSUM 17  /* kXR_query / kXR_QChecksum */
 #define XROOTD_OP_QUERY_SPACE 18  /* kXR_query / kXR_QSpace    */
 #define XROOTD_OP_READV       19  /* kXR_readv                 */
+#define XROOTD_OP_PGREAD      20  /* kXR_pgread                */
+#define XROOTD_OP_WRITEV      21  /* kXR_writev                */
+#define XROOTD_OP_LOCATE      22  /* kXR_locate                */
+#define XROOTD_OP_STATX       23  /* kXR_statx                 */
+#define XROOTD_OP_FATTR       24  /* kXR_fattr                 */
+#define XROOTD_OP_QUERY_STATS 25  /* kXR_query / kXR_QStats    */
+#define XROOTD_OP_QUERY_XATTR 26  /* kXR_query / kXR_Qxattr    */
+#define XROOTD_OP_QUERY_FINFO 27  /* kXR_query / kXR_QFinfo    */
+#define XROOTD_OP_QUERY_FSINFO 28 /* kXR_query / kXR_QFSinfo   */
 /* Number of entries in op_ok[] / op_err[] and xrootd_op_names[]. */
-#define XROOTD_NOPS           20
+#define XROOTD_NOPS           29
 
 /*
  * Per-server counter block.  Lives in shared memory; accessed by all

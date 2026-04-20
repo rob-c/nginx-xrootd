@@ -29,6 +29,7 @@
 typedef uint8_t   kXR_char;
 typedef uint16_t  kXR_unt16;
 typedef uint32_t  kXR_unt32;
+typedef uint64_t  kXR_unt64;
 typedef int16_t   kXR_int16;
 typedef int32_t   kXR_int32;
 typedef int64_t   kXR_int64;
@@ -88,6 +89,7 @@ typedef int64_t   kXR_int64;
 #define kXR_stat        3017
 #define kXR_set         3018
 #define kXR_write       3019
+#define kXR_fattr       3020
 #define kXR_prepare     3021
 #define kXR_statx       3022
 #define kXR_endsess     3023
@@ -729,6 +731,156 @@ typedef struct {
     /* host bytes start here and continue until the terminating NUL. */
     char       host[1];        /* null-terminated hostname */
 } ServerRedirectBody;
+
+/* ------------------------------------------------------------------ */
+/* kXR_pgread (3030) — paged read with per-page CRC32c checksums       */
+/* ------------------------------------------------------------------ */
+
+#define kXR_pgPageSZ    4096
+#define kXR_pgPageBL    12
+#define kXR_pgUnitSZ    (kXR_pgPageSZ + 4)
+#define kXR_pgRetry     0x01
+#define kXR_AnyPath     0xff
+
+typedef struct {
+    kXR_char   streamid[2];
+    kXR_unt16  requestid;      /* kXR_pgread */
+    kXR_char   fhandle[4];
+    kXR_int64  offset;
+    kXR_int32  rlen;
+    kXR_int32  dlen;           /* 0, 1 (pathid), or 2 (pathid+reqflags) */
+} ClientPgReadRequest;         /* 24 bytes */
+
+typedef struct {
+    kXR_char   pathid;         /* kXR_AnyPath = 0xff = server chooses */
+    kXR_char   reqflags;       /* kXR_pgRetry = 0x01 */
+} ClientPgReadReqArgs;
+
+typedef struct {
+    kXR_int64  offset;         /* file offset of first byte of returned data */
+} ServerResponseBody_pgRead;   /* 8 bytes */
+
+typedef struct {
+    ServerResponseHdr          hdr;
+    ServerResponseBody_Status  bdy;
+    ServerResponseBody_pgRead  pgr;
+} ServerStatusResponse_pgRead; /* 32 bytes; interleaved data+crc follows */
+
+/* ------------------------------------------------------------------ */
+/* kXR_writev (3031) — scatter-gather / vector write                   */
+/* ------------------------------------------------------------------ */
+
+#define kXR_wv_doSync       0x01
+#define XROOTD_WRITEV_SEGSIZE   16      /* sizeof(write_list)          */
+#define XROOTD_WRITEV_MAXSEGS   1024    /* XrdProto::maxWvecsz         */
+
+typedef struct {
+    kXR_char   fhandle[4];
+    kXR_int32  wlen;
+    kXR_int64  offset;
+} write_list;                  /* 16 bytes; network byte order */
+
+typedef struct {
+    kXR_char   streamid[2];
+    kXR_unt16  requestid;      /* kXR_writev */
+    kXR_char   options;        /* kXR_wv_doSync = 0x01 */
+    kXR_char   reserved[15];
+    kXR_int32  dlen;
+} ClientWriteVRequest;         /* 24 bytes */
+
+/* ------------------------------------------------------------------ */
+/* kXR_locate (3027) — file replica location query                     */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    kXR_char   streamid[2];
+    kXR_unt16  requestid;      /* kXR_locate */
+    kXR_unt16  options;        /* kXR_refresh, kXR_compress, ... */
+    kXR_char   reserved[14];
+    kXR_int32  dlen;
+} ClientLocateRequest;         /* 24 bytes */
+
+/* Response body: space-separated "XY<host:port>" tokens, NUL-terminated.
+ * X = S (server online) | M (manager) | s/m (pending)
+ * Y = r (read-only) | w (read-write) */
+
+/* ------------------------------------------------------------------ */
+/* kXR_sigver (3029) — request signing verification                    */
+/* ------------------------------------------------------------------ */
+
+#define kXR_SHA256_sig   0x01
+#define kXR_HashMask_sig 0x0f
+#define kXR_rsaKey_sig   0x80
+#define kXR_nodata_sig   0x01   /* payload was not hashed */
+
+typedef struct {
+    kXR_char   streamid[2];
+    kXR_unt16  requestid;      /* kXR_sigver */
+    kXR_unt16  expectrid;      /* opcode of the NEXT (signed) request */
+    kXR_char   version;        /* kXR_Ver_00 = 0 */
+    kXR_char   flags;          /* kXR_nodata_sig = 0x01 */
+    kXR_unt64  seqno;          /* monotonically increasing sequence number */
+    kXR_char   crypto;         /* kXR_SHA256_sig | kXR_rsaKey_sig */
+    kXR_char   rsvd2[3];
+    kXR_int32  dlen;
+} ClientSigverRequest;         /* 24 bytes */
+
+/* ------------------------------------------------------------------ */
+/* kXR_statx (3022) — multi-path stat                                  */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    kXR_char   streamid[2];
+    kXR_unt16  requestid;      /* kXR_statx */
+    kXR_char   options;        /* kXR_vfs or 0 */
+    kXR_char   reserved[11];
+    kXR_char   fhandle[4];
+    kXR_int32  dlen;
+} ClientStatxRequest;          /* 24 bytes */
+
+/* Response body: NUL-separated stat lines; one line per path:
+ *   "<id> <size> <flags> <mtime>\n"  (last entry ends with \0) */
+
+/* ------------------------------------------------------------------ */
+/* kXR_fattr (3020) — file extended attributes                         */
+/* ------------------------------------------------------------------ */
+
+/* Subcodes (subcode field) */
+#define kXR_fattrDel    0   /* delete named attributes                   */
+#define kXR_fattrGet    1   /* retrieve named attributes                 */
+#define kXR_fattrList   2   /* enumerate all attributes                  */
+#define kXR_fattrSet    3   /* write named attributes                    */
+#define kXR_fattrMaxSC  3   /* highest valid subcode                     */
+
+/* Limits */
+#define kXR_faMaxVars   16      /* max attributes per request            */
+#define kXR_faMaxNlen   248     /* max attribute name length             */
+#define kXR_faMaxVlen   65536   /* max attribute value length            */
+
+/* Options field bits */
+#define kXR_fa_isNew    0x01    /* set: attribute must not already exist */
+#define kXR_fa_aData    0x10    /* list: include attribute values        */
+
+typedef struct {
+    kXR_char   streamid[2];
+    kXR_unt16  requestid;   /* kXR_fattr */
+    kXR_char   fhandle[4];  /* open file handle (0 if path-based)        */
+    kXR_char   subcode;     /* one of kXR_fattrDel/Get/List/Set above    */
+    kXR_char   numattr;     /* number of attributes in request (0 for list) */
+    kXR_char   options;     /* kXR_fa_isNew | kXR_fa_aData               */
+    kXR_char   reserved[9];
+    kXR_int32  dlen;
+    /*
+     * Payload layout for path-based (payload[0] != 0):
+     *   [path\0][nvec][vvec]
+     *
+     * Payload layout for handle-based (payload[0] == 0 or dlen == 0):
+     *   [0x00][nvec][vvec]   or   (empty for list with dlen=0)
+     *
+     * nvec entry: [kXR_unt16 = 0x0000][name\0]   (numattr entries)
+     * vvec entry: [kXR_int32 vlen BE][value]      (numattr entries, set only)
+     */
+} ClientFattrRequest;    /* 24 bytes */
 
 #pragma pack(pop)
 

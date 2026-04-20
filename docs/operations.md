@@ -2,6 +2,10 @@
 
 This page describes every XRootD operation the module supports, how to use it from the command line and Python client, and any constraints to be aware of.
 
+If you want the higher-level "what does `xrdcp` usually do to the server?" view,
+see [xrdcp-interactions.md](xrdcp-interactions.md). If you want the design
+trade-offs behind some of the odd-looking behavior, see [quirks.md](quirks.md).
+
 ---
 
 ## Connection and session
@@ -11,6 +15,8 @@ These operations happen at the start of every connection, before any file access
 ### Handshake + `kXR_protocol`
 
 The XRootD client sends a 20-byte binary handshake when it first connects, then immediately sends a `kXR_protocol` request to negotiate capabilities. The module handles both automatically — clients and servers do this without any user-level configuration.
+
+When `xrootd_manager_map` mappings are configured the server sets the `kXR_isManager` capability bit in the `kXR_protocol` response so clients know the server may return redirects.
 
 ### `kXR_login`
 
@@ -122,6 +128,16 @@ for entry in listing:
 ```
 
 ---
+
+### `kXR_locate` — file replica location query
+
+`kXR_locate` asks the server for one or more replica locations for a given path. For a simple data server the module returns a single-entry location string in the format `"S<access><host:port>"` where `S` indicates the endpoint is a server and `<access>` is `r` (read-only) or `w` (read-write).
+
+Manager-mode mapping: when `xrootd_manager_map` contains a matching prefix the server returns an XRootD `kXR_redirect` response (status `4004`) instead of a normal location list. The redirect body is encoded as a 4-byte big-endian port followed by the host name bytes (ASCII). Clients should parse the first four bytes as the port and the remaining bytes as the host string.
+
+Both `locate` and `open` consult the configured manager map and will return a redirect when a mapping matches; mappings use longest-prefix matching so more-specific prefixes take precedence.
+
+Configure static mappings using the `xrootd_manager_map /prefix host:port;` directive in the server block. See [Manager Mode](manager-mode.md) for details and examples.
 
 ### `kXR_close` — close a file handle
 
@@ -281,20 +297,39 @@ status, _ = fs.chmod("/store/mc/file.root", AccessMode.UR | AccessMode.UW | Acce
 
 #### Checksum (`QueryCode.CHECKSUM`)
 
-Returns the adler32 checksum of a file. Useful for verifying transfer integrity without re-downloading the file.
+Returns a checksum for a file. The server supports multiple algorithms; the
+default is `adler32` (8 hex digits). You can explicitly request `md5`,
+`sha1` or `sha256` by prefixing the path with the algorithm token using
+either `"<alg>:<path>"` or `"<alg> <path>"` (for example
+`sha256:/store/mc/sample.root`).
+
+Examples:
 
 ```bash
 xrdfs localhost:1094 query checksum /store/mc/sample.root
 # adler32 1a2b3c4d
+
+xrdfs localhost:1094 query checksum md5:/store/mc/sample.root
+# md5 0123456789abcdef0123456789abcdef
+
+xrdfs localhost:1094 query checksum sha256:/store/mc/sample.root
+# sha256 0123456789abcdef... (64 hex digits)
 ```
 
 ```python
 from XRootD.client.flags import QueryCode
 status, resp = fs.query(QueryCode.CHECKSUM, "/store/mc/sample.root")
 # resp → b"adler32 1a2b3c4d\x00"
+
+status, resp = fs.query(QueryCode.CHECKSUM, "md5:/store/mc/sample.root")
+# resp → b"md5 0123456789abcdef0123456789abcdef\x00"
+
+status, resp = fs.query(QueryCode.CHECKSUM, "sha256:/store/mc/sample.root")
+# resp → b"sha256 0123456789abcdef...\x00" (64-hex digits)
 ```
 
-`xrdcp` uses this automatically with `--cksum adler32:print`.
+`xrdcp` continues to use the adler32 response when instructed with
+`--cksum adler32:print`.
 
 #### Space (`QueryCode.SPACE`)
 

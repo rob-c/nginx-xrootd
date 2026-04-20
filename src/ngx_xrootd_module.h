@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
+#include <sys/xattr.h>
 #include <fcntl.h>
 #include <dirent.h>
 #include <limits.h>
@@ -265,6 +266,12 @@ typedef struct {
 } xrootd_group_rule_t;
 
 typedef struct {
+    ngx_str_t  prefix;   /* normalized policy-style prefix (NUL-terminated) */
+    ngx_str_t  host;     /* backend host (text) */
+    uint16_t   port;     /* backend port */
+} xrootd_manager_map_t;
+
+typedef struct {
     ngx_flag_t  enable;
     ngx_str_t   root;
     ngx_uint_t  auth;
@@ -280,6 +287,7 @@ typedef struct {
 
     ngx_array_t *vo_rules;
     ngx_array_t *group_rules;
+    ngx_array_t *manager_map; /* xrootd_manager_map_t entries */
 
     /* Loaded OpenSSL objects */
     X509        *gsi_cert;
@@ -336,6 +344,10 @@ char *xrootd_conf_set_require_vo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 char *xrootd_conf_set_inherit_parent_group(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 
+/* xrootd manager map directive parser */
+char *xrootd_conf_set_manager_map(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+
 /* ngx_xrootd_connection.c */
 void ngx_stream_xrootd_handler(ngx_stream_session_t *s);
 void ngx_stream_xrootd_recv(ngx_event_t *rev);
@@ -367,6 +379,7 @@ ngx_int_t xrootd_handle_login(xrootd_ctx_t *ctx, ngx_connection_t *c,
     ngx_stream_xrootd_srv_conf_t *conf);
 ngx_int_t xrootd_handle_ping(xrootd_ctx_t *ctx, ngx_connection_t *c);
 ngx_int_t xrootd_handle_endsess(xrootd_ctx_t *ctx, ngx_connection_t *c);
+ngx_int_t xrootd_handle_sigver(xrootd_ctx_t *ctx, ngx_connection_t *c);
 
 /* ngx_xrootd_gsi.c */
 int gsi_find_bucket(const u_char *payload, size_t plen,
@@ -383,10 +396,24 @@ ngx_int_t xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
     ngx_stream_xrootd_srv_conf_t *conf);
 ngx_int_t xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c);
 ngx_int_t xrootd_handle_readv(xrootd_ctx_t *ctx, ngx_connection_t *c);
+ngx_int_t xrootd_handle_pgread(xrootd_ctx_t *ctx, ngx_connection_t *c);
+ngx_int_t xrootd_handle_locate(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    ngx_stream_xrootd_srv_conf_t *conf);
+ngx_int_t xrootd_handle_statx(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    ngx_stream_xrootd_srv_conf_t *conf);
 ngx_int_t xrootd_handle_close(xrootd_ctx_t *ctx, ngx_connection_t *c);
 
-/* ngx_xrootd_query.c — kXR_query: checksum (adler32), space, config queries */
+/* ngx_xrootd_query.c — kXR_query: checksum (adler32, md5, sha1, sha256), */
+/*                        space, config, stats, xattr, finfo, fsinfo queries */
 ngx_int_t xrootd_handle_query(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    ngx_stream_xrootd_srv_conf_t *conf);
+
+/* manager map lookup helper (longest-prefix match) */
+const xrootd_manager_map_t *xrootd_find_manager_map(const char *reqpath,
+    ngx_array_t *map);
+
+/* ngx_xrootd_fattr.c — kXR_fattr: file extended attributes */
+ngx_int_t xrootd_handle_fattr(xrootd_ctx_t *ctx, ngx_connection_t *c,
     ngx_stream_xrootd_srv_conf_t *conf);
 
 /* ngx_xrootd_dirlist.c — kXR_dirlist: directory listing with optional dStat */
@@ -396,6 +423,7 @@ ngx_int_t xrootd_handle_dirlist(xrootd_ctx_t *ctx, ngx_connection_t *c,
 /* ngx_xrootd_write_handlers.c */
 ngx_int_t xrootd_handle_write(xrootd_ctx_t *ctx, ngx_connection_t *c);
 ngx_int_t xrootd_handle_pgwrite(xrootd_ctx_t *ctx, ngx_connection_t *c);
+ngx_int_t xrootd_handle_writev(xrootd_ctx_t *ctx, ngx_connection_t *c);
 ngx_int_t xrootd_handle_sync(xrootd_ctx_t *ctx, ngx_connection_t *c);
 ngx_int_t xrootd_handle_truncate(xrootd_ctx_t *ctx, ngx_connection_t *c,
     ngx_stream_xrootd_srv_conf_t *conf);
@@ -417,8 +445,13 @@ ngx_int_t xrootd_send_ok(xrootd_ctx_t *ctx, ngx_connection_t *c,
     const void *body, uint32_t bodylen);
 ngx_int_t xrootd_send_error(xrootd_ctx_t *ctx, ngx_connection_t *c,
     uint16_t errcode, const char *msg);
+ngx_int_t xrootd_send_redirect(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    const char *host, uint16_t port);
 ngx_int_t xrootd_send_pgwrite_status(xrootd_ctx_t *ctx,
     ngx_connection_t *c, int64_t write_offset);
+void xrootd_build_pgread_status(xrootd_ctx_t *ctx, int64_t file_offset,
+    uint32_t total_with_crcs, ServerStatusResponse_pgRead *out);
+uint32_t xrootd_crc32c(const void *buf, size_t len);
 
 /* ngx_xrootd_path.c */
 size_t xrootd_sanitize_log_string(const char *in, char *out, size_t outsz);

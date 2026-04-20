@@ -467,7 +467,7 @@ ngx_http_xrootd_webdav_tpc_handle_copy(ngx_http_request_t *r)
         }
     }
 
-    rc = ngx_http_xrootd_webdav_resolve_path(r, &conf->root, path,
+    rc = ngx_http_xrootd_webdav_resolve_path(r, conf->root_canon, path,
                                              sizeof(path));
     if (rc != NGX_OK) {
         return (ngx_int_t) rc;

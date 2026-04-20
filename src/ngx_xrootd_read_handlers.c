@@ -313,6 +313,19 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
                                  "invalid path payload");
     }
 
+    /* Manager-mode mapping: redirect opens for configured prefixes. */
+    if (conf->manager_map != NULL) {
+        const xrootd_manager_map_t *m = xrootd_find_manager_map(clean_path,
+                                                                conf->manager_map);
+        if (m != NULL) {
+            xrootd_log_access(ctx, c, "OPEN", clean_path, "redirect",
+                              1, 0, NULL, 0);
+            XROOTD_OP_OK(ctx, is_write ? XROOTD_OP_OPEN_WR : XROOTD_OP_OPEN_RD);
+            return xrootd_send_redirect(ctx, c, (const char *) m->host.data,
+                                        m->port);
+        }
+    }
+
     /* Resolve the path.
      * For read opens the file must already exist (realpath check).
      * For write opens with kXR_mkpath the parent dirs may not exist yet,
@@ -936,7 +949,7 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
         return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
     }
 
-    if (S_ISREG(st.st_mode)) {
+    if (S_ISREG(st.st_mode) && !c->ssl) {
         off_t avail;
 
         if ((off_t) offset >= st.st_size) {
@@ -981,8 +994,9 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
     }
 
     /*
-     * Handles should normally point at regular files.  Keep a conservative
-     * memory-backed fallback for unusual descriptors where sendfile is invalid.
+     * Memory-backed read path.  Used for non-regular descriptors where sendfile
+     * is invalid, and for TLS connections where nginx's ngx_ssl_send_chain
+     * silently drops file-backed chain buffers without kernel TLS support.
      */
     databuf = xrootd_get_read_scratch(ctx, c, rlen);
     if (databuf == NULL) {
@@ -1029,6 +1043,356 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
         }
         return rc;
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* kXR_pgread — paged read with per-page CRC32c checksums              */
+/*                                                                     */
+/* The response uses kXR_status framing (not kXR_ok).  Each 4096-byte */
+/* page of data is immediately followed by a 4-byte big-endian CRC32c */
+/* of that page.  The last page may be shorter than 4096 bytes but    */
+/* still has a 4-byte CRC appended.                                    */
+/* ------------------------------------------------------------------ */
+ngx_int_t
+xrootd_handle_pgread(xrootd_ctx_t *ctx, ngx_connection_t *c)
+{
+    ClientPgReadRequest *req = (ClientPgReadRequest *) ctx->hdr_buf;
+    int      idx;
+    int64_t  offset;
+    size_t   rlen;
+    int      fd;
+    ssize_t  nread;
+    size_t   n_pages, i;
+    u_char  *flat_buf;   /* temporary: raw file data before CRC interleaving */
+    u_char  *out_buf;    /* final: interleaved data + CRC, in scratch buffer  */
+    size_t   out_size;
+    ServerStatusResponse_pgRead *hdr_buf;
+    ngx_chain_t *cl_hdr, *cl_data, *rsp_chain;
+    char     detail[64];
+
+    idx    = (int)(unsigned char) req->fhandle[0];
+    offset = (int64_t) be64toh((uint64_t) req->offset);
+    rlen   = (size_t)(uint32_t) ntohl((uint32_t) req->rlen);
+
+    if (idx < 0 || idx >= XROOTD_MAX_FILES || ctx->files[idx].fd < 0) {
+        XROOTD_OP_ERR(ctx, XROOTD_OP_PGREAD);
+        return xrootd_send_error(ctx, c, kXR_FileNotOpen,
+                                 "invalid file handle");
+    }
+
+    if (!ctx->files[idx].readable) {
+        XROOTD_OP_ERR(ctx, XROOTD_OP_PGREAD);
+        return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                 "file not open for reading");
+    }
+
+    if (offset < 0) {
+        XROOTD_OP_ERR(ctx, XROOTD_OP_PGREAD);
+        return xrootd_send_error(ctx, c, kXR_IOError, "negative read offset");
+    }
+
+    if (rlen == 0) {
+        /* A zero-length pgread is an integrity no-op; return an empty kXR_status. */
+        hdr_buf = ngx_palloc(c->pool, sizeof(*hdr_buf));
+        if (hdr_buf == NULL) { return NGX_ERROR; }
+        xrootd_build_pgread_status(ctx, offset, 0, hdr_buf);
+        XROOTD_OP_OK(ctx, XROOTD_OP_PGREAD);
+        return xrootd_queue_response(ctx, c, (u_char *) hdr_buf,
+                                     sizeof(*hdr_buf));
+    }
+
+    if (rlen > (size_t) XROOTD_READ_MAX * 16) {
+        rlen = (size_t) XROOTD_READ_MAX * 16;
+    }
+
+    fd = ctx->files[idx].fd;
+
+    /* Read raw data into a temporary flat buffer. */
+    flat_buf = ngx_palloc(c->pool, rlen);
+    if (flat_buf == NULL) { return NGX_ERROR; }
+
+    nread = pread(fd, flat_buf, rlen, (off_t) offset);
+    if (nread < 0) {
+        xrootd_log_access(ctx, c, "PGREAD", ctx->files[idx].path, "-",
+                          0, kXR_IOError, strerror(errno), 0);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_PGREAD);
+        return xrootd_send_error(ctx, c, kXR_IOError, strerror(errno));
+    }
+
+    rlen = (size_t) nread;   /* actual bytes; may be short at EOF */
+
+    /* Compute number of pages (last page may be partial). */
+    n_pages = (rlen + kXR_pgPageSZ - 1) / kXR_pgPageSZ;
+    if (n_pages == 0) { n_pages = 1; }
+
+    out_size = n_pages * kXR_pgUnitSZ;   /* each page: kXR_pgPageSZ data + 4 CRC */
+
+    /* The scratch buffer holds the interleaved data+CRC that follows the status header. */
+    out_buf = xrootd_get_read_scratch(ctx, c, out_size);
+    if (out_buf == NULL) { return NGX_ERROR; }
+
+    /* Interleave: for each page copy data then append 4-byte BE CRC32c. */
+    {
+        u_char  *src = flat_buf;
+        u_char  *dst = out_buf;
+        size_t   remaining = rlen;
+
+        for (i = 0; i < n_pages; i++) {
+            size_t   page_data = (remaining >= (size_t) kXR_pgPageSZ)
+                                 ? (size_t) kXR_pgPageSZ : remaining;
+            uint32_t crc = xrootd_crc32c(src, page_data);
+            uint32_t crc_be = htonl(crc);
+
+            ngx_memcpy(dst, src, page_data);
+            dst       += page_data;
+            src       += page_data;
+            remaining -= page_data;
+
+            ngx_memcpy(dst, &crc_be, 4);
+            dst += 4;
+        }
+
+        /* Actual output size: sum of (page_data + 4) per page. */
+        out_size = (size_t)(dst - out_buf);
+    }
+
+    /* Build the 32-byte kXR_status header. */
+    hdr_buf = ngx_palloc(c->pool, sizeof(*hdr_buf));
+    if (hdr_buf == NULL) {
+        xrootd_release_read_buffer(ctx, c, out_buf);
+        return NGX_ERROR;
+    }
+    xrootd_build_pgread_status(ctx, offset, (uint32_t) out_size, hdr_buf);
+
+    /* Chain: status header buffer → data+CRC buffer. */
+    cl_hdr = ngx_alloc_chain_link(c->pool);
+    if (cl_hdr == NULL) {
+        xrootd_release_read_buffer(ctx, c, out_buf);
+        return NGX_ERROR;
+    }
+    cl_hdr->buf = ngx_calloc_buf(c->pool);
+    if (cl_hdr->buf == NULL) {
+        xrootd_release_read_buffer(ctx, c, out_buf);
+        return NGX_ERROR;
+    }
+    cl_hdr->buf->pos      = (u_char *) hdr_buf;
+    cl_hdr->buf->last     = cl_hdr->buf->pos + sizeof(*hdr_buf);
+    cl_hdr->buf->memory   = 1;
+    cl_hdr->buf->last_buf = 0;
+
+    cl_data = xrootd_build_chunked_chain(ctx, c, out_buf, out_size);
+    if (cl_data == NULL) {
+        xrootd_release_read_buffer(ctx, c, out_buf);
+        return NGX_ERROR;
+    }
+    cl_hdr->next = cl_data;
+    rsp_chain    = cl_hdr;
+
+    ctx->files[idx].bytes_read += rlen;
+    ctx->session_bytes         += rlen;
+
+    snprintf(detail, sizeof(detail), "%lld+%zu", (long long) offset, rlen);
+    xrootd_log_access(ctx, c, "PGREAD", ctx->files[idx].path,
+                      detail, 1, 0, NULL, rlen);
+    XROOTD_OP_OK(ctx, XROOTD_OP_PGREAD);
+
+    {
+        ngx_int_t rc = xrootd_queue_response_chain(ctx, c, rsp_chain, out_buf);
+        if (rc != NGX_OK || ctx->state != XRD_ST_SENDING) {
+            xrootd_release_read_buffer(ctx, c, out_buf);
+        }
+        return rc;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* kXR_locate — file replica location query                            */
+/*                                                                     */
+/* For a data server we return a single-entry location string in the  */
+/* format "XY<host:port>" where X=S (server online), Y=r|w.           */
+/* ------------------------------------------------------------------ */
+ngx_int_t
+xrootd_handle_locate(xrootd_ctx_t *ctx, ngx_connection_t *c,
+                     ngx_stream_xrootd_srv_conf_t *conf)
+{
+    ClientLocateRequest *req = (ClientLocateRequest *) ctx->hdr_buf;
+    char     reqpath_buf[XROOTD_MAX_PATH + 1];
+    char     resolved[PATH_MAX];
+    struct   sockaddr_in *sin;
+    char     loc_buf[256];
+    char     addr_buf[INET6_ADDRSTRLEN + 8];
+    int      loc_len;
+    int      is_wildcard;
+    uint16_t port;
+    char     access_char;
+
+    (void) req;   /* options field unused for data-server implementation */
+
+    /* Validate and extract path from payload. */
+    if (ctx->cur_dlen == 0 || ctx->payload == NULL) {
+        XROOTD_OP_ERR(ctx, XROOTD_OP_LOCATE);
+        return xrootd_send_error(ctx, c, kXR_ArgMissing, "no path given");
+    }
+
+    if (!xrootd_extract_path(c->log, ctx->payload, ctx->cur_dlen,
+                             reqpath_buf, sizeof(reqpath_buf), 1)) {
+        XROOTD_OP_ERR(ctx, XROOTD_OP_LOCATE);
+        return xrootd_send_error(ctx, c, kXR_ArgInvalid,
+                                 "invalid path payload");
+    }
+
+    is_wildcard = (reqpath_buf[0] == '*' && reqpath_buf[1] == '\0');
+
+    /* Manager-mode static mapping: check for a configured redirect before local resolution. */
+    if (!is_wildcard && conf->manager_map != NULL) {
+        const xrootd_manager_map_t *m = xrootd_find_manager_map(reqpath_buf,
+                                                                conf->manager_map);
+        if (m != NULL) {
+            xrootd_log_access(ctx, c, "LOCATE", reqpath_buf, "redirect",
+                              1, 0, NULL, 0);
+            XROOTD_OP_OK(ctx, XROOTD_OP_LOCATE);
+            return xrootd_send_redirect(ctx, c, (const char *) m->host.data,
+                                        m->port);
+        }
+    }
+
+    if (!is_wildcard) {
+        /* Verify the path exists and is accessible. */
+        if (!xrootd_resolve_path(c->log, &conf->root,
+                                 reqpath_buf, resolved, sizeof(resolved))) {
+            xrootd_log_access(ctx, c, "LOCATE", reqpath_buf, "-",
+                              0, kXR_NotFound, "file not found", 0);
+            XROOTD_OP_ERR(ctx, XROOTD_OP_LOCATE);
+            return xrootd_send_error(ctx, c, kXR_NotFound, "file not found");
+        }
+
+        if (xrootd_check_vo_acl(c->log, resolved, conf->vo_rules,
+                                 ctx->vo_list) != NGX_OK) {
+            XROOTD_OP_ERR(ctx, XROOTD_OP_LOCATE);
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "VO not authorized");
+        }
+    }
+
+    /* Determine access level for this server. */
+    access_char = conf->allow_write ? 'w' : 'r';
+
+    /* Format the local endpoint as "host:port". */
+    if (c->local_sockaddr != NULL
+        && c->local_sockaddr->sa_family == AF_INET) {
+        sin  = (struct sockaddr_in *) c->local_sockaddr;
+        port = ntohs(sin->sin_port);
+        snprintf(addr_buf, sizeof(addr_buf), "%s:%d",
+                 inet_ntoa(sin->sin_addr), (int) port);
+    } else {
+        snprintf(addr_buf, sizeof(addr_buf), "localhost");
+    }
+
+    /* Build the single-entry response: "S<access><addr>\0" */
+    loc_len = snprintf(loc_buf, sizeof(loc_buf), "S%c%s", access_char, addr_buf);
+
+    xrootd_log_access(ctx, c, "LOCATE", reqpath_buf, loc_buf,
+                      1, 0, NULL, 0);
+    XROOTD_OP_OK(ctx, XROOTD_OP_LOCATE);
+
+    return xrootd_send_ok(ctx, c, loc_buf, (uint32_t)(loc_len + 1));
+}
+
+/* ------------------------------------------------------------------ */
+/* kXR_statx — multi-path stat                                         */
+/*                                                                     */
+/* Payload is one or more NUL-separated paths.  The response is a     */
+/* concatenation of per-path stat strings, each on its own line.      */
+/* Paths that cannot be resolved produce an error sentinel line.       */
+/* ------------------------------------------------------------------ */
+ngx_int_t
+xrootd_handle_statx(xrootd_ctx_t *ctx, ngx_connection_t *c,
+                    ngx_stream_xrootd_srv_conf_t *conf)
+{
+#define XROOTD_STATX_MAX_PATHS  256
+#define XROOTD_STATX_LINE_MAX   256
+#define XROOTD_STATX_BUF_MAX    (XROOTD_STATX_MAX_PATHS * XROOTD_STATX_LINE_MAX)
+#define XROOTD_STATX_ERR_LINE   "0 0 0 0\n"
+
+    const u_char *p, *end, *path_start;
+    u_char       *rsp_buf, *rsp_ptr;
+    char          reqpath_buf[XROOTD_MAX_PATH + 1];
+    char          resolved[PATH_MAX];
+    struct stat   st;
+    char          stat_body[XROOTD_STATX_LINE_MAX];
+    size_t        path_len, stat_len;
+    int           n_paths = 0;
+
+    if (ctx->cur_dlen == 0 || ctx->payload == NULL) {
+        XROOTD_OP_ERR(ctx, XROOTD_OP_STATX);
+        return xrootd_send_error(ctx, c, kXR_ArgMissing, "no paths given");
+    }
+
+    rsp_buf = ngx_palloc(c->pool, XROOTD_STATX_BUF_MAX);
+    if (rsp_buf == NULL) { return NGX_ERROR; }
+
+    rsp_ptr = rsp_buf;
+    p       = ctx->payload;
+    end     = ctx->payload + ctx->cur_dlen;
+
+    while (p < end && n_paths < XROOTD_STATX_MAX_PATHS) {
+        /* Find the next NUL-terminated path in the payload. */
+        path_start = p;
+        while (p < end && *p != '\0') { p++; }
+
+        path_len = (size_t)(p - path_start);
+        if (p < end) { p++; }   /* skip the NUL separator */
+
+        if (path_len == 0) { continue; }
+        if (path_len >= sizeof(reqpath_buf)) { continue; }
+
+        ngx_memcpy(reqpath_buf, path_start, path_len);
+        reqpath_buf[path_len] = '\0';
+
+        n_paths++;
+
+        /* Resolve and stat the path. */
+        if (!xrootd_resolve_path(c->log, &conf->root,
+                                 reqpath_buf, resolved, sizeof(resolved))
+            || xrootd_check_vo_acl(c->log, resolved, conf->vo_rules,
+                                    ctx->vo_list) != NGX_OK
+            || stat(resolved, &st) != 0)
+        {
+            /* Inaccessible or missing — emit error sentinel. */
+            size_t errlen = sizeof(XROOTD_STATX_ERR_LINE) - 1;
+            if (rsp_ptr + errlen < rsp_buf + XROOTD_STATX_BUF_MAX) {
+                ngx_memcpy(rsp_ptr, XROOTD_STATX_ERR_LINE, errlen);
+                rsp_ptr += errlen;
+            }
+            continue;
+        }
+
+        xrootd_make_stat_body(&st, 0, stat_body, sizeof(stat_body));
+        stat_len = strlen(stat_body);
+
+        if (rsp_ptr + stat_len + 1 < rsp_buf + XROOTD_STATX_BUF_MAX) {
+            ngx_memcpy(rsp_ptr, stat_body, stat_len);
+            rsp_ptr += stat_len;
+            *rsp_ptr++ = '\n';
+        }
+    }
+
+    /* Replace the last '\n' with '\0' per the XRootD stat wire protocol. */
+    if (rsp_ptr > rsp_buf && *(rsp_ptr - 1) == '\n') {
+        *(rsp_ptr - 1) = '\0';
+    } else {
+        *rsp_ptr++ = '\0';
+    }
+
+    {
+        char detail[32];
+        snprintf(detail, sizeof(detail), "%d_paths", n_paths);
+        xrootd_log_access(ctx, c, "STATX", "-", detail, 1, 0, NULL, 0);
+    }
+    XROOTD_OP_OK(ctx, XROOTD_OP_STATX);
+
+    return xrootd_send_ok(ctx, c, rsp_buf,
+                          (uint32_t)((size_t)(rsp_ptr - rsp_buf)));
 }
 
 /* kXR_close — close an open file handle */

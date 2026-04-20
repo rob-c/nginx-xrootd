@@ -73,6 +73,9 @@ The main test harness in `tests/` expects nginx already running on the base anon
 
 These came from interoperability debugging and are easy to forget:
 
+For the longer-form version, see [quirks.md](quirks.md) and
+[protocol-notes.md](protocol-notes.md).
+
 - **Trailing NUL in path `dlen`:** Some XRootD clients include a single trailing NUL inside the path length field. The server must tolerate this terminator but still reject embedded NULs before it.
 - **`xrdfs ping` not implemented:** In xrootd-client 5.9.2, `xrdfs ... ping` is not available. Use `xrdfs ... ls /` as the readiness probe instead.
 - **Repeated upload tests:** Use `xrdcp -f` or remove the destination first; otherwise reruns fail because the file already exists rather than testing the server.

@@ -2,6 +2,11 @@
 
 The `ngx_http_xrootd_webdav_module` adds a WebDAV content handler to nginx's HTTP layer. Together with TLS, GSI proxy-certificate support, and optional JWT bearer-token validation, it lets `xrdcp` use the `davs://host:8443/` URL scheme — the same transfer path used by Grid and WLCG workflows that prefer HTTP over the native `root://` protocol.
 
+For the full TLS implementation details across both WebDAV and native XRootD,
+see [tls.md](tls.md). For the WebDAV fast paths and syscall-reduction work, see
+[optimizations.md](optimizations.md). For the usual `xrdcp --allow-http`
+request flow, see [xrdcp-interactions.md](xrdcp-interactions.md).
+
 ---
 
 ## How it works
@@ -222,6 +227,30 @@ Expected JWT `iss` claim.
 **Context:** `location`
 
 Expected JWT `aud` claim.
+
+---
+
+### `xrootd_webdav_thread_pool <name>`
+
+**Context:** `location` · **Default:** `default`
+
+Names the nginx thread pool used for async WebDAV file I/O, primarily the
+in-memory `PUT` fast path. If the named pool does not exist, the module logs a
+notice and falls back to synchronous I/O.
+
+```nginx
+thread_pool webdav_io threads=8 max_queue=65536;
+
+server {
+    listen 8443 ssl;
+
+    location / {
+        xrootd_webdav on;
+        xrootd_webdav_root /data;
+        xrootd_webdav_thread_pool webdav_io;
+    }
+}
+```
 
 ---
 

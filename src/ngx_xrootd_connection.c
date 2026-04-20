@@ -462,6 +462,11 @@ xrootd_tls_handshake_done(ngx_connection_t *c)
     ctx->state       = XRD_ST_REQ_HEADER;
     ctx->hdr_pos     = 0;
 
+    /* Restore the normal read/write event handlers that ngx_ssl_handshake()
+     * replaced with its own internal handlers during the async handshake. */
+    c->read->handler  = ngx_stream_xrootd_recv;
+    c->write->handler = ngx_stream_xrootd_send;
+
     ngx_stream_xrootd_recv(c->read);
 }
 
@@ -623,6 +628,30 @@ xrootd_queue_response(xrootd_ctx_t *ctx, ngx_connection_t *c,
     return xrootd_queue_response_base(ctx, c, buf, len, NULL);
 }
 
+/*
+ * xrootd_tcp_push — release TCP_CORK (set by ngx_linux_sendfile_chain when
+ * it sees a memory-header + in_file body) and restore TCP_NODELAY.
+ *
+ * Without this, the kernel holds the last sub-MSS segment for the 200 ms
+ * TCP_CORK auto-flush timeout, causing exactly that delay per kXR_read chunk
+ * on plain TCP.  TLS connections are unaffected because ngx_ssl_send_chain
+ * never sets TCP_CORK.
+ */
+static void
+xrootd_tcp_push(ngx_connection_t *c)
+{
+    if (c->tcp_nopush != NGX_TCP_NOPUSH_SET) {
+        return;
+    }
+    (void) ngx_tcp_push(c->fd);
+    c->tcp_nopush = NGX_TCP_NOPUSH_UNSET;
+
+    if (c->tcp_nodelay == NGX_TCP_NODELAY_UNSET) {
+        (void) ngx_tcp_nodelay(c);
+        c->tcp_nodelay = NGX_TCP_NODELAY_SET;
+    }
+}
+
 ngx_int_t
 xrootd_queue_response_chain(xrootd_ctx_t *ctx, ngx_connection_t *c,
                             ngx_chain_t *cl, u_char *base)
@@ -643,6 +672,7 @@ xrootd_queue_response_chain(xrootd_ctx_t *ctx, ngx_connection_t *c,
         }
 
         if (out == NULL) {
+            xrootd_tcp_push(c);
             return NGX_OK;
         }
 
@@ -697,6 +727,8 @@ xrootd_flush_pending(xrootd_ctx_t *ctx, ngx_connection_t *c)
             }
             return NGX_AGAIN;
         }
+
+        xrootd_tcp_push(c);
 
         if (ctx->wchain_base) {
             xrootd_release_read_buffer(ctx, c, ctx->wchain_base);

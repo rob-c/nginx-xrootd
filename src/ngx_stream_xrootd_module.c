@@ -217,6 +217,14 @@ static ngx_command_t ngx_stream_xrootd_commands[] = {
       offsetof(ngx_stream_xrootd_srv_conf_t, access_log),
       NULL },
 
+    /* Manager-mode: static prefix -> backend mapping (manager/redirector). */
+    { ngx_string("xrootd_manager_map"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE2,
+      xrootd_conf_set_manager_map,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      0,
+      NULL },
+
 #if (NGX_THREADS)
     /*
      * Async pread/pwrite support is only compiled when nginx itself was built

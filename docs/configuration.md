@@ -82,6 +82,36 @@ xrootd_auth gsi;
 
 ---
 
+### `xrootd_tls on|off`
+
+**Default:** `off`
+
+Enables XRootD's in-protocol TLS upgrade on a normal `root://` listener. When a
+client advertises `kXR_ableTLS`, the server replies with `kXR_haveTLS` and
+upgrades the same TCP connection to TLS before `kXR_login` / `kXR_auth`
+continue.
+
+Requires `xrootd_certificate` and `xrootd_certificate_key`.
+
+Use this on a plain `listen 1094;` style listener. Do not combine it with
+`listen ... ssl` on the same stream server; that `roots://` mode is already
+encrypted from the first byte. Full details: [tls.md](tls.md).
+
+```nginx
+server {
+    listen 1095;
+    xrootd on;
+    xrootd_root /data;
+    xrootd_auth gsi;
+    xrootd_certificate     /etc/grid-security/hostcert.pem;
+    xrootd_certificate_key /etc/grid-security/hostkey.pem;
+    xrootd_trusted_ca      /etc/grid-security/certificates/ca.pem;
+    xrootd_tls on;
+}
+```
+
+---
+
 ### `xrootd_certificate <path>`
 
 Path to the server's PEM certificate file. Required when `xrootd_auth gsi` or `xrootd_auth both`.
@@ -254,6 +284,18 @@ What happens on each create:
 
 ---
 
+### `xrootd_manager_map /prefix host:port`
+
+Map requests for a path prefix to an external manager/redirector endpoint. When a `locate` or `open` request matches a configured prefix the server replies with an XRootD `kXR_redirect` (status `4004`). The redirect body format is a 4-byte big-endian port followed by the host name bytes (ASCII). Lookups use longest-prefix matching; prefixes are normalized by the module before comparison.
+
+The `host:port` value may be an IPv4 address or an IPv6 literal using bracket notation (for example: `[::1]:1234`). See [Manager Mode](manager-mode.md) for full semantics and examples.
+
+Example:
+
+```nginx
+xrootd_manager_map /maps backend.example.org:54321;
+```
+
 ## Complete examples
 
 ### Minimal read-only server
@@ -415,6 +457,7 @@ http {
 | `xrootd_root <path>` | `server` | `/` | Recommended |
 | `xrootd_allow_write on\|off` | `server` | `off` | No |
 | `xrootd_auth none\|gsi\|token\|both` | `server` | `none` | No |
+| `xrootd_tls on\|off` | `server` | `off` | No |
 | `xrootd_certificate <path>` | `server` | — | If `auth gsi` or `auth both` |
 | `xrootd_certificate_key <path>` | `server` | — | If `auth gsi` or `auth both` |
 | `xrootd_trusted_ca <path>` | `server` | — | If `auth gsi` or `auth both` |
@@ -458,3 +501,4 @@ The WebDAV module (`ngx_http_xrootd_webdav_module`) handles `davs://` clients in
 | `xrootd_webdav_token_jwks <path>` | `location` | — | JWKS for Bearer tokens |
 | `xrootd_webdav_token_issuer <string>` | `location` | — | Expected token issuer |
 | `xrootd_webdav_token_audience <string>` | `location` | — | Expected token audience |
+| `xrootd_webdav_thread_pool <name>` | `location` | `default` | nginx thread pool for async WebDAV file I/O |

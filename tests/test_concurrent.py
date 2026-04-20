@@ -22,8 +22,9 @@ from XRootD import client
 # Configuration
 # ---------------------------------------------------------------------------
 
-ANON_URL  = "root://localhost:11094"
-GSI_URL   = "root://localhost:11095"
+ANON_URL    = "root://localhost:11094"
+GSI_URL     = "root://localhost:11095"
+GSI_TLS_URL = "roots://localhost:11096"
 
 CA_DIR    = "/tmp/xrd-test/pki/ca"
 PROXY_PEM = "/tmp/xrd-test/pki/user/proxy_std.pem"
@@ -265,6 +266,81 @@ class TestConcurrent:
         print(
             f"\n  n=1 aggregate: {agg1/1e6:.0f} MB/s  wall={wall1:.2f}s"
             f"\n  n=4 aggregate: {agg4/1e6:.0f} MB/s  wall={wall4:.2f}s"
+            f"\n  scale-up ratio: {ratio:.2f}x"
+        )
+
+        assert ratio >= 1.5, (
+            f"Expected ≥1.5× aggregate throughput at n=4 vs n=1, got {ratio:.2f}×. "
+            f"n=1={agg1/1e6:.0f} MB/s  n=4={agg4/1e6:.0f} MB/s"
+        )
+
+
+class TestConcurrentTLS:
+    """
+    Same concurrency matrix as TestConcurrent but against the roots:// endpoint
+    (GSI auth + kXR_ableTLS in-protocol TLS upgrade).
+    """
+
+    def test_baseline_single_gsi_tls(self):
+        """Single transfer baseline for GSI+TLS endpoint."""
+        results, wall = _run_concurrent(1, GSI_TLS_URL)
+        _assert_and_report(results, 1, wall, "gsi+tls n=1 baseline")
+
+    def test_concurrent_2_gsi_tls(self):
+        """2 simultaneous GSI+TLS transfers."""
+        results, wall = _run_concurrent(2, GSI_TLS_URL)
+        _assert_and_report(results, 2, wall, "gsi+tls n=2")
+
+    def test_concurrent_4_gsi_tls(self):
+        """4 simultaneous GSI+TLS transfers."""
+        results, wall = _run_concurrent(4, GSI_TLS_URL)
+        _assert_and_report(results, 4, wall, "gsi+tls n=4")
+
+    def test_concurrent_8_gsi_tls(self):
+        """8 simultaneous GSI+TLS transfers."""
+        results, wall = _run_concurrent(8, GSI_TLS_URL)
+        _assert_and_report(results, 8, wall, "gsi+tls n=8")
+
+    def test_concurrent_mixed_gsi_and_gsi_tls(self):
+        """
+        4 plain-GSI + 4 GSI+TLS transfers simultaneously.
+        Verifies the server correctly multiplexes TLS-upgraded and plain
+        connections within one event loop.
+        """
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            t0 = time.perf_counter()
+            futures = (
+                [pool.submit(_transfer_worker, i,   GSI_URL)     for i in range(4)]
+              + [pool.submit(_transfer_worker, i+4, GSI_TLS_URL) for i in range(4)]
+            )
+            results = [f.result() for f in as_completed(futures)]
+        wall = time.perf_counter() - t0
+
+        gsi_results     = [r for r in results if GSI_URL     in r["url"] and GSI_TLS_URL not in r["url"]]
+        gsi_tls_results = [r for r in results if GSI_TLS_URL in r["url"]]
+
+        _assert_and_report(gsi_results,     4, wall, "mixed → gsi      side")
+        _assert_and_report(gsi_tls_results, 4, wall, "mixed → gsi+tls  side")
+
+    @pytest.mark.timeout(240)
+    def test_aggregate_throughput_scales_gsi_tls(self):
+        """
+        Aggregate throughput with 4 GSI+TLS connections should be at least
+        1.5× that of 1 connection — TLS overhead should not serialise I/O.
+        """
+        _run_concurrent(1, GSI_TLS_URL)
+        _run_concurrent(4, GSI_TLS_URL)
+
+        wall1 = min(_run_concurrent(1, GSI_TLS_URL)[1], _run_concurrent(1, GSI_TLS_URL)[1])
+        wall4 = min(_run_concurrent(4, GSI_TLS_URL)[1], _run_concurrent(4, GSI_TLS_URL)[1])
+
+        agg1 = LARGE_FILE_SIZE / wall1
+        agg4 = (4 * LARGE_FILE_SIZE) / wall4
+        ratio = agg4 / agg1
+
+        print(
+            f"\n  gsi+tls n=1 aggregate: {agg1/1e6:.0f} MB/s  wall={wall1:.2f}s"
+            f"\n  gsi+tls n=4 aggregate: {agg4/1e6:.0f} MB/s  wall={wall4:.2f}s"
             f"\n  scale-up ratio: {ratio:.2f}x"
         )
 
