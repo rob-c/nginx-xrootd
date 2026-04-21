@@ -22,11 +22,28 @@ import hashlib
 import pytest
 from XRootD import client
 from XRootD.client.flags import OpenFlags, QueryCode
+from backend_matrix import selected_backend_name
+from settings import CA_DIR as DEFAULT_CA_DIR, PROXY_STD
 
-ANON_URL  = "root://localhost:11094"
-GSI_URL   = "root://localhost:11095"
-CA_DIR    = "/tmp/xrd-test/pki/ca"
-PROXY_PEM = "/tmp/xrd-test/pki/user/proxy_std.pem"
+CROSS_BACKEND = selected_backend_name()
+ANON_URL  = ""
+GSI_URL   = ""
+CA_DIR    = DEFAULT_CA_DIR
+PROXY_PEM = PROXY_STD
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _configure(test_env, ref_xrootd, ref_xrootd_gsi_shared):
+    """Bind module constants from the selected shared test environment."""
+    global ANON_URL, GSI_URL, CA_DIR, PROXY_PEM
+    if CROSS_BACKEND == "xrootd":
+        ANON_URL = ref_xrootd["url"]
+        GSI_URL = ref_xrootd_gsi_shared["url"]
+    else:
+        ANON_URL = test_env["anon_url"]
+        GSI_URL = test_env["gsi_url"]
+    CA_DIR    = test_env["ca_dir"]
+    PROXY_PEM = test_env["proxy_pem"]
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +71,10 @@ def _upload(url_base: str, remote_path: str, data: bytes) -> None:
 # Checksum tests (anonymous)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(
+    CROSS_BACKEND == "xrootd",
+    reason="reference xrootd test fixture does not enable checksum queries by default",
+)
 class TestChecksum:
     """kXR_Qcksum (QueryCode.CHECKSUM) via the anonymous endpoint."""
 
@@ -279,10 +300,12 @@ class TestSpace:
 class TestQueryGSI:
     """Verify both query types work through the GSI-authenticated endpoint."""
 
-    GSI_ENV = {
-        "X509_CERT_DIR":   CA_DIR,
-        "X509_USER_PROXY": PROXY_PEM,
-    }
+    @property
+    def GSI_ENV(self):
+        return {
+            "X509_CERT_DIR":   CA_DIR,
+            "X509_USER_PROXY": PROXY_PEM,
+        }
 
     @pytest.fixture(autouse=True)
     def _setup(self):
@@ -294,6 +317,10 @@ class TestQueryGSI:
             os.environ.pop(k, None)
 
     def test_gsi_checksum(self):
+        if CROSS_BACKEND == "xrootd":
+            pytest.skip(
+                "reference xrootd test fixture does not enable checksum queries by default"
+            )
         payload = b"GSI checksum test data"
         remote  = "/test_query_gsi_cksum.bin"
         _upload(GSI_URL, remote, payload)

@@ -27,80 +27,29 @@ Run:
 import hashlib
 import os
 import struct
-import subprocess
-import time
 import zlib
 
 import pytest
 from XRootD import client
 from XRootD.client.flags import DirListFlags, OpenFlags, StatInfoFlags
+from settings import DATA_ROOT as DEFAULT_DATA_ROOT
 
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
-NGINX_URL = "root://localhost:11094"
-REF_PORT  = 11096
-REF_URL   = f"root://localhost:{REF_PORT}"
+NGINX_URL = ""
+REF_URL   = ""
+DATA_DIR  = DEFAULT_DATA_ROOT
 
-DATA_DIR  = "/tmp/xrd-test/data"
-REF_DIR   = "/tmp/xrd-ref"
-REF_CFG   = f"{REF_DIR}/conformance.cfg"
-REF_LOG   = f"{REF_DIR}/conformance.log"
 
-# ---------------------------------------------------------------------------
-# Session-scoped fixture: start reference xrootd
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope="session", autouse=True)
-def reference_xrootd():
-    """
-    Start an official xrootd server on REF_PORT pointing at the same data
-    directory as the nginx-xrootd instance.  Killed after all tests finish.
-    """
-    os.makedirs(f"{REF_DIR}/admin-conf", exist_ok=True)
-    os.makedirs(f"{REF_DIR}/run-conf",   exist_ok=True)
-
-    cfg = (
-        f"xrd.port {REF_PORT}\n"
-        f"oss.localroot {DATA_DIR}\n"
-        "all.export /\n"
-        f"all.adminpath {REF_DIR}/admin-conf\n"
-        f"all.pidpath   {REF_DIR}/run-conf\n"
-        "xrd.trace off\n"
-    )
-    with open(REF_CFG, "w") as fh:
-        fh.write(cfg)
-
-    proc = subprocess.Popen(
-        ["xrootd", "-c", REF_CFG, "-l", REF_LOG],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-    # Wait up to 15 s for the server to accept connections
-    ref_fs = client.FileSystem(REF_URL)
-    ready = False
-    for _ in range(30):
-        st, _ = ref_fs.ping()
-        if st.ok:
-            ready = True
-            break
-        time.sleep(0.5)
-
-    if not ready:
-        proc.kill()
-        proc.wait()
-        pytest.skip("Reference xrootd failed to start — skipping conformance suite")
-
-    yield proc
-
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-
+@pytest.fixture(scope="module", autouse=True)
+def _configure(test_env, ref_xrootd):
+    """Bind module constants from the shared test environment."""
+    global NGINX_URL, REF_URL, DATA_DIR
+    NGINX_URL = test_env["anon_url"]
+    REF_URL   = ref_xrootd["url"]
+    DATA_DIR  = test_env["data_dir"]
 
 # ---------------------------------------------------------------------------
 # Test-scoped fixture: per-test scratch file

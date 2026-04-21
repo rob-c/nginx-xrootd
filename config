@@ -7,6 +7,7 @@
 ngx_addon_name=ngx_stream_xrootd_module
 
 ngx_xrootd_stream_deps="$ngx_addon_dir/src/ngx_xrootd_module.h \
+                        $ngx_addon_dir/src/ngx_xrootd_cms_heartbeat.h \
                         $ngx_addon_dir/src/ngx_xrootd_metrics.h \
                         $ngx_addon_dir/src/xrootd_protocol.h"
 ngx_xrootd_metrics_deps="$ngx_addon_dir/src/ngx_xrootd_metrics.h"
@@ -30,7 +31,10 @@ ngx_module_srcs="$ngx_addon_dir/src/ngx_stream_xrootd_module.c \
                  $ngx_addon_dir/src/ngx_xrootd_aio.c \
                  $ngx_addon_dir/src/ngx_xrootd_response.c \
                  $ngx_addon_dir/src/ngx_xrootd_path.c \
-                 $ngx_addon_dir/src/ngx_xrootd_voms.c"
+                 $ngx_addon_dir/src/ngx_xrootd_pki_check.c \
+                 $ngx_addon_dir/src/ngx_xrootd_voms.c \
+                 $ngx_addon_dir/src/ngx_xrootd_upstream.c \
+                 $ngx_addon_dir/src/ngx_xrootd_cms_heartbeat.c"
 ngx_module_deps="$ngx_xrootd_stream_deps"
 ngx_module_libs="-lssl -lcrypto"
 CORE_LIBS="$CORE_LIBS -lssl -lcrypto"

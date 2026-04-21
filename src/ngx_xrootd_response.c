@@ -260,6 +260,55 @@ xrootd_send_redirect(xrootd_ctx_t *ctx, ngx_connection_t *c,
 }
 
 /*
+ * xrootd_send_wait — send kXR_wait: retry after N seconds.
+ * Body is a 4-byte big-endian unsigned integer (seconds).
+ */
+ngx_int_t
+xrootd_send_wait(xrootd_ctx_t *ctx, ngx_connection_t *c, uint32_t seconds)
+{
+    size_t   total = XRD_RESPONSE_HDR_LEN + sizeof(uint32_t);
+    u_char  *buf   = ngx_palloc(c->pool, total);
+
+    if (buf == NULL) {
+        return NGX_ERROR;
+    }
+
+    xrootd_build_resp_hdr(ctx->cur_streamid, kXR_wait,
+                           (uint32_t) sizeof(uint32_t),
+                           (ServerResponseHdr *) buf);
+
+    uint32_t sbe = htonl(seconds);
+    ngx_memcpy(buf + XRD_RESPONSE_HDR_LEN, &sbe, sizeof(sbe));
+
+    ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                   "xrootd: sending kXR_wait %u seconds", (unsigned) seconds);
+
+    return xrootd_queue_response(ctx, c, buf, total);
+}
+
+/*
+ * xrootd_send_waitresp — send kXR_waitresp (dlen=0): async result is coming.
+ */
+ngx_int_t
+xrootd_send_waitresp(xrootd_ctx_t *ctx, ngx_connection_t *c)
+{
+    size_t  total = XRD_RESPONSE_HDR_LEN;
+    u_char *buf   = ngx_palloc(c->pool, total);
+
+    if (buf == NULL) {
+        return NGX_ERROR;
+    }
+
+    xrootd_build_resp_hdr(ctx->cur_streamid, kXR_waitresp, 0,
+                           (ServerResponseHdr *) buf);
+
+    ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                   "xrootd: sending kXR_waitresp");
+
+    return xrootd_queue_response(ctx, c, buf, total);
+}
+
+/*
  * xrootd_send_error — build and queue a kXR_error response.
  */
 ngx_int_t

@@ -61,6 +61,7 @@ make clean 2>/dev/null || true
     --with-stream \
     --with-stream_ssl_module \
     --with-http_ssl_module \
+    --with-http_v2_module \
     --with-threads \
     --add-module=/path/to/nginx-xrootd
 

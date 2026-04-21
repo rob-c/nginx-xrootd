@@ -148,6 +148,9 @@ ngx_int_t webdav_verify_bearer_token(ngx_http_request_t *r,
     ngx_http_xrootd_webdav_loc_conf_t *conf);
 ngx_int_t webdav_check_token_write_scope(ngx_http_request_t *r,
     const char *method_name);
+/* PKI consistency checks invoked at postconfiguration/startup */
+ngx_int_t webdav_check_pki_consistency(ngx_log_t *log,
+    ngx_http_xrootd_webdav_loc_conf_t *conf);
 
 /* ---- HTTP method handlers (ngx_http_xrootd_webdav_handlers.c) ------ */
 

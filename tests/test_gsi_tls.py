@@ -25,18 +25,19 @@ import tempfile
 import pytest
 from XRootD import client
 from XRootD.client.flags import DirListFlags, OpenFlags, StatInfoFlags
+from settings import CA_DIR as DEFAULT_CA_DIR, DATA_ROOT as DEFAULT_DATA_ROOT, PROXY_STD
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-GSI_TLS_URL = "root://localhost:11096"
-GSI_URL     = "root://localhost:11095"   # plain GSI (no TLS) for comparison
-ANON_URL    = "root://localhost:11094"
+GSI_TLS_URL = ""
+GSI_URL     = ""
+ANON_URL    = ""
 
-DATA_ROOT = "/tmp/xrd-test/data"
-CA_DIR    = "/tmp/xrd-test/pki/ca"
-PROXY_PEM = "/tmp/xrd-test/pki/user/proxy_std.pem"
+DATA_ROOT = DEFAULT_DATA_ROOT
+CA_DIR    = DEFAULT_CA_DIR
+PROXY_PEM = PROXY_STD
 
 TEST_FILES = {
     "test.txt":   {"size": 24,      "content": b"hello from nginx-xrootd\n"},
@@ -49,8 +50,15 @@ TEST_FILES = {
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module", autouse=True)
-def gsi_env():
-    """Set GSI environment variables for all tests in this module."""
+def _configure(test_env):
+    """Bind module constants and set GSI env vars from the shared test environment."""
+    global GSI_TLS_URL, GSI_URL, ANON_URL, DATA_ROOT, CA_DIR, PROXY_PEM
+    GSI_TLS_URL = test_env["gsi_tls_url"]
+    GSI_URL     = test_env["gsi_url"]
+    ANON_URL    = test_env["anon_url"]
+    DATA_ROOT   = test_env["data_dir"]
+    CA_DIR      = test_env["ca_dir"]
+    PROXY_PEM   = test_env["proxy_pem"]
     old = {}
     for k, v in [("X509_CERT_DIR", CA_DIR), ("X509_USER_PROXY", PROXY_PEM)]:
         old[k] = os.environ.get(k)

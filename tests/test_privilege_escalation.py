@@ -22,25 +22,29 @@ Run:
 import os
 import socket
 import struct
-import subprocess
 import tempfile
-import time
 
 import pytest
+
+from backend_matrix import root_endpoint_parts, selected_backend_name
+from settings import DATA_ROOT, NGINX_BIN
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-ANON_URL  = "root://localhost:11094"
+CROSS_BACKEND = selected_backend_name()
 ANON_HOST = "127.0.0.1"
 ANON_PORT = 11094
-DATA_DIR  = "/tmp/xrd-test/data"
-
-NGINX_BIN     = "/tmp/nginx-1.28.3/objs/nginx"
+DATA_DIR  = DATA_ROOT
 READONLY_HOST = "127.0.0.1"
-READONLY_PORT = 11098
-READONLY_DIR  = "/tmp/xrd-readonly-test"
+READONLY_PORT = 0
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 # XRootD request opcodes
 kXR_auth      = 3000
@@ -71,6 +75,7 @@ kXR_OK             = 0
 kXR_ERROR          = 4003
 kXR_ArgInvalid     = 3000
 kXR_FileNotOpen    = 3004
+kXR_InvalidRequest = 3006
 kXR_NOT_AUTHORIZED = 3010
 kXR_Unsupported    = 3013
 kXR_fsReadOnly     = 3025
@@ -104,7 +109,11 @@ def _read_response(sock: socket.socket) -> tuple[int, bytes]:
     return status, body
 
 
-def _raw_session(host: str = ANON_HOST, port: int = ANON_PORT) -> socket.socket:
+def _raw_session(host: str = None, port: int = None) -> socket.socket:
+    if host is None:
+        host = ANON_HOST
+    if port is None:
+        port = ANON_PORT
     sock = socket.create_connection((host, port), timeout=5)
     sock.settimeout(5)
     sock.sendall(struct.pack("!IIIII", 0, 0, 0, 4, 2012))
@@ -219,6 +228,26 @@ def _assert_readonly_response(status: int, body: bytes) -> None:
     assert _error_code(body) == kXR_fsReadOnly
 
 
+def _assert_preauth_rejected(status: int, body: bytes) -> None:
+    """Portable pre-auth rejection: nginx and xrootd use different codes."""
+    assert status == kXR_ERROR
+    code = _error_code(body)
+    if CROSS_BACKEND == "xrootd":
+        assert code in (kXR_NOT_AUTHORIZED, kXR_InvalidRequest)
+    else:
+        assert code == kXR_NOT_AUTHORIZED
+
+
+def _assert_readonly_handle_write_rejected(status: int, body: bytes) -> None:
+    """Portable read-only-handle write rejection across nginx and xrootd."""
+    assert status == kXR_ERROR
+    code = _error_code(body)
+    if CROSS_BACKEND == "xrootd":
+        assert code in (kXR_NOT_AUTHORIZED, kXR_FileNotOpen)
+    else:
+        assert code == kXR_NOT_AUTHORIZED
+
+
 def _unlink_if_exists(path: str) -> None:
     try:
         os.unlink(path)
@@ -233,90 +262,52 @@ def _rmdir_if_exists(path: str) -> None:
         pass
 
 
-def _wait_for_port(host: str, port: int, proc: subprocess.Popen,
-                   stderr_path: str) -> None:
-    deadline = time.time() + 10
-    last_error = None
-
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            with open(stderr_path, "r", encoding="utf-8", errors="replace") as fh:
-                stderr_text = fh.read()
-            pytest.fail(
-                f"read-only nginx exited during startup (rc={proc.returncode}).\n"
-                f"stderr: {stderr_text}"
-            )
-
-        try:
-            with socket.create_connection((host, port), timeout=0.5):
-                return
-        except OSError as exc:
-            last_error = exc
-            time.sleep(0.1)
-
-    pytest.fail(f"read-only nginx did not listen on {host}:{port}: {last_error}")
+@pytest.fixture(scope="module", autouse=True)
+def _configure(test_env, ref_xrootd):
+    """Bind module constants from the selected shared test environment."""
+    global ANON_HOST, ANON_PORT, DATA_DIR
+    if CROSS_BACKEND == "xrootd":
+        ANON_HOST, ANON_PORT = root_endpoint_parts(ref_xrootd["url"])
+        DATA_DIR = ref_xrootd["data_dir"]
+    else:
+        ANON_HOST = "127.0.0.1"
+        ANON_PORT = test_env["anon_port"]
+        DATA_DIR = test_env["data_dir"]
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def readonly_nginx():
     """Start an isolated anonymous XRootD listener with xrootd_allow_write off."""
     if not os.path.exists(NGINX_BIN):
         pytest.skip(f"nginx binary not found at {NGINX_BIN}")
+    import server_control
 
-    conf_dir = os.path.join(READONLY_DIR, "conf")
-    log_dir = os.path.join(READONLY_DIR, "logs")
-    tmp_dir = os.path.join(READONLY_DIR, "tmp")
-    os.makedirs(conf_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(tmp_dir, exist_ok=True)
+    global READONLY_PORT
+    READONLY_PORT = _free_port()
 
-    conf_path = os.path.join(conf_dir, "nginx.conf")
-    stderr_path = os.path.join(log_dir, "startup_stderr.log")
-    with open(conf_path, "w", encoding="utf-8") as fh:
-        fh.write(f"""\
-daemon off;
-worker_processes 1;
-error_log {log_dir}/error.log info;
-pid       {log_dir}/nginx.pid;
-
-thread_pool default threads=4 max_queue=65536;
-events {{ worker_connections 64; }}
-
-stream {{
-    server {{
-        listen {READONLY_PORT};
-        xrootd on;
-        xrootd_root {DATA_DIR};
-        xrootd_auth none;
-        xrootd_access_log {log_dir}/xrootd_access.log;
-    }}
-}}
-""")
-
-    stderr_fh = open(stderr_path, "w", encoding="utf-8")
-    proc = subprocess.Popen(
-        [NGINX_BIN, "-c", conf_path],
-        stdout=subprocess.DEVNULL,
-        stderr=stderr_fh,
+    info = server_control.start_nginx_instance(
+        port=READONLY_PORT, nginx_bin=NGINX_BIN,
+        conf_file="nginx_readonly.conf",
+        template_kwargs={"DATA_DIR": DATA_DIR},
     )
-    stderr_fh.close()
 
-    _wait_for_port(READONLY_HOST, READONLY_PORT, proc, stderr_path)
-
-    yield
-
-    proc.terminate()
     try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
+        yield
+    finally:
+        try:
+            info["stop"]()
+        except Exception:
+            pass
 
 
 # ===========================================================================
 # Read-only server authorization boundary
 # ===========================================================================
 
+@pytest.mark.skipif(
+    CROSS_BACKEND == "xrootd",
+    reason="read-only listener coverage is specific to nginx-xrootd",
+)
 class TestReadOnlyServer:
     """A listener without xrootd_allow_write must permit reads and block mutations."""
 
@@ -720,8 +711,7 @@ class TestPreAuthRejection:
             sock.sendall(req + payload)
             status, body = _read_response(sock)
 
-        assert status == kXR_ERROR
-        assert _error_code(body) == kXR_NOT_AUTHORIZED
+        _assert_preauth_rejected(status, body)
 
     def test_preauth_open_rejected(self):
         """kXR_open must fail before login."""
@@ -737,8 +727,7 @@ class TestPreAuthRejection:
             sock.sendall(req + payload)
             status, body = _read_response(sock)
 
-        assert status == kXR_ERROR
-        assert _error_code(body) == kXR_NOT_AUTHORIZED
+        _assert_preauth_rejected(status, body)
 
     def test_preauth_read_rejected(self):
         """kXR_read must fail before login."""
@@ -754,8 +743,7 @@ class TestPreAuthRejection:
             sock.sendall(req)
             status, body = _read_response(sock)
 
-        assert status == kXR_ERROR
-        assert _error_code(body) == kXR_NOT_AUTHORIZED
+        _assert_preauth_rejected(status, body)
 
     def test_preauth_write_rejected(self):
         """kXR_write must fail before login."""
@@ -773,8 +761,7 @@ class TestPreAuthRejection:
             sock.sendall(req + data)
             status, body = _read_response(sock)
 
-        assert status == kXR_ERROR
-        assert _error_code(body) == kXR_NOT_AUTHORIZED
+        _assert_preauth_rejected(status, body)
 
     def test_preauth_dirlist_rejected(self):
         """kXR_dirlist must fail before login."""
@@ -789,8 +776,7 @@ class TestPreAuthRejection:
             sock.sendall(req + payload)
             status, body = _read_response(sock)
 
-        assert status == kXR_ERROR
-        assert _error_code(body) == kXR_NOT_AUTHORIZED
+        _assert_preauth_rejected(status, body)
 
     def test_preauth_truncate_rejected(self):
         """kXR_truncate must fail before login."""
@@ -807,8 +793,7 @@ class TestPreAuthRejection:
             sock.sendall(req + payload)
             status, body = _read_response(sock)
 
-        assert status == kXR_ERROR
-        assert _error_code(body) == kXR_NOT_AUTHORIZED
+        _assert_preauth_rejected(status, body)
 
     def test_preauth_query_rejected(self):
         """kXR_query must fail before login."""
@@ -827,8 +812,7 @@ class TestPreAuthRejection:
             sock.sendall(req + payload)
             status, body = _read_response(sock)
 
-        assert status == kXR_ERROR
-        assert _error_code(body) == kXR_NOT_AUTHORIZED
+        _assert_preauth_rejected(status, body)
 
     def test_preauth_readv_rejected(self):
         """kXR_readv must fail before login."""
@@ -844,8 +828,7 @@ class TestPreAuthRejection:
             sock.sendall(req + segment)
             status, body = _read_response(sock)
 
-        assert status == kXR_ERROR
-        assert _error_code(body) == kXR_NOT_AUTHORIZED
+        _assert_preauth_rejected(status, body)
 
     def test_preauth_mkdir_rejected(self):
         """kXR_mkdir must fail before login."""
@@ -864,8 +847,7 @@ class TestPreAuthRejection:
                 sock.sendall(req + payload)
                 status, body = _read_response(sock)
 
-            assert status == kXR_ERROR
-            assert _error_code(body) == kXR_NOT_AUTHORIZED
+            _assert_preauth_rejected(status, body)
             assert not os.path.exists(victim), "pre-auth mkdir created directory"
         finally:
             if os.path.isdir(victim):
@@ -881,6 +863,8 @@ class TestPreAuthAllowed:
 
     def test_preauth_ping_ok(self):
         """kXR_ping should succeed before login."""
+        if CROSS_BACKEND == "xrootd":
+            pytest.skip("reference xrootd rejects pre-auth ping")
         with _raw_session() as sock:
             req = struct.pack(
                 "!2sH16sI",
@@ -1039,8 +1023,7 @@ class TestWriteOnReadOnly:
             sock.sendall(req + data)
             status, body = _read_response(sock)
 
-        assert status == kXR_ERROR
-        assert _error_code(body) == kXR_NOT_AUTHORIZED
+        _assert_readonly_handle_write_rejected(status, body)
 
         # Verify file content was NOT modified
         with open(self.disk_path, "rb") as f:

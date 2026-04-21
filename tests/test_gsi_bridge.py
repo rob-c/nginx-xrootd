@@ -49,24 +49,51 @@ import zlib
 import pytest
 from XRootD import client
 from XRootD.client.flags import OpenFlags, QueryCode
+from settings import (
+    CA_DIR as DEFAULT_CA_DIR,
+    DATA_ROOT as DEFAULT_DATA_ROOT,
+    PROXY_STD,
+    SERVER_CERT as SETTINGS_SERVER_CERT,
+    SERVER_KEY as SETTINGS_SERVER_KEY,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-CA_DIR     = "/tmp/xrd-test/pki/ca"
-PROXY_PEM  = "/tmp/xrd-test/pki/user/proxy_std.pem"
-SERVER_CERT = "/tmp/xrd-test/pki/server/hostcert.pem"
-SERVER_KEY  = "/tmp/xrd-test/pki/server/hostkey.pem"
+CA_DIR     = DEFAULT_CA_DIR
+PROXY_PEM  = PROXY_STD
+SERVER_CERT = ""
+SERVER_KEY  = ""
 
-NGINX_PORT = 11095
-NGINX_URL  = f"root://localhost:{NGINX_PORT}"
+NGINX_PORT = 0
+NGINX_URL  = ""
 
-REF_PORT   = 11097
-REF_URL    = f"root://localhost:{REF_PORT}"
+REF_PORT   = 0
+REF_URL    = ""
 
-BRIDGE_DATA = "/tmp/xrd-gsi-bridge/data"
-NGINX_DATA  = "/tmp/xrd-test/data"
+BRIDGE_DATA = ""
+NGINX_DATA  = DEFAULT_DATA_ROOT
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _configure(test_env, ref_xrootd_gsi):
+    """Bind module constants from the shared test environment."""
+    global CA_DIR, PROXY_PEM, SERVER_CERT, SERVER_KEY
+    global NGINX_PORT, NGINX_URL, REF_PORT, REF_URL
+    global BRIDGE_DATA, NGINX_DATA
+
+    CA_DIR      = test_env["ca_dir"]
+    PROXY_PEM   = test_env["proxy_pem"]
+    SERVER_CERT = SETTINGS_SERVER_CERT
+    SERVER_KEY  = SETTINGS_SERVER_KEY
+    NGINX_PORT  = test_env["gsi_port"]
+    NGINX_URL   = test_env["gsi_url"]
+    NGINX_DATA  = test_env["data_dir"]
+
+    REF_PORT    = ref_xrootd_gsi["port"]
+    REF_URL     = ref_xrootd_gsi["url"]
+    BRIDGE_DATA = ref_xrootd_gsi["data_dir"]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -150,130 +177,32 @@ def _write_local(content: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Session fixture: start reference xrootd with GSI authentication
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope="session", autouse=True)
-def reference_xrootd_gsi(tmp_path_factory):
-    """
-    Start an official xrootd server on REF_PORT with GSI authentication
-    enabled, using the same test CA and server certificates as the nginx-xrootd
-    instance.
-
-    The server's data directory is separate from the nginx data directory so we
-    can distinguish which server read a particular file.
-
-    Configuration directives:
-      xrootd.seclib   — loads the xrootd security plugin framework
-      sec.protocol gsi — enables the GSI protocol plugin (libXrdSecgsi)
-        -certdir   : directory containing CA hashes (*.0 and *.signing_policy)
-        -cert/-key : server certificate and private key
-        -gmapopt:10: do not require a grid-mapfile entry; accept all valid certs
-      acc.authdb      — 'u * / lr' grants all authenticated users read access
-    """
-    os.makedirs(BRIDGE_DATA, exist_ok=True)
-    os.makedirs("/tmp/xrd-gsi-bridge/admin-conf", exist_ok=True)
-    os.makedirs("/tmp/xrd-gsi-bridge/run-conf",   exist_ok=True)
-
-    authdb_path = "/tmp/xrd-gsi-bridge/authdb"
-    with open(authdb_path, "w") as f:
-        # Grant all authenticated users read access to everything
-        f.write("u * / lr\n")
-
-    cfg_path = "/tmp/xrd-gsi-bridge/server.cfg"
-    cfg = (
-        f"xrd.port {REF_PORT}\n"
-        f"oss.localroot {BRIDGE_DATA}\n"
-        "all.export /\n"
-        f"all.adminpath /tmp/xrd-gsi-bridge/admin-conf\n"
-        f"all.pidpath   /tmp/xrd-gsi-bridge/run-conf\n"
-        "xrd.trace off\n"
-        # Security: load the xrootd security framework
-        "xrootd.seclib /usr/lib64/libXrdSec-5.so\n"
-        # Enable GSI protocol with our test CA and server certificate
-        f"sec.protocol gsi "
-        f"-certdir:{CA_DIR} "
-        f"-cert:{SERVER_CERT} "
-        f"-key:{SERVER_KEY} "
-        f"-gmapopt:10\n"          # accept any valid cert; no grid-mapfile needed
-        f"acc.authdb {authdb_path}\n"
-    )
-    with open(cfg_path, "w") as f:
-        f.write(cfg)
-
-    log_path = "/tmp/xrd-gsi-bridge/server.log"
-    proc = subprocess.Popen(
-        ["xrootd", "-c", cfg_path, "-l", log_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-    # Wait up to 15 s for GSI server to accept connections.
-    # Older xrdfs builds do not implement a ping subcommand, so use a simple
-    # authenticated directory listing rather than an anonymous Python client.
-    ready = False
-    for _ in range(30):
-        try:
-            # We probe with a real authenticated filesystem op, not just TCP reachability.
-            r = subprocess.run(
-                ["xrdfs", REF_URL, "ls", "/"],
-                env=_gsi_env(),
-                capture_output=True,
-                timeout=5,
-            )
-        except subprocess.TimeoutExpired:
-            # Early timeouts are normal while the auth plugin and listener come up.
-            time.sleep(0.5)
-            continue
-        if r.returncode == 0:
-            ready = True
-            break
-        time.sleep(0.5)
-
-    if not ready:
-        proc.terminate()
-        with open(log_path) as fh:
-            pytest.fail(
-                f"Reference xrootd GSI server did not start on port {REF_PORT}.\n"
-                f"Log:\n{fh.read()[-3000:]}"
-            )
-
-    yield proc
-
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-
-
-# ---------------------------------------------------------------------------
 # Helper fixture: ensure nginx GSI endpoint is reachable
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
-def nginx_gsi_ready():
-    """Verify nginx-xrootd GSI endpoint on port 11095 is up before running tests."""
+def nginx_gsi_ready(test_env):
+    """Verify nginx-xrootd GSI endpoint is up before running tests."""
+    url = test_env["gsi_url"]
+    ca  = test_env["ca_dir"]
+    proxy = test_env["proxy_pem"]
+    env = os.environ.copy()
+    env["X509_CERT_DIR"]   = ca
+    env["X509_USER_PROXY"] = proxy
+    env["XrdSecPROTOCOL"]  = "gsi"
     for _ in range(10):
         try:
             r = subprocess.run(
-                ["xrdfs", NGINX_URL, "ls", "/"],
-                env=_gsi_env(),
-                capture_output=True,
-                timeout=5,
+                ["xrdfs", url, "ls", "/"],
+                env=env, capture_output=True, timeout=5,
             )
         except subprocess.TimeoutExpired:
-            # Keep polling; a slow handshake here is not yet a hard failure.
             time.sleep(0.5)
             continue
         if r.returncode == 0:
             return
         time.sleep(0.5)
-    pytest.skip(
-        f"nginx-xrootd GSI endpoint not reachable at {NGINX_URL}. "
-        "Start nginx with: /tmp/nginx-1.28.3/objs/nginx -p /tmp/xrd-test "
-        "-c /tmp/xrd-test/conf/nginx.conf"
-    )
+    pytest.skip(f"nginx-xrootd GSI endpoint not reachable at {url}.")
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +212,7 @@ def nginx_gsi_ready():
 class TestXrootdToNginx:
     """Copy files from the official xrootd server to the nginx-xrootd endpoint."""
 
-    def test_small_file_transfer(self, reference_xrootd_gsi, nginx_gsi_ready):
+    def test_small_file_transfer(self, nginx_gsi_ready):
         """Copy a small file from xrootd to nginx; verify content is identical."""
         content = b"Hello from official xrootd server via GSI!\n" * 10
         filename = "bridge_small_xrd_to_nginx.txt"
@@ -307,7 +236,7 @@ class TestXrootdToNginx:
             got = f.read()
         assert got == content, "File content mismatch after xrootd→nginx transfer"
 
-    def test_large_file_transfer(self, reference_xrootd_gsi, nginx_gsi_ready):
+    def test_large_file_transfer(self, nginx_gsi_ready):
         """Transfer a 10 MB file from xrootd to nginx and verify md5."""
         size = 10 * 1024 * 1024
         content = bytes(range(256)) * (size // 256)
@@ -328,7 +257,7 @@ class TestXrootdToNginx:
         assert os.path.exists(dst_path)
         assert _md5(dst_path) == expected_md5, "md5 mismatch after 10 MB xrootd→nginx"
 
-    def test_checksum_preserved(self, reference_xrootd_gsi, nginx_gsi_ready):
+    def test_checksum_preserved(self, nginx_gsi_ready):
         """Adler32 checksum returned by nginx must match the source file's checksum."""
         content = b"checksum integrity test " * 512
         filename = "bridge_cksum_xrd_to_nginx.txt"
@@ -365,7 +294,7 @@ class TestXrootdToNginx:
 class TestNginxToXrootd:
     """Copy files from the nginx-xrootd endpoint to the official xrootd server."""
 
-    def test_small_file_transfer(self, reference_xrootd_gsi, nginx_gsi_ready):
+    def test_small_file_transfer(self, nginx_gsi_ready):
         """Upload to nginx, then copy nginx → xrootd; verify content."""
         content = b"Hello from nginx-xrootd via GSI!\n" * 10
         filename = "bridge_small_nginx_to_xrd.txt"
@@ -392,7 +321,7 @@ class TestNginxToXrootd:
         finally:
             os.unlink(local)
 
-    def test_large_file_transfer(self, reference_xrootd_gsi, nginx_gsi_ready):
+    def test_large_file_transfer(self, nginx_gsi_ready):
         """Upload 10 MB to nginx, copy to xrootd, verify md5."""
         size = 10 * 1024 * 1024
         content = os.urandom(size)
@@ -424,7 +353,7 @@ class TestNginxToXrootd:
 class TestRoundTrip:
     """Upload, bridge, and read back to verify end-to-end GSI transfer integrity."""
 
-    def test_xrootd_to_nginx_and_back(self, reference_xrootd_gsi, nginx_gsi_ready):
+    def test_xrootd_to_nginx_and_back(self, nginx_gsi_ready):
         """
         Write a file on xrootd → copy to nginx → read back from nginx.
         Verifies the full path: xrootd GSI read + nginx GSI write + nginx GSI read.
@@ -452,7 +381,7 @@ class TestRoundTrip:
         f_obj.close()
         assert data == content, "Round-trip content mismatch (xrootd write → nginx read)"
 
-    def test_nginx_to_xrootd_and_back(self, reference_xrootd_gsi, nginx_gsi_ready):
+    def test_nginx_to_xrootd_and_back(self, nginx_gsi_ready):
         """
         Upload to nginx → copy to xrootd → read back from xrootd.
         Verifies: nginx GSI write + xrootd GSI read.
@@ -483,7 +412,7 @@ class TestRoundTrip:
         finally:
             os.unlink(local)
 
-    def test_integrity_across_multiple_chunks(self, reference_xrootd_gsi, nginx_gsi_ready):
+    def test_integrity_across_multiple_chunks(self, nginx_gsi_ready):
         """
         Transfer a file large enough to require multiple xrdcp read chunks (>4 MB),
         verifying that chunked reassembly produces identical bytes on both ends.
@@ -518,7 +447,7 @@ class TestRoundTrip:
 class TestAuthEnforcement:
     """Verify that GSI authentication is required and rejected credentials fail."""
 
-    def test_no_proxy_rejected_by_nginx(self, reference_xrootd_gsi, nginx_gsi_ready):
+    def test_no_proxy_rejected_by_nginx(self, nginx_gsi_ready):
         """
         xrdcp to nginx GSI port without a proxy certificate must fail.
         The server should refuse the connection at the authentication stage.
@@ -536,7 +465,7 @@ class TestAuthEnforcement:
         finally:
             os.unlink(local)
 
-    def test_no_proxy_rejected_by_xrootd(self, reference_xrootd_gsi, nginx_gsi_ready):
+    def test_no_proxy_rejected_by_xrootd(self, nginx_gsi_ready):
         """
         xrdcp to reference xrootd GSI port without a proxy must also fail,
         confirming the test CA setup enforces authentication on the xrootd side too.
@@ -563,7 +492,7 @@ class TestAuthEnforcement:
         finally:
             os.unlink(local)
 
-    def test_valid_proxy_accepted_by_both(self, reference_xrootd_gsi, nginx_gsi_ready):
+    def test_valid_proxy_accepted_by_both(self, nginx_gsi_ready):
         """
         With a valid proxy, transfers to both servers must succeed.
         This is the positive control for the auth tests above.
@@ -598,7 +527,7 @@ class TestAuthEnforcement:
 class TestDirlistGSI:
     """Verify directory listing works across both GSI endpoints."""
 
-    def test_nginx_dirlist_after_bridge_transfer(self, reference_xrootd_gsi, nginx_gsi_ready):
+    def test_nginx_dirlist_after_bridge_transfer(self, nginx_gsi_ready):
         """
         Files copied from xrootd to nginx must appear in nginx's directory listing.
         """
@@ -625,7 +554,7 @@ class TestDirlistGSI:
             f"Got: {names}"
         )
 
-    def test_xrootd_dirlist_after_bridge_transfer(self, reference_xrootd_gsi, nginx_gsi_ready):
+    def test_xrootd_dirlist_after_bridge_transfer(self, nginx_gsi_ready):
         """
         Files copied from nginx to xrootd must appear in xrootd's directory listing.
         """

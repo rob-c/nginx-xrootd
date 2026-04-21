@@ -26,6 +26,19 @@ After the protocol handshake, the client sends its username. For anonymous serve
 
 A liveness check. Clients occasionally send pings to verify the server is still up. The module replies immediately with `kXR_ok`.
 
+### `kXR_sigver` — request signature verification
+
+When GSI authentication is active, the client may precede sensitive requests with a `kXR_sigver` packet carrying an HMAC-SHA256 of the following request header (and optionally its payload). The server verifies the HMAC using the session signing key derived from the GSI Diffie-Hellman shared secret (`SHA-256(DH_secret)`).
+
+Verification rules:
+- **Signing key**: derived during GSI handshake; `signing_active` flag gates all checks.
+- **HMAC input**: `seqno(8B big-endian) || 24-byte request header [|| payload if `kXR_nodata` not set]`.
+- **Replay protection**: the sequence number must strictly increase across the session.
+- **RSA path**: if the `kXR_rsaKey` crypto flag is set, the asymmetric signature is accepted without verification (the HMAC path covers the common case).
+- **Non-GSI sessions**: `kXR_sigver` is accepted without verification; token and anonymous sessions do not derive a signing key.
+
+Mismatched HMACs are rejected with `kXR_NotAuthorized`.
+
 ### `kXR_endsess`
 
 The client signals it is done with the session. The module closes all open file handles and acknowledges. The client then closes the TCP connection.
@@ -93,6 +106,19 @@ xrdcp root://localhost:1094//store/mc/sample.root /tmp/local.root
 
 ---
 
+### `kXR_pgread` — paged read with CRC32c integrity
+
+The v5 paged-read protocol. The server splits the requested range into 4 KiB pages, appends a CRC32c checksum to each, and streams them in `kXR_oksofar` chunks terminated by a `kXR_status` frame. Clients use the checksums to detect silent data corruption in transit.
+
+```python
+# The Python client automatically uses pgread when available
+status, data = f.read(offset=0, size=1048576)
+```
+
+When nginx is built with `--with-threads`, the `pread(2)` and CRC computation run on a thread-pool worker so disk latency does not block the event loop.
+
+---
+
 ### `kXR_readv` — scatter-gather vector read
 
 Reads multiple non-contiguous byte ranges in a single round-trip. This is significantly more efficient than issuing multiple individual `kXR_read` requests when you know which parts of a file you need — common in ROOT file access where the file index is read first to find the data.
@@ -138,6 +164,21 @@ Manager-mode mapping: when `xrootd_manager_map` contains a matching prefix the s
 Both `locate` and `open` consult the configured manager map and will return a redirect when a mapping matches; mappings use longest-prefix matching so more-specific prefixes take precedence.
 
 Configure static mappings using the `xrootd_manager_map /prefix host:port;` directive in the server block. See [Manager Mode](manager-mode.md) for details and examples.
+
+### `kXR_statx` — bulk multi-path stat
+
+Returns stat information for multiple paths in a single round-trip. Each result contains the same flags as a regular `kXR_stat` (readable, writable, directory, etc.). Paths that do not exist return a sentinel flags value of `0xFF`.
+
+```python
+# No direct Python client API — used internally by xrdfs and some frameworks
+# The underlying wire request can be sent via raw socket for batch operations
+```
+
+```bash
+xrdfs localhost:1094 stat /store/mc/file1.root   # single-path fallback
+```
+
+---
 
 ### `kXR_close` — close a file handle
 
@@ -188,6 +229,17 @@ xrdcp /tmp/local_file.root root://localhost:1094//remote_file.root
 ```python
 # Python client also uses pgwrite automatically when writing
 status, _ = f.write(data, offset=0)
+```
+
+---
+
+### `kXR_writev` — scatter-gather vector write
+
+Writes multiple non-contiguous byte ranges in a single round-trip. Each segment in the request specifies a file handle, offset, and length, followed by the data. The module applies each segment sequentially and returns a single `kXR_ok` after all writes complete.
+
+```python
+# The Python client uses writev when writing multiple disjoint chunks
+status, _ = f.write(data, offset=0)   # client decides whether to use writev
 ```
 
 ---
@@ -303,8 +355,6 @@ default is `adler32` (8 hex digits). You can explicitly request `md5`,
 either `"<alg>:<path>"` or `"<alg> <path>"` (for example
 `sha256:/store/mc/sample.root`).
 
-Examples:
-
 ```bash
 xrdfs localhost:1094 query checksum /store/mc/sample.root
 # adler32 1a2b3c4d
@@ -320,20 +370,13 @@ xrdfs localhost:1094 query checksum sha256:/store/mc/sample.root
 from XRootD.client.flags import QueryCode
 status, resp = fs.query(QueryCode.CHECKSUM, "/store/mc/sample.root")
 # resp → b"adler32 1a2b3c4d\x00"
-
-status, resp = fs.query(QueryCode.CHECKSUM, "md5:/store/mc/sample.root")
-# resp → b"md5 0123456789abcdef0123456789abcdef\x00"
-
-status, resp = fs.query(QueryCode.CHECKSUM, "sha256:/store/mc/sample.root")
-# resp → b"sha256 0123456789abcdef...\x00" (64-hex digits)
 ```
 
-`xrdcp` continues to use the adler32 response when instructed with
-`--cksum adler32:print`.
+`xrdcp` uses adler32 when instructed with `--cksum adler32:print`.
 
 #### Space (`QueryCode.SPACE`)
 
-Returns disk space statistics for the `xrootd_root` filesystem.
+Returns disk space statistics for the `xrootd_root` filesystem in `oss.*` format.
 
 ```bash
 xrdfs localhost:1094 spaceinfo /
@@ -341,8 +384,112 @@ xrdfs localhost:1094 spaceinfo /
 
 ```python
 status, resp = fs.query(QueryCode.SPACE, "/")
-# resp contains oss.cgroup, oss.space, oss.free, oss.used, oss.quota
+# resp → b"oss.cgroup=default&oss.space=...\x00"
 ```
+
+#### Stats (`QueryCode.STATS`)
+
+Returns an XML statistics blob summarising open connections, operations, and
+server identity. Useful for health checks and monitoring.
+
+```python
+status, resp = fs.query(QueryCode.STATS, "")
+# resp → b"<statistics>...</statistics>\x00"
+```
+
+#### Extended attributes (`QueryCode.XATTR`)
+
+Returns extended attribute key-value pairs for a path (same underlying data as
+`kXR_fattr` get/list).
+
+```python
+status, resp = fs.query(QueryCode.XATTR, "/store/mc/sample.root")
+```
+
+#### File info (`QueryCode.FINFO`)
+
+Returns a hint line describing any compression or checksum annotations stored
+on the file. The response is empty when no metadata is present.
+
+```python
+status, resp = fs.query(QueryCode.FINFO, "/store/mc/sample.root")
+```
+
+#### Filesystem info (`QueryCode.FSINFO`)
+
+Returns filesystem-level metrics for the path's mountpoint in `oss.*` format:
+total/free/used bytes, quota, and mount flags.
+
+```python
+status, resp = fs.query(QueryCode.FSINFO, "/")
+```
+
+#### Configuration (`QueryCode.CONFIG`)
+
+Returns the current value of one or more server configuration keys. Recognised
+keys include `bind_max`, `chksum`, `stype`, `version`, `sitename`, and `pio_max`.
+
+```bash
+xrdfs localhost:1094 query config version
+```
+
+```python
+status, resp = fs.query(QueryCode.CONFIG, "version")
+```
+
+---
+
+### `kXR_fattr` — file extended attributes
+
+Reads, writes, deletes, and lists Linux `user.*` xattrs on files and directories.
+All four subcodes are supported:
+
+| Subcode | Operation |
+|---|---|
+| `kXR_fattrGet` | Read the value of one or more named attributes |
+| `kXR_fattrSet` | Write a named attribute (creates or overwrites) |
+| `kXR_fattrDel` | Delete a named attribute |
+| `kXR_fattrList` | List all attribute names on the path |
+
+Attribute names are stored under the `user.U.` prefix in the filesystem (e.g. `user.U.checksum`). Requests can be path-based or handle-based (after `kXR_open`).
+
+```bash
+xrdfs localhost:1094 xattr /store/mc/sample.root set checksum abc123
+xrdfs localhost:1094 xattr /store/mc/sample.root get checksum
+xrdfs localhost:1094 xattr /store/mc/sample.root list
+xrdfs localhost:1094 xattr /store/mc/sample.root del checksum
+```
+
+```python
+from XRootD.client.flags import XAttrCode
+status, result = fs.set_xattr("/store/mc/sample.root",
+                               [client.XAttr("checksum", "abc123")])
+status, result = fs.get_xattr("/store/mc/sample.root", ["checksum"])
+```
+
+---
+
+## Prepare
+
+`kXR_prepare` is accepted as a local-storage staging hint. The module parses
+the official newline-separated path payload, validates each path under
+`xrootd_root`, applies VO ACL checks, and returns success when all requested
+files are already online. `kXR_cancel` and `kXR_evict` are acknowledged as
+no-ops because there is no local staging queue or cache layer to modify.
+
+---
+
+## Unsupported opcodes
+
+The following opcodes return `kXR_Unsupported` and are not implemented:
+
+| Opcode | Reason not implemented |
+|---|---|
+| `kXR_bind` (3024) | Parallel-stream binding — rarely used |
+| `kXR_clone` | Not defined in XRootD v5.2 wire spec |
+| `kXR_gpfile` (3005) | Legacy get-from-proxy — obsolete |
+| `kXR_chkpoint` (3012) | Checkpoint/restore — not implemented |
+| `kXR_set` (3018) | Server-side key/value store — not implemented |
 
 ---
 
@@ -356,6 +503,7 @@ status, resp = fs.query(QueryCode.SPACE, "/")
 | Maximum path length | 4 KB |
 | Maximum `kXR_readv` segments per request | 1024 |
 | Maximum total `kXR_readv` response | 256 MB |
+| Maximum `kXR_writev` segments per request | 1024 |
 
 ---
 

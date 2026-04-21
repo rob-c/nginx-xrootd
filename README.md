@@ -14,14 +14,16 @@ Instead of running a separate `xrootd` daemon, you add this module to your exist
 
 | Protocol | Connections | nginx-xrootd | xrootd native | nginx p95 | xrootd p95 |
 |---|---:|---:|---:|---:|---:|
-| `root://` + GSI | 1 | 630 MiB/s | 1,060 MiB/s | 1.6 s | 1.0 s |
-| `root://` + GSI | 8 | 5,885 MiB/s | 3,013 MiB/s | 1.4 s | 2.7 s |
-| `root://` + GSI | 32 | 9,376 MiB/s | 2,842 MiB/s | 3.4 s | 11.4 s |
-| `root://` + GSI | 128 | **10,402 MiB/s** | 2,272 MiB/s | **12.1 s** | 57.2 s |
-| `davs://` + x509 | 1 | 935 MiB/s | 1,415 MiB/s | 1.1 s | 0.7 s |
-| `davs://` + x509 | 8 | 3,288 MiB/s | 3,631 MiB/s | 2.5 s | 2.2 s |
-| `davs://` + x509 | 32 | 3,445 MiB/s | 3,725 MiB/s | 8.9 s | 8.7 s |
-| `davs://` + x509 | 128 | **3,697 MiB/s** | 2,268 MiB/s | **33.3 s** | 56.9 s |
+| `root://` + GSI | 1  | 1,302 MiB/s | 1,790 MiB/s | 0.8 s | 0.6 s |
+| `root://` + GSI | 8  | 4,305 MiB/s | 5,303 MiB/s | 1.9 s | 1.5 s |
+| `root://` + GSI | 16 | 4,478 MiB/s | 5,329 MiB/s | 3.6 s | 3.1 s |
+| `root://` + GSI | 32 | 5,349 MiB/s | 4,674 MiB/s | 6.1 s | 6.9 s |
+| `root://` + GSI | 64 | 4,977 MiB/s | 4,421 MiB/s | 13.0 s | 14.7 s |
+| `davs://` + x509 | 1  | 1,593 MiB/s | 1,940 MiB/s | 0.6 s | 0.5 s |
+| `davs://` + x509 | 8  | 7,134 MiB/s | 5,392 MiB/s | 1.1 s | 1.5 s |
+| `davs://` + x509 | 16 | 5,703 MiB/s | 5,845 MiB/s | 2.9 s | 2.8 s |
+| `davs://` + x509 | 32 | 6,495 MiB/s | 5,797 MiB/s | 4.9 s | 5.6 s |
+| `davs://` + x509 | 64 | 5,919 MiB/s | 5,538 MiB/s | 10.7 s | 11.7 s |
 
 nginx-xrootd uses nginx's event-driven workers; both xrootd native protocols use one thread per connection and saturate under load. At single-connection, native xrootd has lower latency (less per-request framing overhead). At 128 simultaneous connections nginx-xrootd sustains 4.6× higher aggregate throughput on `root://` and 1.6× on `davs://`; xrootd native p95 latency climbs 5–57× higher. `davs://` vs `root://+GSI` throughput difference in nginx reflects TLS + HTTP framing overhead on top of the XRootD stream protocol.
 
@@ -106,11 +108,13 @@ Full setup: [docs/getting-started.md](docs/getting-started.md)
 
 ## Features
 
-- **XRootD operations:** `stat`, `open`, `read`, `readv`, `close`, `mkdir`, `rm`, `rmdir`, `mv`, `chmod`, `truncate`, checksum and space queries
+- **XRootD operations:** `stat`, `statx`, `open`, `read`, `pgread` (CRC32c), `readv`, `write`, `pgwrite`, `writev`, `close`, `mkdir`, `rm`, `rmdir`, `mv`, `chmod`, `truncate`, `locate`, `fattr` (get/set/del/list), checksum, space, stats, config, and filesystem queries
 - **WebDAV operations:** OPTIONS, GET (with Range), HEAD, PUT, DELETE, MKCOL, PROPFIND, and opt-in HTTP-TPC COPY pull support for `https://` sources
-- **Authentication:** anonymous access, GSI/x509 proxy certificates, and WLCG/JWT bearer tokens
-- **Async I/O:** nginx thread-pool support so disk operations never block the event loop
-- **Observability:** per-request access logs and Prometheus metrics
+- **Authentication:** anonymous access, GSI/x509 proxy certificates, and WLCG/JWT bearer tokens; `kXR_sigver` HMAC-SHA256 request signing verified for GSI sessions
+- **TLS:** in-protocol `root://` upgrade (`kXR_wantTLS`/`kXR_ableTLS`), `roots://` (TLS-from-byte-one), and `davs://`
+- **Async I/O:** nginx thread-pool support for `read`, `pgread`, `readv`, `write`, and WebDAV PUT — disk operations never block the event loop
+- **Manager mode:** static path → backend mapping with `xrootd_manager_map`, catch-all `xrootd_upstream` forwarding, and server-side `kXR_redirect` support
+- **Observability:** per-request access logs and Prometheus metrics (29 operation counters)
 
 ---
 
@@ -120,6 +124,10 @@ Full setup: [docs/getting-started.md](docs/getting-started.md)
 |---|---|
 | [Getting started](docs/getting-started.md) | Build, install, first working server |
 | [Benchmarks](docs/benchmarks.md) | How to reproduce the performance numbers above |
+| [TLS implementation](docs/tls.md) | How TLS works for `davs://`, `root://` + `xrootd_tls`, and `roots://` |
+| [Optimizations](docs/optimizations.md) | Code-level performance work and why it helps |
+| [xrdcp interactions](docs/xrdcp-interactions.md) | Typical client/server flows for `xrdcp` over `root://` and `davs://` |
+| [Quirks & compromises](docs/quirks.md) | Design mismatches, pragmatic trade-offs, and implementation gotchas |
 | [Building from scratch](docs/building.md) | Detailed build guide with all dependencies |
 | [Configuration reference](docs/configuration.md) | All directives |
 | [WebDAV / HTTPS+GSI/Bearer](docs/webdav.md) | WebDAV setup, x509 proxy, and bearer-token compatibility |
@@ -127,6 +135,7 @@ Full setup: [docs/getting-started.md](docs/getting-started.md)
 | [Test PKI & VOMS](docs/test-pki.md) | Generate test CA, certs, proxies, and VOMS infrastructure |
 | [Test tokens](docs/test-tokens.md) | Generate local WLCG/JWT signing keys and bearer tokens |
 | [Operations](docs/operations.md) | Supported XRootD operations |
+| [Manager mode](docs/manager-mode.md) | Static path-to-backend mapping and redirect semantics |
 | [Metrics & logging](docs/metrics-and-logging.md) | Prometheus metrics, access log format |
 | [Development](docs/development.md) | Source layout, utilities, workflow, known quirks |
 | [Utilities](utils/README.md) | Test and debug tools: proxy/token/CRL generators, protocol dumper, reference server, security probe |
@@ -148,6 +157,65 @@ tests/manage_test_servers.sh start
 # show status / stop both
 tests/manage_test_servers.sh status
 tests/manage_test_servers.sh stop
+```
+
+Running the cross-compatible native XRootD tests against both backends
+----------------------------------------------------------------------
+
+The portable native-protocol/API suite can be exercised against nginx-xrootd
+and the official reference xrootd in one go:
+
+```bash
+tests/run_cross_compatible_tests.sh
+```
+
+That wrapper runs these modules twice, first with `TEST_CROSS_BACKEND=nginx`
+and then with `TEST_CROSS_BACKEND=xrootd`:
+
+- `tests/test_file_api.py`
+- `tests/test_query.py`
+- `tests/test_protocol_edge_cases.py`
+- `tests/test_privilege_escalation.py`
+
+Extra pytest arguments are passed through to both runs:
+
+```bash
+tests/run_cross_compatible_tests.sh -k read_only
+```
+
+If you want just one backend, set `TEST_CROSS_BACKEND` directly:
+
+```bash
+TEST_CROSS_BACKEND=xrootd pytest tests/test_protocol_edge_cases.py -v
+```
+
+On the reference-xrootd leg, checksum-query tests are skipped unless the
+server is configured with checksum support.
+
+Running tests against an external, preconfigured server
+------------------------------------------------------
+
+You can point the test-suite at an already-running nginx+plugin instance or
+an official xrootd instance instead of having the test harness start local
+processes. Set one or more of these environment variables before running
+`pytest`:
+
+- `TEST_NGINX_URL` — URL to the nginx WebDAV endpoint (e.g. `https://myhost:8443`).
+- `TEST_REF_URL` — URL to a reference `root://` xrootd instance (e.g. `root://xrootd.example:1096`).
+- `TEST_REF_GSI_URL` — URL to an xrootd instance configured with GSI (used by
+    some GSI-specific fixtures).
+
+When any of these are set, the corresponding fixtures will validate reachability
+and then run tests against the provided server. This lets you run the full
+test-suite against a production-like nginx+plugin or xrootd endpoint. Tests
+will not `skip` simply because local binaries are missing if an appropriate
+`TEST_*` variable is provided; instead they'll target the external server.
+
+Example (run all tests against a single nginx+plugin instance):
+
+```bash
+export TEST_NGINX_URL=https://ci-nginx.example:8443
+pytest -v
 ```
 
 ## License

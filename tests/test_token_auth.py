@@ -29,6 +29,7 @@ import tempfile
 import urllib3
 import pytest
 import requests
+from settings import CA_CERT, DATA_ROOT as DEFAULT_DATA_ROOT, TOKENS_DIR
 
 # Suppress InsecureRequestWarning for verify=False in WebDAV tests
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -43,13 +44,13 @@ from utils.make_token import TokenIssuer
 # Constants
 # ---------------------------------------------------------------------------
 
-TOKEN_DIR   = "/tmp/xrd-test/tokens"
-TOKEN_URL   = "root://localhost:11097"
+TOKEN_DIR   = TOKENS_DIR
+TOKEN_URL   = ""
 TOKEN_HOST  = "127.0.0.1"
-TOKEN_PORT  = 11099
-WEBDAV_BASE = "https://localhost:8443"
-DATA_ROOT   = "/tmp/xrd-test/data"
-CA_PEM      = "/tmp/xrd-test/pki/ca/ca.pem"
+TOKEN_PORT  = 0
+WEBDAV_BASE = ""
+DATA_ROOT   = DEFAULT_DATA_ROOT
+CA_PEM      = CA_CERT
 
 # XRootD request IDs (host byte order)
 kXR_auth     = 3000
@@ -77,6 +78,20 @@ kXR_open_force  = 0x0004  # kXR_delete
 # ---------------------------------------------------------------------------
 # Token issuer fixture
 # ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module", autouse=True)
+def _configure(test_env):
+    """Bind module constants from the shared test environment."""
+    global TOKEN_DIR, TOKEN_URL, TOKEN_HOST, TOKEN_PORT
+    global WEBDAV_BASE, DATA_ROOT, CA_PEM
+    TOKEN_DIR   = test_env["token_dir"]
+    TOKEN_URL   = test_env["token_url"]
+    TOKEN_HOST  = "127.0.0.1"
+    TOKEN_PORT  = test_env["token_port"]
+    WEBDAV_BASE = test_env["webdav_url"]
+    DATA_ROOT   = test_env["data_dir"]
+    CA_PEM      = test_env["ca_pem"]
+
 
 @pytest.fixture(scope="module")
 def issuer():
@@ -111,8 +126,12 @@ def _read_response(sock):
     return status, body
 
 
-def _raw_handshake(host=TOKEN_HOST, port=TOKEN_PORT):
+def _raw_handshake(host=None, port=None):
     """Open a raw socket and complete the 20-byte XRootD handshake."""
+    if host is None:
+        host = TOKEN_HOST
+    if port is None:
+        port = TOKEN_PORT
     sock = socket.create_connection((host, port), timeout=5)
     sock.settimeout(5)
     # Client hello: 20 bytes of handshake
@@ -211,7 +230,7 @@ def _send_ping(sock, streamid=b"\x00\x06"):
     return _read_response(sock)
 
 
-def _token_session(token, host=TOKEN_HOST, port=TOKEN_PORT):
+def _token_session(token, host=None, port=None):
     """Open a raw XRootD session with token auth and return the socket."""
     sock = _raw_handshake(host, port)
     status, body = _send_protocol(sock)

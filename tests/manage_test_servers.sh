@@ -39,7 +39,7 @@ Usage:
 
 Examples:
   tests/manage_test_servers.sh start
-    tests/manage_test_servers.sh force-stop ref
+  tests/manage_test_servers.sh force-stop ref
   tests/manage_test_servers.sh restart nginx
   tests/manage_test_servers.sh status ref
 EOF
@@ -137,10 +137,14 @@ start_nginx() {
 
     "$NGINX_BIN" -p "$NGINX_PREFIX" -c "$NGINX_CONF_REL"
 
-    if wait_ready_xrdfs "root://localhost:${NGINX_PORT}"; then
-        echo "nginx started and ready on ${NGINX_PORT}"
+    if [[ -n "${SKIP_XRDFS_CHECK:-}" ]]; then
+        echo "nginx started (skipping xrdfs readiness because SKIP_XRDFS_CHECK set)"
     else
-        echo "WARNING: nginx started but readiness probe failed on ${NGINX_PORT}" >&2
+        if wait_ready_xrdfs "root://localhost:${NGINX_PORT}"; then
+            echo "nginx started and ready on ${NGINX_PORT}"
+        else
+            echo "WARNING: nginx started but readiness probe failed on ${NGINX_PORT}" >&2
+        fi
     fi
 }
 
@@ -205,12 +209,21 @@ start_ref() {
         return 1
     fi
 
-    if wait_ready_xrdfs "root://localhost:${REF_PORT}" 1 0.1; then
-        echo "reference xrootd already running on ${REF_PORT}"
-        return 0
+    if [[ -n "${SKIP_XRDFS_CHECK:-}" ]]; then
+        if pids_on_port "${REF_PORT}" | grep -q .; then
+            echo "reference xrootd appears to be listening on ${REF_PORT} (SKIP_XRDFS_CHECK set)"
+            return 0
+        fi
+    else
+        if wait_ready_xrdfs "root://localhost:${REF_PORT}" 1 0.1; then
+            echo "reference xrootd already running on ${REF_PORT}"
+            return 0
+        fi
     fi
 
-    write_ref_cfg
+    if [[ "${REF_CFG_PREGENERATED:-0}" != "1" ]]; then
+        write_ref_cfg
+    fi
     rm -f "$REF_PID_FILE"
 
     "$REF_BIN" -c "$REF_CFG" -l "$REF_LOG" -b >/dev/null 2>&1
@@ -222,10 +235,14 @@ start_ref() {
         sleep 0.1
     done
 
-    if wait_ready_xrdfs "root://localhost:${REF_PORT}"; then
-        echo "reference xrootd started and ready on ${REF_PORT}"
+    if [[ -n "${SKIP_XRDFS_CHECK:-}" ]]; then
+        echo "reference xrootd started (skipping xrdfs readiness because SKIP_XRDFS_CHECK set)"
     else
-        echo "WARNING: reference xrootd started but readiness probe failed on ${REF_PORT}" >&2
+        if wait_ready_xrdfs "root://localhost:${REF_PORT}"; then
+            echo "reference xrootd started and ready on ${REF_PORT}"
+        else
+            echo "WARNING: reference xrootd started but readiness probe failed on ${REF_PORT}" >&2
+        fi
     fi
 }
 
@@ -302,9 +319,16 @@ status_ref() {
         fi
     fi
 
-    if wait_ready_xrdfs "root://localhost:${REF_PORT}" 1 0.1; then
-        echo "ref xrootd: running (port=${REF_PORT}, unmanaged)"
-        return 0
+    if [[ -n "${SKIP_XRDFS_CHECK:-}" ]]; then
+        if pids_on_port "${REF_PORT}" | grep -q .; then
+            echo "ref xrootd: running (port=${REF_PORT}, unmanaged)"
+            return 0
+        fi
+    else
+        if wait_ready_xrdfs "root://localhost:${REF_PORT}" 1 0.1; then
+            echo "ref xrootd: running (port=${REF_PORT}, unmanaged)"
+            return 0
+        fi
     fi
 
     echo "ref xrootd: stopped"

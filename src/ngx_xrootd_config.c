@@ -1,4 +1,5 @@
 #include "ngx_xrootd_module.h"
+#include <ctype.h>
 
 /* ================================================================== */
 /*  Configuration management                                            */
@@ -257,6 +258,70 @@ xrootd_conf_set_manager_map(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
+char *
+xrootd_conf_set_upstream(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_stream_xrootd_srv_conf_t *xcf = conf;
+    ngx_str_t                    *value;
+    char                         *addr_copy, *colon, *endp;
+    long                          pnum;
+
+    value = cf->args->elts;
+    (void) cmd;
+
+    addr_copy = ngx_pnalloc(cf->pool, value[1].len + 1);
+    if (addr_copy == NULL) {
+        return NGX_CONF_ERROR;
+    }
+    ngx_memcpy(addr_copy, value[1].data, value[1].len);
+    addr_copy[value[1].len] = '\0';
+
+    if (addr_copy[0] == '[') {
+        /* IPv6 literal [addr]:port */
+        char *rb = strchr(addr_copy, ']');
+        if (rb == NULL || *(rb + 1) != ':') {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "xrootd_upstream: invalid address \"%V\"", &value[1]);
+            return NGX_CONF_ERROR;
+        }
+        size_t hostlen = (size_t)(rb - addr_copy - 1);
+        xcf->upstream_host.data = ngx_pnalloc(cf->pool, hostlen + 1);
+        if (xcf->upstream_host.data == NULL) { return NGX_CONF_ERROR; }
+        ngx_memcpy(xcf->upstream_host.data, addr_copy + 1, hostlen);
+        xcf->upstream_host.data[hostlen] = '\0';
+        xcf->upstream_host.len = hostlen;
+        pnum = strtol(rb + 2, &endp, 10);
+    } else {
+        /* hostname:port or IPv4:port — split on last colon */
+        colon = strrchr(addr_copy, ':');
+        if (colon == NULL) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "xrootd_upstream: missing port in \"%V\"", &value[1]);
+            return NGX_CONF_ERROR;
+        }
+        size_t hostlen = (size_t)(colon - addr_copy);
+        xcf->upstream_host.data = ngx_pnalloc(cf->pool, hostlen + 1);
+        if (xcf->upstream_host.data == NULL) { return NGX_CONF_ERROR; }
+        ngx_memcpy(xcf->upstream_host.data, addr_copy, hostlen);
+        xcf->upstream_host.data[hostlen] = '\0';
+        xcf->upstream_host.len = hostlen;
+        pnum = strtol(colon + 1, &endp, 10);
+    }
+
+    if (*endp != '\0' || pnum <= 0 || pnum > 65535) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "xrootd_upstream: invalid port in \"%V\"", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+    xcf->upstream_port = (uint16_t) pnum;
+
+    ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
+        "xrootd: upstream redirector: %s:%d",
+        (char *) xcf->upstream_host.data, (int) xcf->upstream_port);
+
+    return NGX_CONF_OK;
+}
+
 void *
 ngx_stream_xrootd_create_srv_conf(ngx_conf_t *cf)
 {
@@ -292,6 +357,9 @@ ngx_stream_xrootd_create_srv_conf(ngx_conf_t *cf)
     conf->metrics_slot = -1;
     conf->tls          = NGX_CONF_UNSET;
     conf->tls_ctx      = NULL;
+    conf->cms_addr     = NULL;
+    conf->cms_interval = NGX_CONF_UNSET;
+    conf->cms_ctx      = NULL;
 
     return conf;
 }
@@ -325,6 +393,13 @@ ngx_stream_xrootd_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_str_value(conf->token_issuer,    prev->token_issuer,    "");
     ngx_conf_merge_str_value(conf->token_audience,  prev->token_audience,  "");
     ngx_conf_merge_value(conf->tls,             prev->tls,             0);
+    ngx_conf_merge_str_value(conf->cms_paths,       prev->cms_paths,       "");
+    ngx_conf_merge_value(conf->cms_interval,        prev->cms_interval,    30);
+
+    if (conf->cms_addr == NULL && prev->cms_addr != NULL) {
+        conf->cms_addr = prev->cms_addr;
+        conf->cms_manager = prev->cms_manager;
+    }
 
     child_vo_rules = conf->vo_rules;
     conf->vo_rules = xrootd_merge_arrays(cf, prev->vo_rules, child_vo_rules,
@@ -352,6 +427,12 @@ ngx_stream_xrootd_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
             && (prev->manager_map != NULL || child_manager_map != NULL)) {
             return NGX_CONF_ERROR;
         }
+    }
+
+    /* Inherit upstream redirector from parent scope if not set locally */
+    if (conf->upstream_host.len == 0 && prev->upstream_host.len > 0) {
+        conf->upstream_host = prev->upstream_host;
+        conf->upstream_port = prev->upstream_port;
     }
 
     return NGX_CONF_OK;
@@ -637,6 +718,10 @@ ngx_stream_xrootd_init_process(ngx_cycle_t *cycle)
             continue;
         }
 
+        if (xcf->cms_addr != NULL) {
+            ngx_xrootd_cms_start(cycle, xcf);
+        }
+
         if ((xcf->auth != XROOTD_AUTH_GSI && xcf->auth != XROOTD_AUTH_BOTH)
             || xcf->crl.len == 0 || xcf->crl_reload == 0)
         {
@@ -666,6 +751,78 @@ ngx_stream_xrootd_init_process(ngx_cycle_t *cycle)
 /* ================================================================== */
 /*  Post-configuration: load GSI certificates                          */
 /* ================================================================== */
+
+char *
+xrootd_conf_set_cms_manager(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_stream_xrootd_srv_conf_t *xcf = conf;
+    ngx_str_t                    *value;
+    ngx_url_t                     url;
+    ngx_addr_t                   *addr;
+
+    value = cf->args->elts;
+    (void) cmd;
+
+    if (xcf->cms_addr != NULL) {
+        return "is duplicate";
+    }
+
+    if (xrootd_copy_conf_string(cf, &value[1], &xcf->cms_manager)
+        != NGX_CONF_OK)
+    {
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_memzero(&url, sizeof(url));
+    url.url = xcf->cms_manager;
+    url.default_port = 0;
+
+    if (ngx_parse_url(cf->pool, &url) != NGX_OK) {
+        if (url.err != NULL) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "xrootd_cms_manager: %s in \"%V\"", url.err, &value[1]);
+        }
+        return NGX_CONF_ERROR;
+    }
+
+    if (url.no_port) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "xrootd_cms_manager: missing port in \"%V\"", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    if (url.naddrs == 0 || url.addrs == NULL) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "xrootd_cms_manager: could not resolve \"%V\"", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    if (ngx_inet_get_port(url.addrs[0].sockaddr) == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "xrootd_cms_manager: invalid port in \"%V\"", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    addr = ngx_pcalloc(cf->pool, sizeof(ngx_addr_t));
+    if (addr == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    addr->sockaddr = ngx_pnalloc(cf->pool, url.addrs[0].socklen);
+    if (addr->sockaddr == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_memcpy(addr->sockaddr, url.addrs[0].sockaddr, url.addrs[0].socklen);
+    addr->socklen = url.addrs[0].socklen;
+    addr->name = url.addrs[0].name;
+    xcf->cms_addr = addr;
+
+    ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
+        "xrootd: CMS manager configured: %V", &xcf->cms_manager);
+
+    return NGX_CONF_OK;
+}
 
 ngx_int_t
 ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
@@ -801,6 +958,9 @@ ngx_stream_xrootd_postconfiguration(ngx_conf_t *cf)
         if (xrootd_rebuild_gsi_store(xcf, cf->log) != NGX_OK) {
             return NGX_ERROR;
         }
+
+        /* Run a lightweight PKI/CRL consistency check and log any problems. */
+        (void) xrootd_check_pki_consistency_stream(cf->log, xcf);
 
         /* Compute CA hash (for kXRS_issuer_hash in kXGS_init) */
         {

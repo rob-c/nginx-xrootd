@@ -17,17 +17,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
 from XRootD import client
+from settings import CA_DIR as DEFAULT_CA_DIR, PROXY_STD
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-ANON_URL    = "root://localhost:11094"
-GSI_URL     = "root://localhost:11095"
-GSI_TLS_URL = "roots://localhost:11096"
+ANON_URL    = ""
+GSI_URL     = ""
+GSI_TLS_URL = ""
 
-CA_DIR    = "/tmp/xrd-test/pki/ca"
-PROXY_PEM = "/tmp/xrd-test/pki/user/proxy_std.pem"
+CA_DIR    = DEFAULT_CA_DIR
+PROXY_PEM = PROXY_STD
 
 LARGE_FILE      = "large200.bin"
 LARGE_FILE_SIZE = 200 * 1024 * 1024
@@ -41,7 +42,14 @@ READ_CHUNK = 4 * 1024 * 1024   # 4 MiB — matches XROOTD_READ_MAX in module
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module", autouse=True)
-def gsi_env():
+def _configure(test_env):
+    """Bind module constants and set GSI env vars from the shared test environment."""
+    global ANON_URL, GSI_URL, GSI_TLS_URL, CA_DIR, PROXY_PEM
+    ANON_URL    = test_env["anon_url"]
+    GSI_URL     = test_env["gsi_url"]
+    GSI_TLS_URL = test_env["gsi_tls_url"]
+    CA_DIR      = test_env["ca_dir"]
+    PROXY_PEM   = test_env["proxy_pem"]
     os.environ["X509_CERT_DIR"]  = CA_DIR
     os.environ["X509_USER_PROXY"] = PROXY_PEM
 

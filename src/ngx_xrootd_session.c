@@ -44,9 +44,16 @@ xrootd_handle_protocol(xrootd_ctx_t *ctx, ngx_connection_t *c,
     int want_token = (conf->auth == XROOTD_AUTH_TOKEN
                       || conf->auth == XROOTD_AUTH_BOTH);
 
-    /* Advertise TLS capability when the client offers it and we have a TLS context. */
+    /* kXR_wantTLS: client requires TLS; kXR_ableTLS: client is TLS-capable. */
+    int client_wants_tls = (client_flags & kXR_wantTLS) ? 1 : 0;
     int offer_tls = (conf->tls && conf->tls_ctx != NULL
-                     && (client_flags & kXR_ableTLS));
+                     && (client_flags & (kXR_ableTLS | kXR_wantTLS)));
+
+    /* Reject if the client demands TLS but this listener has none configured. */
+    if (client_wants_tls && (!conf->tls || conf->tls_ctx == NULL)) {
+        return xrootd_send_error(ctx, c, kXR_TLSRequired,
+                                 "TLS required by client but not configured on this server");
+    }
 
     /*
      * Base kXR_protocol reply is the fixed 8-byte ServerProtocolBody.
@@ -275,18 +282,75 @@ xrootd_handle_endsess(xrootd_ctx_t *ctx, ngx_connection_t *c)
 }
 
 /*
- * xrootd_handle_sigver — accept and ignore request signing.
+ * xrootd_handle_sigver — XRootD request signing (kXR_sigver).
  *
- * We do not advertise kXR_secreqs in the kXR_protocol response, so a
- * conforming client will never send kXR_sigver.  Non-conforming clients
- * that do send it receive kXR_ok so the session can continue; the following
- * request is processed without cryptographic verification.
+ * Protocol flow:
+ *   1. Client sends kXR_sigver with HMAC-SHA256(signing_key, seqno || next_hdr
+ *      [|| next_payload]) as the body, and expectrid = opcode of the next request.
+ *   2. We save the HMAC and seqno in pending state on ctx.
+ *   3. xrootd_dispatch() verifies the HMAC before routing the following request.
+ *
+ * For GSI sessions signing_active is 1 and signing_key = SHA-256(DH secret).
+ * For token/anonymous sessions we accept sigver without verification; legitimate
+ * clients should not send it unsolicited, but some do (e.g. when connecting to an
+ * unknown server type).
+ *
+ * Only HMAC-SHA256 without RSA (kXR_SHA256, kXR_rsaKey unset) is verified.
+ * RSA-signed requests are accepted without checking the asymmetric signature.
  */
 ngx_int_t
 xrootd_handle_sigver(xrootd_ctx_t *ctx, ngx_connection_t *c)
 {
-    ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
-                   "xrootd: kXR_sigver received — accepted without verification");
+    ClientSigverRequest *req = (ClientSigverRequest *) ctx->hdr_buf;
+    uint16_t expectrid;
+    uint64_t seqno;
+
+    ngx_memcpy(&expectrid, &req->expectrid, 2);
+    expectrid = ntohs(expectrid);
+
+    ngx_memcpy(&seqno, &req->seqno, 8);
+    seqno = be64toh(seqno);
+
+    if (ctx->signing_active) {
+        /* Reject replays — seqno must strictly increase across the session. */
+        if (seqno <= ctx->last_seqno) {
+            ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                          "xrootd: sigver replay (seqno=%llu <= last=%llu)",
+                          (unsigned long long) seqno,
+                          (unsigned long long) ctx->last_seqno);
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "sigver replay detected");
+        }
+        ctx->last_seqno = seqno;
+
+        if ((req->crypto & kXR_HashMask_sig) == kXR_SHA256_sig
+            && !(req->crypto & kXR_rsaKey_sig))
+        {
+            /* Need exactly 32 bytes of HMAC in the body. */
+            if (ctx->cur_dlen < 32 || ctx->payload == NULL) {
+                return xrootd_send_error(ctx, c, kXR_ArgInvalid,
+                                         "sigver body too short");
+            }
+
+            ctx->sigver_pending   = 1;
+            ctx->sigver_expectrid = expectrid;
+            ctx->sigver_seqno     = seqno;
+            ctx->sigver_nodata    = (req->flags & kXR_nodata_sig) ? 1 : 0;
+            ngx_memcpy(ctx->sigver_hmac, ctx->payload, 32);
+
+            ngx_log_debug2(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                           "xrootd: sigver pending expectrid=%d seqno=%llu",
+                           (int) expectrid, (unsigned long long) seqno);
+        } else {
+            ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                           "xrootd: sigver crypto=0x%02x not verified (RSA path)",
+                           (unsigned) req->crypto);
+        }
+    } else {
+        ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                       "xrootd: sigver accepted without verification (no GSI key)");
+    }
+
     xrootd_log_access(ctx, c, "SIGVER", "-", "-", 1, 0, NULL, 0);
     return xrootd_send_ok(ctx, c, NULL, 0);
 }

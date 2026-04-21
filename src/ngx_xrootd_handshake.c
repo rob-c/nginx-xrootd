@@ -78,6 +78,94 @@ xrootd_dispatch(xrootd_ctx_t *ctx, ngx_connection_t *c,
                    "xrootd: dispatch reqid=%d", (int) ctx->cur_reqid);
 
     /*
+     * kXR_sigver verification.
+     *
+     * A kXR_sigver arrived earlier and set sigver_pending; now that we have
+     * the next request's full 24-byte header (and optional payload), verify
+     * HMAC-SHA256(signing_key, seqno_BE || hdr_buf [|| payload]).
+     *
+     * Another kXR_sigver clears and replaces the pending state (no error).
+     * Any mismatch in expectrid or HMAC is a hard auth failure.
+     */
+    if (ctx->sigver_pending && ctx->cur_reqid != kXR_sigver) {
+        ctx->sigver_pending = 0;
+
+        if (ctx->signing_active) {
+            if (ctx->sigver_expectrid != ctx->cur_reqid) {
+                ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                              "xrootd: sigver expectrid=%d but got reqid=%d",
+                              (int) ctx->sigver_expectrid, (int) ctx->cur_reqid);
+                return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                         "signed request opcode mismatch");
+            }
+
+            /* HMAC input: seqno(8B BE) || request_header(24B) [|| payload] */
+            {
+                u_char        seqno_be[8];
+                u_char        computed[32];
+                uint64_t      seq  = ctx->sigver_seqno;
+                EVP_MAC      *mac  = EVP_MAC_fetch(NULL, "HMAC", NULL);
+                EVP_MAC_CTX  *mctx = mac ? EVP_MAC_CTX_new(mac) : NULL;
+                OSSL_PARAM    params[2];
+                size_t        clen = sizeof(computed);
+                int           ok   = 0;
+
+                seqno_be[0] = (u_char)(seq >> 56);
+                seqno_be[1] = (u_char)(seq >> 48);
+                seqno_be[2] = (u_char)(seq >> 40);
+                seqno_be[3] = (u_char)(seq >> 32);
+                seqno_be[4] = (u_char)(seq >> 24);
+                seqno_be[5] = (u_char)(seq >> 16);
+                seqno_be[6] = (u_char)(seq >>  8);
+                seqno_be[7] = (u_char)(seq      );
+
+                params[0] = OSSL_PARAM_construct_utf8_string("digest",
+                                                              "SHA256", 0);
+                params[1] = OSSL_PARAM_construct_end();
+
+                if (mctx
+                    && EVP_MAC_init(mctx, ctx->signing_key, 32, params) == 1
+                    && EVP_MAC_update(mctx, seqno_be, 8) == 1
+                    && EVP_MAC_update(mctx, ctx->hdr_buf,
+                                      XRD_REQUEST_HDR_LEN) == 1)
+                {
+                    if (ctx->sigver_nodata
+                        || ctx->payload == NULL
+                        || ctx->cur_dlen == 0
+                        || EVP_MAC_update(mctx, ctx->payload,
+                                          ctx->cur_dlen) == 1)
+                    {
+                        ok = (EVP_MAC_final(mctx, computed, &clen,
+                                            sizeof(computed)) == 1);
+                    }
+                }
+
+                EVP_MAC_CTX_free(mctx);
+                EVP_MAC_free(mac);
+
+                if (ok && clen >= 32
+                    && ngx_memcmp(computed, ctx->sigver_hmac, 32) != 0)
+                {
+                    ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                                  "xrootd: sigver HMAC mismatch for reqid=%d",
+                                  (int) ctx->cur_reqid);
+                    return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                             "signature verification failed");
+                }
+
+                if (ok) {
+                    ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                                   "xrootd: sigver verified reqid=%d",
+                                   (int) ctx->cur_reqid);
+                }
+            }
+        }
+    } else if (ctx->cur_reqid == kXR_sigver) {
+        /* A new sigver wipes any stale pending state before we handle it. */
+        ctx->sigver_pending = 0;
+    }
+
+    /*
      * Routing policy is intentionally centralized here:
      *   1. decide which opcodes are legal before/after login+auth
      *   2. enforce read-only vs mutating behavior from config
@@ -291,6 +379,14 @@ xrootd_dispatch(xrootd_ctx_t *ctx, ngx_connection_t *c,
                                      "authentication required");
         }
         return xrootd_handle_query(ctx, c, conf);
+
+    case kXR_prepare:
+        /* prepare is a staging/cache hint; the local implementation validates paths. */
+        if (!ctx->logged_in || !ctx->auth_done) {
+            return xrootd_send_error(ctx, c, kXR_NotAuthorized,
+                                     "authentication required");
+        }
+        return xrootd_handle_prepare(ctx, c, conf);
 
     case kXR_pgread:
         if (!ctx->logged_in || !ctx->auth_done) {

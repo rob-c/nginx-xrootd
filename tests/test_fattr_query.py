@@ -23,6 +23,7 @@ import struct
 import tempfile
 import time
 import pytest
+from settings import CA_DIR as DEFAULT_CA_DIR, DATA_ROOT as DEFAULT_DATA_ROOT, PROXY_STD
 
 # ── XRootD Python client imports ─────────────────────────────────────────────
 
@@ -38,24 +39,40 @@ pytestmark = pytest.mark.skipif(not HAS_XROOTD,
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-ANON_URL = "root://localhost:11094/"
-GSI_URL  = "root://localhost:11095/"
-ANON_HOST, ANON_PORT = "localhost", 11094
+ANON_URL = ""
+GSI_URL  = ""
+ANON_HOST, ANON_PORT = "localhost", 0
+DATA_DIR = DEFAULT_DATA_ROOT
+CA_DIR   = DEFAULT_CA_DIR
+PROXY_PEM = PROXY_STD
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _configure(test_env):
+    """Bind module constants from the shared test environment."""
+    global ANON_URL, GSI_URL, ANON_HOST, ANON_PORT, DATA_DIR, CA_DIR, PROXY_PEM
+    ANON_URL  = test_env["anon_url"] + "/"
+    GSI_URL   = test_env["gsi_url"] + "/"
+    ANON_HOST = "127.0.0.1"
+    ANON_PORT = test_env["anon_port"]
+    DATA_DIR  = test_env["data_dir"]
+    CA_DIR    = test_env["ca_dir"]
+    PROXY_PEM = test_env["proxy_pem"]
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def make_file(name: str, content: bytes = b"hello fattr\n") -> str:
-    """Create a test file under /tmp/xrd-test/data/ and return the XRootD path."""
-    data_dir = "/tmp/xrd-test/data"
-    os.makedirs(data_dir, exist_ok=True)
-    fpath = os.path.join(data_dir, name)
+    """Create a test file under DATA_DIR and return the XRootD path."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    fpath = os.path.join(DATA_DIR, name)
     with open(fpath, "wb") as f:
         f.write(content)
     return "/" + name
 
 
 def rm_file(name: str) -> None:
-    path = f"/tmp/xrd-test/data/{name}"
+    path = os.path.join(DATA_DIR, name)
     try:
         os.remove(path)
     except FileNotFoundError:
@@ -151,7 +168,7 @@ class TestFattr:
     def setup_method(self) -> None:
         self.fname = f"fattr_test_{os.getpid()}.txt"
         self.xrd_path = make_file(self.fname)
-        self.local_path = f"/tmp/xrd-test/data/{self.fname}"
+        self.local_path = os.path.join(DATA_DIR, self.fname)
         self.fs = xrd_client.FileSystem(ANON_URL)
 
     def teardown_method(self) -> None:
@@ -276,8 +293,8 @@ class TestFattr:
     def test_fattr_gsi_endpoint(self) -> None:
         """Attributes work on the GSI-authenticated endpoint."""
         # Ensure GSI environment is set for authenticated endpoint
-        os.environ["X509_CERT_DIR"] = "/tmp/xrd-test/pki/ca"
-        os.environ["X509_USER_PROXY"] = "/tmp/xrd-test/pki/user/proxy_std.pem"
+        os.environ["X509_CERT_DIR"] = CA_DIR
+        os.environ["X509_USER_PROXY"] = PROXY_PEM
         try:
             fs_gsi = xrd_client.FileSystem(GSI_URL)
             status, _ = fs_gsi.set_xattr(self.xrd_path, [("gsi_tag", "ok")])
@@ -354,7 +371,7 @@ class TestQueryXattr:
     def setup_method(self) -> None:
         self.fname = f"qxattr_test_{os.getpid()}.txt"
         self.xrd_path = make_file(self.fname)
-        self.local_path = f"/tmp/xrd-test/data/{self.fname}"
+        self.local_path = os.path.join(DATA_DIR, self.fname)
         # Pre-set an xattr directly so the query has something to return
         try:
             os.setxattr(self.local_path, "user.U.meta", b"info")

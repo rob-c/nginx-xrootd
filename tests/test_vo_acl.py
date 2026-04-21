@@ -47,26 +47,27 @@ from types import SimpleNamespace
 import pytest
 from XRootD import client
 from XRootD.client.flags import OpenFlags, StatInfoFlags
+from settings import (
+    CA_DIR,
+    DATA_ROOT,
+    NGINX_BIN,
+    PKI_DIR,
+    PROXY_ATLAS,
+    PROXY_CMS,
+    PROXY_STD,
+    SERVER_CERT,
+    SERVER_KEY,
+    USER_CERT,
+    USER_KEY,
+    VOMS_CERT,
+    VOMSDIR,
+    VOMS_KEY,
+)
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 
-NGINX_BIN   = "/tmp/nginx-1.28.3/objs/nginx"
-PKI_DIR     = "/tmp/xrd-test/pki"
-CA_DIR      = "/tmp/xrd-test/pki/ca"
-VOMSDIR     = "/tmp/xrd-test/pki/vomsdir"
-VOMS_CERT   = "/tmp/xrd-test/pki/voms/vomscert.pem"
-VOMS_KEY    = "/tmp/xrd-test/pki/voms/vomskey.pem"
-USER_CERT   = "/tmp/xrd-test/pki/user/usercert.pem"
-USER_KEY    = "/tmp/xrd-test/pki/user/userkey.pem"
-PROXY_STD   = "/tmp/xrd-test/pki/user/proxy_std.pem"
-PROXY_CMS   = "/tmp/xrd-test/pki/user/proxy_cms.pem"
-PROXY_ATLAS = "/tmp/xrd-test/pki/user/proxy_atlas.pem"
-SERVER_CERT = "/tmp/xrd-test/pki/server/hostcert.pem"
-SERVER_KEY  = "/tmp/xrd-test/pki/server/hostkey.pem"
-
-DATA_ROOT   = "/tmp/xrd-test/data"
 VO_PORT     = 11103
 VO_URL      = f"root://localhost:{VO_PORT}"
 
@@ -347,19 +348,44 @@ def vo_nginx(tmp_path_factory):
             with open(seed, "w") as f:
                 f.write(f"seed file for {subdir}\n")
 
-    # ---- Start VO nginx
+    # ---- Start VO nginx via server_control
     os.makedirs(VO_NGINX_DIR, exist_ok=True)
-    conf_path = os.path.join(VO_NGINX_DIR, "nginx.conf")
-    _write_vo_nginx_conf(conf_path)
-    proc = _start_vo_nginx(conf_path)
 
-    yield proc
+    import server_control
+    info = server_control.start_nginx_instance(
+        port=VO_PORT, nginx_bin=NGINX_BIN,
+        conf_file="nginx_vo_acl.conf",
+        template_kwargs={
+            "DATA_DIR": DATA_ROOT,
+            "CA_DIR": CA_DIR,
+            "VOMSDIR": VOMSDIR,
+        },
+    )
 
-    proc.terminate()
+    # Wait for authenticated xrdfs ls to succeed (ensures GSI/VOMS ready)
+    for _ in range(20):
+        r = subprocess.run(
+            ["xrdfs", VO_URL, "ls", "/"],
+            env={**os.environ,
+                 "X509_CERT_DIR":   CA_DIR,
+                 "X509_USER_PROXY": PROXY_CMS,
+                 "XrdSecPROTOCOL":  "gsi"},
+            capture_output=True, timeout=5,
+        )
+        if r.returncode == 0:
+            break
+        time.sleep(0.5)
+    else:
+        info["stop"]()
+        pytest.fail(f"VO nginx server did not become ready on port {VO_PORT}.")
+
     try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+        yield info
+    finally:
+        try:
+            info["stop"]()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

@@ -87,6 +87,13 @@ extern ngx_module_t ngx_stream_xrootd_module;
 #define XROOTD_MAX_WRITE_PAYLOAD  (16 * 1024 * 1024)
 
 /*
+ * Maximum kXR_prepare payload.  XrdCl sends a newline-separated list of paths
+ * here; allow a moderately sized batch without growing the receive buffer used
+ * for ordinary path operations.
+ */
+#define XROOTD_MAX_PREPARE_PAYLOAD  (64 * 1024)
+
+/*
  * Maximum kXR_auth payload.  GSI certificate chains with VOMS attribute
  * certificates can reach 8-10 KB depending on the CA chain depth.
  */
@@ -137,7 +144,14 @@ typedef enum {
     XRD_ST_SENDING,       /* draining a large pending write buffer  */
     XRD_ST_AIO,           /* async file I/O posted to thread pool   */
     XRD_ST_TLS_HANDSHAKE, /* kXR_ableTLS: TLS accept in progress    */
+    XRD_ST_UPSTREAM,      /* upstream redirector query in progress  */
 } xrootd_state_t;
+
+/* Opaque upstream context — defined in ngx_xrootd_upstream.c */
+typedef struct xrootd_upstream_s xrootd_upstream_t;
+
+/* Opaque CMS heartbeat context — defined in ngx_xrootd_cms_heartbeat.c */
+typedef struct ngx_xrootd_cms_ctx_s ngx_xrootd_cms_ctx_t;
 
 /* ------------------------------------------------------------------ */
 /* Per-open-file bookkeeping                                            */
@@ -243,6 +257,27 @@ typedef struct {
      * cleared once the TLS handshake completes successfully. */
     ngx_uint_t                  tls_pending;
 
+    /* Active upstream query, or NULL if none in progress. */
+    xrootd_upstream_t          *upstream;
+
+    /*
+     * kXR_sigver: HMAC-SHA256 request signing (GSI sessions only).
+     *
+     * signing_key is SHA-256(DH shared secret), set at end of GSI kXGC_cert.
+     * sigver_pending is set when kXR_sigver arrives; the next dispatch verifies
+     * the HMAC against the buffered 24-byte header (and optional payload) before
+     * routing the request.  last_seqno guards against replays.
+     */
+    u_char     signing_key[32];     /* HMAC-SHA256 key from DH exchange */
+    int        signing_active;      /* 1 when signing_key is valid */
+    uint64_t   last_seqno;          /* last accepted sigver seqno */
+
+    int        sigver_pending;      /* 1 if next dispatch must verify */
+    uint16_t   sigver_expectrid;    /* opcode the pending signature covers */
+    uint64_t   sigver_seqno;        /* seqno from the pending sigver */
+    int        sigver_nodata;       /* 1 = payload excluded from HMAC */
+    u_char     sigver_hmac[32];     /* expected HMAC bytes */
+
 } xrootd_ctx_t;
 
 /* ------------------------------------------------------------------ */
@@ -273,6 +308,14 @@ typedef struct {
 
 typedef struct {
     ngx_flag_t  enable;
+
+    /* CMS heartbeat/manager registration */
+    ngx_str_t    cms_manager;       /* original host:port directive value */
+    ngx_addr_t  *cms_addr;          /* resolved manager address */
+    ngx_str_t    cms_paths;         /* exported path list, or empty for root */
+    time_t       cms_interval;      /* heartbeat interval seconds */
+    ngx_xrootd_cms_ctx_t *cms_ctx;  /* runtime event/peer state */
+
     ngx_str_t   root;
     ngx_uint_t  auth;
 
@@ -317,6 +360,10 @@ typedef struct {
     /* Prometheus metrics */
     ngx_int_t    metrics_slot;
 
+    /* Upstream XRootD redirector (xrootd_upstream host:port) */
+    ngx_str_t    upstream_host;    /* NUL-terminated hostname or IP             */
+    uint16_t     upstream_port;    /* TCP port                                  */
+
     /* kXR_ableTLS in-protocol TLS upgrade */
     ngx_flag_t   tls;              /* xrootd_tls on|off                          */
     ngx_ssl_t   *tls_ctx;          /* SSL context; populated at postconfiguration */
@@ -340,12 +387,23 @@ ngx_int_t ngx_stream_xrootd_init_process(ngx_cycle_t *cycle);
 ngx_int_t ngx_xrootd_metrics_shm_init(ngx_shm_zone_t *shm_zone, void *data);
 ngx_int_t xrootd_rebuild_gsi_store(ngx_stream_xrootd_srv_conf_t *xcf,
     ngx_log_t *log);
+/* PKI consistency checks invoked at startup/postconfiguration. */
+ngx_int_t xrootd_check_pki_consistency_stream(ngx_log_t *log,
+    ngx_stream_xrootd_srv_conf_t *xcf);
 char *xrootd_conf_set_require_vo(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 char *xrootd_conf_set_inherit_parent_group(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 
 /* xrootd manager map directive parser */
 char *xrootd_conf_set_manager_map(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+
+/* CMS heartbeat directive parser */
+char *xrootd_conf_set_cms_manager(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+
+/* xrootd upstream redirector directive parser */
+char *xrootd_conf_set_upstream(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 
 /* ngx_xrootd_connection.c */
@@ -408,6 +466,10 @@ ngx_int_t xrootd_handle_close(xrootd_ctx_t *ctx, ngx_connection_t *c);
 ngx_int_t xrootd_handle_query(xrootd_ctx_t *ctx, ngx_connection_t *c,
     ngx_stream_xrootd_srv_conf_t *conf);
 
+/* ngx_xrootd_query.c — kXR_prepare staging/cache hint */
+ngx_int_t xrootd_handle_prepare(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    ngx_stream_xrootd_srv_conf_t *conf);
+
 /* manager map lookup helper (longest-prefix match) */
 const xrootd_manager_map_t *xrootd_find_manager_map(const char *reqpath,
     ngx_array_t *map);
@@ -447,6 +509,9 @@ ngx_int_t xrootd_send_error(xrootd_ctx_t *ctx, ngx_connection_t *c,
     uint16_t errcode, const char *msg);
 ngx_int_t xrootd_send_redirect(xrootd_ctx_t *ctx, ngx_connection_t *c,
     const char *host, uint16_t port);
+ngx_int_t xrootd_send_wait(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    uint32_t seconds);
+ngx_int_t xrootd_send_waitresp(xrootd_ctx_t *ctx, ngx_connection_t *c);
 ngx_int_t xrootd_send_pgwrite_status(xrootd_ctx_t *ctx,
     ngx_connection_t *c, int64_t write_offset);
 void xrootd_build_pgread_status(xrootd_ctx_t *ctx, int64_t file_offset,
@@ -491,6 +556,15 @@ void xrootd_make_stat_body(const struct stat *st, ngx_flag_t is_vfs,
 void xrootd_log_access(xrootd_ctx_t *ctx, ngx_connection_t *c,
     const char *verb, const char *path, const char *detail,
     ngx_uint_t xrd_ok, uint16_t errcode, const char *errmsg, size_t bytes);
+
+/* ngx_xrootd_upstream.c — outbound XRootD redirector client */
+ngx_int_t xrootd_upstream_start(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    ngx_stream_xrootd_srv_conf_t *conf);
+void xrootd_upstream_cleanup(xrootd_upstream_t *up);
+
+/* ngx_xrootd_cms_heartbeat.c — CMS manager heartbeat/registration */
+void ngx_xrootd_cms_start(ngx_cycle_t *cycle,
+    ngx_stream_xrootd_srv_conf_t *conf);
 
 /* ngx_xrootd_voms.c — runtime VOMS via dlopen(libvomsapi.so.1) */
 ngx_int_t  xrootd_voms_init(ngx_log_t *log);
@@ -575,11 +649,34 @@ typedef struct {
     char    err_msg[64];
 } xrootd_readv_aio_t;
 
+/*
+ * xrootd_pgread_aio_t — async kXR_pgread context.
+ *
+ * scratch layout: [0 .. rlen-1] = flat file data read by thread;
+ *                 [rlen .. rlen+out_size-1] = interleaved data+CRC written by thread.
+ * The completion callback builds the chain from scratch + rlen.
+ */
+typedef struct {
+    ngx_connection_t              *c;
+    xrootd_ctx_t                  *ctx;
+    int       fd;
+    int       handle_idx;
+    off_t     offset;
+    size_t    rlen;       /* requested bytes; flat portion size in scratch */
+    u_char   *scratch;    /* single alloc: flat data then interleaved output */
+    size_t    out_size;   /* interleaved bytes written (set by thread) */
+    u_char    streamid[2];
+    ssize_t   nread;      /* actual pread return (set by thread) */
+    int       io_errno;
+} xrootd_pgread_aio_t;
+
 void xrootd_aio_resume(ngx_connection_t *c);
 void xrootd_read_aio_done(ngx_event_t *ev);
 void xrootd_write_aio_done(ngx_event_t *ev);
 void xrootd_readv_aio_done(ngx_event_t *ev);
+void xrootd_pgread_aio_done(ngx_event_t *ev);
 void xrootd_read_aio_thread(void *data, ngx_log_t *log);
 void xrootd_write_aio_thread(void *data, ngx_log_t *log);
 void xrootd_readv_aio_thread(void *data, ngx_log_t *log);
+void xrootd_pgread_aio_thread(void *data, ngx_log_t *log);
 #endif

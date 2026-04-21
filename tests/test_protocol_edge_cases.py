@@ -24,15 +24,32 @@ import time
 import pytest
 from XRootD import client
 from XRootD.client.flags import OpenFlags, QueryCode
+from backend_matrix import root_endpoint_parts, selected_backend_name
+from settings import DATA_ROOT as DEFAULT_DATA_ROOT
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-ANON_URL  = "root://localhost:11094"
+CROSS_BACKEND = selected_backend_name()
+ANON_URL  = ""
 ANON_HOST = "127.0.0.1"
-ANON_PORT = 11094
-DATA_DIR  = "/tmp/xrd-test/data"
+ANON_PORT = 0
+DATA_DIR  = DEFAULT_DATA_ROOT
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _configure(test_env, ref_xrootd):
+    """Bind module constants from the selected shared test environment."""
+    global ANON_URL, ANON_HOST, ANON_PORT, DATA_DIR
+    if CROSS_BACKEND == "xrootd":
+        ANON_URL = ref_xrootd["url"]
+        DATA_DIR = ref_xrootd["data_dir"]
+    else:
+        ANON_URL = test_env["anon_url"]
+        DATA_DIR = test_env["data_dir"]
+    ANON_HOST, ANON_PORT = root_endpoint_parts(ANON_URL)
+
 
 # Request opcodes
 kXR_query     = 3001

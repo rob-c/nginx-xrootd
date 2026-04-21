@@ -845,6 +845,9 @@ ngx_http_xrootd_webdav_merge_loc_conf(ngx_conf_t *cf,
                 return NGX_CONF_ERROR;
             }
 
+            /* Run a lightweight PKI/CRL consistency check and emit log messages */
+            (void) webdav_check_pki_consistency(cf->log, conf);
+
             cln = ngx_pool_cleanup_add(cf->pool, 0);
             if (cln == NULL) {
                 X509_STORE_free(store);

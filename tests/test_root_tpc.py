@@ -21,13 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-
-
-NGINX_BIN = "/tmp/nginx-1.28.3/objs/nginx"
-XROOTD_BIN = "xrootd"
-XRDFS_BIN = "xrdfs"
-XRDCP_BIN = "xrdcp"
-
+from settings import NGINX_BIN, XRDCP_BIN, XRDFS_BIN, XROOTD_BIN
 
 @dataclass(frozen=True)
 class NginxRoot:
@@ -131,7 +125,7 @@ def _reports_tpc_disabled(result) -> bool:
     return False
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session", autouse=True)
 def nginx_root(tmp_path_factory):
     if not os.path.exists(NGINX_BIN):
         pytest.skip(f"nginx binary not found at {NGINX_BIN}")
@@ -141,61 +135,23 @@ def nginx_root(tmp_path_factory):
         pytest.skip("xrdcp not found")
 
     workdir = tmp_path_factory.mktemp("root-tpc-nginx")
-    conf_dir = workdir / "conf"
-    log_dir = workdir / "logs"
     data_root = workdir / "data"
-    for directory in (conf_dir, log_dir, data_root):
-        directory.mkdir(parents=True, exist_ok=True)
+    data_root.mkdir(parents=True, exist_ok=True)
 
     port = _free_port()
     url = f"root://localhost:{port}"
-    conf_path = conf_dir / "nginx.conf"
-    conf_path.write_text(
-        f"""\
-daemon off;
-worker_processes 1;
-error_log {log_dir}/error.log debug;
-pid       {log_dir}/nginx.pid;
 
-thread_pool default threads=4 max_queue=65536;
-events {{ worker_connections 64; }}
-
-stream {{
-    server {{
-        listen {port};
-        xrootd on;
-        xrootd_root {data_root};
-        xrootd_auth none;
-        xrootd_allow_write on;
-        xrootd_access_log {log_dir}/xrootd_access.log;
-    }}
-}}
-"""
+    import server_control
+    info = server_control.start_nginx_instance(
+        port=port, nginx_bin=NGINX_BIN,
+        conf_file="nginx_root_tpc.conf",
+        template_kwargs={"DATA_DIR": str(data_root)},
     )
-
-    test_result = subprocess.run(
-        [NGINX_BIN, "-p", str(workdir), "-c", str(conf_path), "-t"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=10,
-    )
-    assert test_result.returncode == 0, test_result.stderr.decode(errors="replace")
-
-    stderr_path = log_dir / "stderr.log"
-    stderr_fh = open(stderr_path, "wb")
-    proc = subprocess.Popen(
-        [NGINX_BIN, "-p", str(workdir), "-c", str(conf_path)],
-        stdout=subprocess.DEVNULL,
-        stderr=stderr_fh,
-    )
-    stderr_fh.close()
 
     try:
         ready = False
         last_result = None
         for _ in range(30):
-            if proc.poll() is not None:
-                break
             try:
                 result = _query_tpc(url)
             except subprocess.TimeoutExpired:
@@ -208,8 +164,7 @@ stream {{
             time.sleep(0.5)
 
         if not ready:
-            proc.terminate()
-            proc.wait(timeout=5)
+            info["stop"]()
             stdout = ""
             stderr = ""
             if last_result is not None:
@@ -219,20 +174,17 @@ stream {{
                 f"nginx root:// fixture did not start on port {port}.\n"
                 f"xrdfs stdout: {stdout}\n"
                 f"xrdfs stderr: {stderr}\n"
-                f"nginx stderr: {stderr_path.read_text(errors='replace')}"
             )
 
         yield NginxRoot(workdir=workdir, data_root=data_root, url=url)
     finally:
-        proc.terminate()
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            info["stop"]()
+        except Exception:
+            pass
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session", autouse=True)
 def reference_root_tpc(tmp_path_factory):
     if shutil.which(XROOTD_BIN) is None:
         pytest.skip("xrootd binary not found")
@@ -251,18 +203,18 @@ def reference_root_tpc(tmp_path_factory):
     url = f"root://localhost:{port}"
     cfg_path = workdir / "xrootd-tpc.cfg"
     log_path = workdir / "xrootd-tpc.log"
+    import server_control
     cfg_path.write_text(
-        f"""\
-all.role server
-all.export /
-oss.localroot {data_root}
-all.adminpath {admin_dir}
-all.pidpath {run_dir}
-
-xrd.port {port}
-xrd.trace off
-ofs.tpc streams 4 pgm {xrdcp} --server
-"""
+        server_control.render_config_file(
+            "xrootd_root_tpc.conf",
+            {
+                "DATA_DIR": str(data_root),
+                "ADMIN_DIR": str(admin_dir),
+                "RUN_DIR": str(run_dir),
+                "PORT": str(port),
+                "XRDCP_BIN": xrdcp,
+            },
+        )
     )
 
     proc = subprocess.Popen(

@@ -53,13 +53,24 @@ import threading
 import time
 
 import pytest
+from settings import DATA_ROOT as DEFAULT_DATA_ROOT
 
 # ---------------------------------------------------------------------------
 # Target
 # ---------------------------------------------------------------------------
 
 ANON_HOST = "localhost"
-ANON_PORT = 11094         # nginx-xrootd anonymous endpoint
+ANON_PORT = 0             # nginx-xrootd anonymous endpoint
+DATA_DIR  = DEFAULT_DATA_ROOT
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _configure(test_env):
+    """Bind module constants from the shared test environment."""
+    global ANON_HOST, ANON_PORT, DATA_DIR
+    ANON_HOST = "127.0.0.1"
+    ANON_PORT = test_env["anon_port"]
+    DATA_DIR  = test_env["data_dir"]
 
 # ---------------------------------------------------------------------------
 # XRootD protocol constants
@@ -202,7 +213,11 @@ RECV_TIMEOUT = 5.0
 CONN_TIMEOUT = 3.0
 
 
-def _connect(host: str = ANON_HOST, port: int = ANON_PORT) -> socket.socket:
+def _connect(host: str = None, port: int = None) -> socket.socket:
+    if host is None:
+        host = ANON_HOST
+    if port is None:
+        port = ANON_PORT
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(CONN_TIMEOUT)
     s.connect((host, port))
@@ -254,7 +269,11 @@ def _errcode(body: bytes) -> int:
 # Health check — confirm server still serves legitimate requests
 # ---------------------------------------------------------------------------
 
-def server_healthy(host: str = ANON_HOST, port: int = ANON_PORT) -> bool:
+def server_healthy(host: str = None, port: int = None) -> bool:
+    if host is None:
+        host = ANON_HOST
+    if port is None:
+        port = ANON_PORT
     """
     Connect, complete handshake + login + ping.
     Returns True if every step returns kXR_ok within short timeouts.
@@ -279,8 +298,12 @@ def server_healthy(host: str = ANON_HOST, port: int = ANON_PORT) -> bool:
         return False
 
 
-def assert_healthy(host: str = ANON_HOST, port: int = ANON_PORT, retries: int = 3):
+def assert_healthy(host: str = None, port: int = None, retries: int = 3):
     """Verify the server is healthy, retrying briefly to allow recovery."""
+    if host is None:
+        host = ANON_HOST
+    if port is None:
+        port = ANON_PORT
     for _ in range(retries):
         if server_healthy(host, port):
             return
@@ -296,12 +319,11 @@ def assert_healthy(host: str = ANON_HOST, port: int = ANON_PORT, retries: int = 
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module", autouse=True)
-def require_server():
-    """Skip the entire module if the target server is not reachable."""
+def require_server(test_env):
+    """Ensure the target server is reachable (started via test_env)."""
     if not server_healthy():
         pytest.skip(
-            f"No XRootD server reachable at {ANON_HOST}:{ANON_PORT}. "
-            "Start nginx-xrootd before running robustness tests."
+            f"No XRootD server reachable at {ANON_HOST}:{ANON_PORT}."
         )
 
 
@@ -816,7 +838,7 @@ class TestResourceExhaustion:
     def test_open_16_handles_and_close_cleanly(self):
         """Open 16 file handles and close each one in sequence."""
         assert_healthy(retries=6)
-        test_path = "/tmp/xrd-test/data/robustness_handles.bin"
+        test_path = os.path.join(DATA_DIR, "robustness_handles.bin")
         with open(test_path, "wb") as f:
             f.write(b'x' * 1024)
         s = _connect()
@@ -851,7 +873,7 @@ class TestResourceExhaustion:
     def test_open_beyond_handle_limit_returns_error(self):
         """Opening more than 16 files must return an error, not crash."""
         assert_healthy(retries=6)
-        test_path = "/tmp/xrd-test/data/robustness_overlimit.bin"
+        test_path = os.path.join(DATA_DIR, "robustness_overlimit.bin")
         with open(test_path, "wb") as f:
             f.write(b'y' * 1024)
         s = _connect()
@@ -893,7 +915,7 @@ class TestStateMachineAttacks:
         Open a file, read from it, close it, then re-read with the same handle.
         The second read must fail.
         """
-        test_path = "/tmp/xrd-test/data/robustness_reuse.bin"
+        test_path = os.path.join(DATA_DIR, "robustness_reuse.bin")
         with open(test_path, "wb") as f:
             f.write(b"REUSE TEST DATA " * 64)   # 1024 bytes
 
@@ -940,7 +962,7 @@ class TestStateMachineAttacks:
         path-based ops (stat, dirlist) may still work on the same socket; that
         is implementation-defined behaviour, not a bug.
         """
-        test_path = "/tmp/xrd-test/data/robustness_endsess.bin"
+        test_path = os.path.join(DATA_DIR, "robustness_endsess.bin")
         with open(test_path, "wb") as f:
             f.write(b'ENDSESS DATA ' * 80)
 
@@ -1105,7 +1127,7 @@ class TestConcurrencySafety:
         8 ping threads + 8 stat threads simultaneously.
         No cross-connection response corruption should occur.
         """
-        test_path = "/tmp/xrd-test/data/robustness_concurrent.bin"
+        test_path = os.path.join(DATA_DIR, "robustness_concurrent.bin")
         with open(test_path, "wb") as f:
             f.write(b'z' * 512)
 

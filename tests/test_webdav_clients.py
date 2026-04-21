@@ -11,136 +11,31 @@ skipped.
 
 import os
 import shutil
-import socket
 import subprocess
 import tempfile
 import time
 
 import pytest
 import requests
+from settings import CA_CERT, CA_DIR, DATA_ROOT as DEFAULT_DATA_ROOT, PROXY_STD, XRDCP_BIN
 
-NGINX_BIN = "/tmp/nginx-1.28.3/objs/nginx"
-WORKDIR = "/tmp/xrd-webdav-client-test"
+PROXY_PEM = PROXY_STD
 
-PKI_DIR = "/tmp/xrd-test/pki"
-CA_CERT = os.path.join(PKI_DIR, "ca", "ca.pem")
-PROXY_PEM = os.path.join(PKI_DIR, "user", "proxy_std.pem")
-SERVER_CERT = os.path.join(PKI_DIR, "server", "hostcert.pem")
-SERVER_KEY = os.path.join(PKI_DIR, "server", "hostkey.pem")
-
-
-def _free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+# Filled at module scope by _configure
+WEBDAV_PORT = 0
+WEBDAV_URL = ""
+DATA_DIR = DEFAULT_DATA_ROOT
+LOG_DIR = ""
 
 
-def _wait_for_port(host, port, proc, timeout=5):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            return False
-        try:
-            with socket.create_connection((host, port), timeout=0.2):
-                return True
-        except OSError:
-            time.sleep(0.1)
-    return False
-
-
-@pytest.fixture(scope="module")
-def webdav_nginx():
-    if not os.path.exists(NGINX_BIN):
-        pytest.skip(f"nginx binary not found at {NGINX_BIN}")
-
-    for path in (CA_CERT, PROXY_PEM, SERVER_CERT, SERVER_KEY):
-        if not os.path.exists(path):
-            pytest.skip(f"required PKI file not found: {path}")
-
-    shutil.rmtree(WORKDIR, ignore_errors=True)
-    conf_dir = os.path.join(WORKDIR, "conf")
-    log_dir = os.path.join(WORKDIR, "logs")
-    data_dir = os.path.join(WORKDIR, "data")
-    tmp_dir = os.path.join(WORKDIR, "tmp")
-    os.makedirs(conf_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(data_dir, exist_ok=True)
-    os.makedirs(tmp_dir, exist_ok=True)
-
-    port = _free_port()
-    conf_path = os.path.join(conf_dir, "nginx.conf")
-
-    # WebDAV server: require client cert for auth and allow writes
-    with open(conf_path, "w", encoding="utf-8") as fh:
-        fh.write(f"""\
-daemon off;
-worker_processes 1;
-error_log {log_dir}/error.log info;
-pid       {log_dir}/nginx.pid;
-
-events {{ worker_connections 128; }}
-
-http {{
-    access_log off;
-    client_max_body_size 64m;
-    client_body_buffer_size 4k;
-    client_body_in_file_only clean;
-    client_body_temp_path {tmp_dir};
-    proxy_temp_path       {tmp_dir};
-    fastcgi_temp_path     {tmp_dir};
-    uwsgi_temp_path       {tmp_dir};
-    scgi_temp_path        {tmp_dir};
-    server {{
-        listen 127.0.0.1:{port} ssl;
-        server_name localhost;
-
-        ssl_certificate     {SERVER_CERT};
-        ssl_certificate_key {SERVER_KEY};
-        ssl_verify_client   optional_no_ca;
-        ssl_verify_depth    10;
-
-                xrootd_webdav_proxy_certs on;
-
-            location / {{
-                xrootd_webdav on;
-                xrootd_webdav_root    {data_dir};
-                xrootd_webdav_cafile  {CA_CERT};
-                xrootd_webdav_auth    required;
-                xrootd_webdav_allow_write on;
-            }}
-    }}
-}}
-""")
-
-    stderr_path = os.path.join(log_dir, "stderr.log")
-    stderr_fh = open(stderr_path, "w")
-    proc = subprocess.Popen(
-        [NGINX_BIN, "-c", conf_path],
-        stdout=subprocess.DEVNULL,
-        stderr=stderr_fh,
-    )
-    stderr_fh.close()
-
-    if not _wait_for_port("127.0.0.1", port, proc):
-        proc.terminate()
-        proc.wait(timeout=5)
-        with open(stderr_path, encoding="utf-8", errors="replace") as fh:
-            stderr = fh.read()
-        pytest.fail(f"webdav nginx did not start\nstderr:\n{stderr}")
-
-    yield {
-        "proc": proc,
-        "port": port,
-        "data_dir": data_dir,
-        "url_base": f"https://localhost:{port}",
-        "log_dir": log_dir,
-    }
-
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+@pytest.fixture(scope="module", autouse=True)
+def _configure(test_env):
+    """Bind module constants from the shared test environment."""
+    global WEBDAV_PORT, WEBDAV_URL, DATA_DIR, LOG_DIR
+    WEBDAV_PORT = test_env["webdav_port"]
+    WEBDAV_URL  = test_env["webdav_url"]
+    DATA_DIR    = test_env["data_dir"]
+    LOG_DIR     = test_env["log_dir"]
 
 
 def _write_temp_file(contents: bytes):
@@ -155,17 +50,12 @@ def _run(cmd, env=None):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
 
 
-def test_xrdcp_upload_and_download(webdav_nginx):
-    if shutil.which("xrdcp") is None:
-        pytest.skip("xrdcp not found on PATH")
+def test_xrdcp_upload_and_download():
+    if shutil.which(XRDCP_BIN) is None:
+        pytest.skip(f"{XRDCP_BIN} not found on PATH")
 
-    # Do not probe for HTTP plugin presence; attempt the real upload.
-    # If xrdcp cannot talk HTTP(s) this will fail and should be addressed
-    # in the environment where tests run.
-
-    info = webdav_nginx
-    port = info["port"]
-    url_base = info["url_base"]
+    port = WEBDAV_PORT
+    url_base = WEBDAV_URL
 
     content = b"hello-xrdcp-" + os.urandom(1024)
     local = _write_temp_file(content)
@@ -174,16 +64,16 @@ def test_xrdcp_upload_and_download(webdav_nginx):
 
     env = os.environ.copy()
     env["X509_USER_PROXY"] = PROXY_PEM
-    env["X509_CERT_DIR"] = os.path.join(PKI_DIR, "ca")
+    env["X509_CERT_DIR"] = CA_DIR
 
     # Upload with xrdcp using HTTP (davs)
-    r = _run(["xrdcp", "--allow-http", "--verbose", local, remote_url], env=env)
+    r = _run([XRDCP_BIN, "--allow-http", "--verbose", local, remote_url], env=env)
     assert r.returncode == 0, (r.returncode, r.stderr.decode())
 
     # Wait for nginx to register the upload request in the error log. This
     # avoids races where the client returned but the server hasn't finished
     # processing the request or writing the file to disk.
-    log_path = os.path.join(info["log_dir"], "error.log")
+    log_path = os.path.join(LOG_DIR, "error.log")
     seen = False
     deadline = time.time() + 8
     while time.time() < deadline:
@@ -204,7 +94,7 @@ def test_xrdcp_upload_and_download(webdav_nginx):
         assert seed.returncode == 0, (seed.returncode, seed.stderr.decode(errors="replace"))
 
         out_local = local + ".from_xrdcp"
-        r2 = _run(["xrdcp", "--allow-http", "--verbose", f"davs://localhost:{port}//{remote_name}", out_local], env=env)
+        r2 = _run([XRDCP_BIN, "--allow-http", "--verbose", f"davs://localhost:{port}//{remote_name}", out_local], env=env)
         if r2.returncode != 0:
             # Collect diagnostics for debugging failures
             log_tail = ""
@@ -242,19 +132,18 @@ def test_xrdcp_upload_and_download(webdav_nginx):
 
     # Now download with xrdcp back to a different local path
     out_local = local + ".out"
-    r2 = _run(["xrdcp", "--allow-http", remote_url, out_local], env=env)
+    r2 = _run([XRDCP_BIN, "--allow-http", remote_url, out_local], env=env)
     assert r2.returncode == 0, (r2.returncode, r2.stderr.decode())
     with open(out_local, "rb") as fh:
         assert fh.read() == content
 
 
-def test_curl_upload_and_download(webdav_nginx):
+def test_curl_upload_and_download():
     if shutil.which("curl") is None:
         pytest.skip("curl not found on PATH")
 
-    info = webdav_nginx
-    port = info["port"]
-    url_base = info["url_base"]
+    port = WEBDAV_PORT
+    url_base = WEBDAV_URL
 
     content = b"hello-curl-" + os.urandom(512)
     local = _write_temp_file(content)
@@ -271,13 +160,12 @@ def test_curl_upload_and_download(webdav_nginx):
     assert r2.stdout == content
 
 
-def test_xrdcp_large_upload_and_download(webdav_nginx):
-    if shutil.which("xrdcp") is None:
-        pytest.skip("xrdcp not found on PATH")
+def test_xrdcp_large_upload_and_download():
+    if shutil.which(XRDCP_BIN) is None:
+        pytest.skip(f"{XRDCP_BIN} not found on PATH")
 
-    info = webdav_nginx
-    port = info["port"]
-    url_base = info["url_base"]
+    port = WEBDAV_PORT
+    url_base = WEBDAV_URL
 
     content = os.urandom((2 * 1024 * 1024) + 137)
     local = _write_temp_file(content)
@@ -286,13 +174,13 @@ def test_xrdcp_large_upload_and_download(webdav_nginx):
 
     env = os.environ.copy()
     env["X509_USER_PROXY"] = PROXY_PEM
-    env["X509_CERT_DIR"] = os.path.join(PKI_DIR, "ca")
+    env["X509_CERT_DIR"] = CA_DIR
 
-    r = _run(["xrdcp", "--allow-http", "--verbose", local, remote_url], env=env)
+    r = _run([XRDCP_BIN, "--allow-http", "--verbose", local, remote_url], env=env)
     assert r.returncode == 0, (r.returncode, r.stderr.decode(errors="replace"))
 
     # Wait for nginx to log the upload
-    log_path = os.path.join(info["log_dir"], "error.log")
+    log_path = os.path.join(LOG_DIR, "error.log")
     seen = False
     deadline = time.time() + 15
     while time.time() < deadline:
@@ -312,7 +200,7 @@ def test_xrdcp_large_upload_and_download(webdav_nginx):
         assert seed.returncode == 0, (seed.returncode, seed.stderr.decode(errors="replace"))
 
         out_local = local + ".from_xrdcp"
-        r2 = _run(["xrdcp", "--allow-http", "--verbose", f"davs://localhost:{port}//{remote_name}", out_local], env=env)
+        r2 = _run([XRDCP_BIN, "--allow-http", "--verbose", f"davs://localhost:{port}//{remote_name}", out_local], env=env)
         assert r2.returncode == 0, (r2.returncode, r2.stderr.decode(errors="replace"))
         with open(out_local, "rb") as fh:
             assert fh.read() == content
@@ -334,13 +222,12 @@ def test_xrdcp_large_upload_and_download(webdav_nginx):
     assert resp.content == content
 
 
-def test_curl_large_upload_and_download(webdav_nginx):
+def test_curl_large_upload_and_download():
     if shutil.which("curl") is None:
         pytest.skip("curl not found on PATH")
 
-    info = webdav_nginx
-    port = info["port"]
-    url_base = info["url_base"]
+    port = WEBDAV_PORT
+    url_base = WEBDAV_URL
 
     content = os.urandom((2 * 1024 * 1024) + 137)
     local = _write_temp_file(content)
@@ -352,7 +239,7 @@ def test_curl_large_upload_and_download(webdav_nginx):
     assert r.returncode == 0, (r.returncode, r.stderr.decode(errors="replace"))
 
     # Wait for nginx to log the upload
-    log_path = os.path.join(info["log_dir"], "error.log")
+    log_path = os.path.join(LOG_DIR, "error.log")
     seen = False
     deadline = time.time() + 15
     while time.time() < deadline:

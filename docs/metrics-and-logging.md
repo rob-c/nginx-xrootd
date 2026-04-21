@@ -100,7 +100,7 @@ xrootd_requests_total{port="1094",auth="anon",op="close",status="ok"} 8314
 xrootd_requests_total{port="1094",auth="anon",op="open_rd",status="error"} 12
 ```
 
-Operations tracked (`op` label values): `login`, `auth`, `stat`, `open_rd`, `open_wr`, `read`, `write`, `sync`, `close`, `dirlist`, `mkdir`, `rmdir`, `rm`, `mv`, `chmod`, `truncate`, `ping`, `query_cksum`, `query_space`, `readv`
+Operations tracked (`op` label values): `login`, `auth`, `stat`, `open_rd`, `open_wr`, `read`, `write`, `sync`, `close`, `dirlist`, `mkdir`, `rmdir`, `rm`, `mv`, `chmod`, `truncate`, `ping`, `query_cksum`, `query_space`, `readv`, `pgread`, `writev`, `locate`, `statx`, `fattr`, `query_stats`, `query_xattr`, `query_finfo`, `query_fsinfo`
 
 Error series (`status="error"`) are omitted from the output when the count is zero — this keeps the scrape output short when errors are rare.
 
@@ -190,8 +190,14 @@ Before any client-controlled text is written, the logger escapes whitespace, con
 | `MV` | File renamed | `-` |
 | `CHMOD` | Permissions changed | `-` |
 | `PING` | Liveness check | `-` |
-| `QUERY` | Checksum, space, or config query | `cksum`, `space`, or query-specific detail |
+| `QUERY` | Checksum, space, stats, xattr, finfo, fsinfo, or config query | `cksum`, `space`, `stats`, `xattr`, `finfo`, `fsinfo`, `config` |
 | `READV` | Vector read | Segment count, e.g. `3_segs` |
+| `PGREAD` | Paged read (`kXR_pgread`) | `offset+length` |
+| `WRITEV` | Vector write (`kXR_writev`) | Segment count, e.g. `3_segs` |
+| `LOCATE` | File replica location query | `-` |
+| `STATX` | Bulk multi-path stat | Path count, e.g. `2_paths` |
+| `FATTR` | File extended attribute operation | `get`, `set`, `del`, or `list` |
+| `SIGVER` | Request signature verification | `-` |
 | `DISCONNECT` | Connection closed | Session summary: `rx=N.NNMiB/s tx=N.NNMiB/s` |
 
 ### Example log lines

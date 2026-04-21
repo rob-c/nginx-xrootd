@@ -19,12 +19,14 @@ import socket
 import pytest
 from XRootD import client
 from XRootD.client.flags import OpenFlags, StatInfoFlags
+from settings import CA_DIR as DEFAULT_CA_DIR, DATA_ROOT as DEFAULT_DATA_ROOT, PROXY_STD
 
-ANON_URL  = "root://localhost:11094"
-GSI_URL   = "root://localhost:11095"
-CA_DIR    = "/tmp/xrd-test/pki/ca"
-PROXY_PEM = "/tmp/xrd-test/pki/user/proxy_std.pem"
-DATA_ROOT = "/tmp/xrd-test/data"
+ANON_URL  = ""
+ANON_PORT = 11094
+GSI_URL   = ""
+CA_DIR    = DEFAULT_CA_DIR
+PROXY_PEM = PROXY_STD
+DATA_ROOT = DEFAULT_DATA_ROOT
 
 PATTERN   = bytes(i & 0xFF for i in range(65536))     # 64 KiB
 LARGE     = bytes((i * 7 + 13) & 0xFF for i in range(512 * 1024))  # 512 KiB
@@ -35,7 +37,15 @@ LARGE     = bytes((i * 7 + 13) & 0xFF for i in range(512 * 1024))  # 512 KiB
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module", autouse=True)
-def gsi_env():
+def _configure(test_env):
+    """Bind module constants and set GSI env vars from the shared test environment."""
+    global ANON_URL, ANON_PORT, GSI_URL, CA_DIR, PROXY_PEM, DATA_ROOT
+    ANON_URL  = test_env["anon_url"]
+    ANON_PORT = test_env["anon_port"]
+    GSI_URL   = test_env["gsi_url"]
+    CA_DIR    = test_env["ca_dir"]
+    PROXY_PEM = test_env["proxy_pem"]
+    DATA_ROOT = test_env["data_dir"]
     os.environ["X509_CERT_DIR"]  = CA_DIR
     os.environ["X509_USER_PROXY"] = PROXY_PEM
 
@@ -281,10 +291,9 @@ class TestLocate:
 
     def test_locate_access_type_read_only_server(self):
         """locate on a read-only server returns a non-write-only accesstype."""
-        # Port 11094 is anonymous (no write enabled in test config).
         upload(ANON_URL, "locate_access.bin", b"access check")
 
-        fs = client.FileSystem("root://localhost:11094")
+        fs = client.FileSystem(ANON_URL)
         status, locations = fs.locate("/locate_access.bin", OpenFlags.NONE)
 
         assert status.ok, f"locate failed: {status.message}"
@@ -351,7 +360,7 @@ class TestSigver:
 
     def test_sigver_accepted_returns_ok(self):
         """A kXR_sigver packet followed by kXR_ping is accepted on the wire."""
-        sock = self._xrd_connect_and_login("localhost", 11094)
+        sock = self._xrd_connect_and_login("localhost", ANON_PORT)
 
         try:
             # kXR_sigver (3029): 24-byte header + signature payload
@@ -384,7 +393,7 @@ class TestSigver:
 
     def test_sigver_session_continues_after_accept(self):
         """After sigver is accepted the session remains fully functional."""
-        sock = self._xrd_connect_and_login("localhost", 11094)
+        sock = self._xrd_connect_and_login("localhost", ANON_PORT)
 
         try:
             # Send sigver
@@ -483,7 +492,7 @@ class TestStatx:
         # Upload a known file
         upload(ANON_URL, "statx_single.bin", b"x" * 1234)
 
-        status, body = self._send_statx("localhost", 11094, ["/statx_single.bin"])
+        status, body = self._send_statx("localhost", ANON_PORT, ["/statx_single.bin"])
 
         assert status == 0, f"statx returned error status {status}"
         # Body is NUL-terminated ASCII; split on whitespace
@@ -498,7 +507,7 @@ class TestStatx:
         for i in range(3):
             upload(ANON_URL, f"statx_multi_{i}.bin", b"y" * (100 * (i + 1)))
 
-        status, body = self._send_statx("localhost", 11094,
+        status, body = self._send_statx("localhost", ANON_PORT,
                                         [f"/statx_multi_{i}.bin" for i in range(3)])
 
         assert status == 0
@@ -513,7 +522,7 @@ class TestStatx:
 
     def test_statx_missing_path_returns_sentinel(self):
         """statx for a non-existent path returns the error sentinel '0 0 0 0'."""
-        status, body = self._send_statx("localhost", 11094,
+        status, body = self._send_statx("localhost", ANON_PORT,
                                         ["/no_such_file_statx.bin"])
 
         assert status == 0, f"statx returned error status {status}"
@@ -524,7 +533,7 @@ class TestStatx:
         """statx with a mix of existing and missing paths handles both correctly."""
         upload(ANON_URL, "statx_mixed_ok.bin", b"z" * 500)
 
-        status, body = self._send_statx("localhost", 11094,
+        status, body = self._send_statx("localhost", ANON_PORT,
                                         ["/statx_mixed_ok.bin",
                                          "/no_such_statx_xyz.bin"])
 
@@ -542,7 +551,7 @@ class TestStatx:
 
     def test_statx_directory(self):
         """statx returns directory flag for a directory path."""
-        status, body = self._send_statx("localhost", 11094, ["/"])
+        status, body = self._send_statx("localhost", ANON_PORT, ["/"])
 
         assert status == 0
         text  = body.rstrip(b"\x00\n").decode().strip()

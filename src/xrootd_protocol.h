@@ -199,6 +199,7 @@ typedef int64_t   kXR_int64;
 
 #define kXR_secreqs     0x01u   /* client wants security-protocol list */
 #define kXR_ableTLS     0x02u   /* client can upgrade to in-protocol TLS */
+#define kXR_wantTLS     0x04u   /* client requires TLS (must upgrade) */
 
 /* ------------------------------------------------------------------ */
 /* Protocol response flags (server capability bits)                    */
@@ -225,6 +226,19 @@ typedef int64_t   kXR_int64;
 /* Dirlist options */
 #define kXR_dstat       0x02   /* include per-entry stat info; see note below */
 #define kXR_online      0x01   /* only online entries */
+
+/* Prepare request options */
+#define kXR_cancel      0x01   /* cancel a prepare request */
+#define kXR_notify      0x02   /* notify client when prepare finishes */
+#define kXR_noerrs      0x04   /* suppress per-path missing-file failures */
+#define kXR_stage       0x08   /* stage files to online storage */
+#define kXR_wmode       0x10   /* prepare for write access */
+#define kXR_coloc       0x20   /* request colocated replicas */
+#define kXR_fresh       0x40   /* require fresh cached copy */
+#define kXR_usetcp      0x80   /* notification port uses TCP */
+
+/* Prepare extended options (optionX field) */
+#define kXR_evict       0x0001 /* evict cached data when supported */
 
 /*
  * kXR_dstat wire format note:
@@ -411,6 +425,21 @@ typedef struct {
     kXR_char   cptype[4];    /* compression type (e.g. "adl\0") */
     /* if kXR_retstat set: ASCII stat string follows */
 } ServerOpenBody;            /* 12 bytes minimum */
+
+/* ------------------------------------------------------------------ */
+/* kXR_prepare (3021)                                                  */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    kXR_char   streamid[2];
+    kXR_unt16  requestid;    /* kXR_prepare */
+    kXR_char   options;      /* kXR_stage, kXR_cancel, kXR_notify, ... */
+    kXR_char   prty;         /* request priority */
+    kXR_unt16  port;         /* notification port when kXR_notify is set */
+    kXR_unt16  optionX;      /* extended prepare flags, e.g. kXR_evict */
+    kXR_char   reserved[10];
+    kXR_int32  dlen;         /* newline-separated paths or cancel token */
+} ClientPrepareRequest;      /* 24 bytes */
 
 /* ------------------------------------------------------------------ */
 /* kXR_read (3013)                                                      */

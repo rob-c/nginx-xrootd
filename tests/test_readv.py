@@ -19,11 +19,12 @@ import os
 import pytest
 from XRootD import client
 from XRootD.client.flags import OpenFlags
+from settings import CA_DIR as DEFAULT_CA_DIR, PROXY_STD
 
-ANON_URL  = "root://localhost:11094"
-GSI_URL   = "root://localhost:11095"
-CA_DIR    = "/tmp/xrd-test/pki/ca"
-PROXY_PEM = "/tmp/xrd-test/pki/user/proxy_std.pem"
+ANON_URL  = ""
+GSI_URL   = ""
+CA_DIR    = DEFAULT_CA_DIR
+PROXY_PEM = PROXY_STD
 
 # Known data patterns ---------------------------------------------------------
 
@@ -66,6 +67,16 @@ def readv(f: client.File, chunks: list) -> list:
 
 
 # Fixtures --------------------------------------------------------------------
+
+@pytest.fixture(scope="module", autouse=True)
+def _configure(test_env):
+    """Bind module constants from the shared test environment."""
+    global ANON_URL, GSI_URL, CA_DIR, PROXY_PEM
+    ANON_URL  = test_env["anon_url"]
+    GSI_URL   = test_env["gsi_url"]
+    CA_DIR    = test_env["ca_dir"]
+    PROXY_PEM = test_env["proxy_pem"]
+
 
 @pytest.fixture(scope="module")
 def pattern_file():

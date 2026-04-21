@@ -19,7 +19,6 @@ Run:
 
 import datetime
 import os
-import signal
 import socket
 import subprocess
 import time
@@ -34,6 +33,7 @@ from cryptography.x509 import (
     CertificateRevocationListBuilder,
     RevokedCertificateBuilder,
 )
+from settings import CA_CERT, CA_KEY, DATA_ROOT, NGINX_BIN, PKI_DIR, PROXY_STD, USER_CERT
 
 # Suppress InsecureRequestWarning — test certs have no SAN
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -42,32 +42,32 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # Paths
 # ---------------------------------------------------------------------------
 
-NGINX_BIN  = "/tmp/nginx-1.28.3/objs/nginx"
-PKI_DIR    = "/tmp/xrd-test/pki"
-CA_CERT    = os.path.join(PKI_DIR, "ca", "ca.pem")
-CA_KEY     = os.path.join(PKI_DIR, "ca", "ca.key")
-USER_CERT  = os.path.join(PKI_DIR, "user", "usercert.pem")
-PROXY_PEM  = os.path.join(PKI_DIR, "user", "proxy_std.pem")
-DATA_ROOT  = "/tmp/xrd-test/data"
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+PROXY_PEM  = PROXY_STD
 
 CRL_DIR    = "/tmp/xrd-crl-test"
 CRL_PEM    = os.path.join(CRL_DIR, "crl.pem")
 
-CRL_PORT   = 11100
+CRL_PORT   = _free_port()
 CRL_HOST   = "127.0.0.1"
 
-WEBDAV_CRL_PORT = 8444
+WEBDAV_CRL_PORT = _free_port()
 
 # Directory-mode test paths
 CRL_DIR_TEST      = "/tmp/xrd-crl-dir-test"
 CRL_DIR_CRLS      = os.path.join(CRL_DIR_TEST, "crls")   # directory of CRLs
-CRL_DIR_PORT      = 11101
-WEBDAV_DIR_PORT   = 8445
+CRL_DIR_PORT      = _free_port()
+WEBDAV_DIR_PORT   = _free_port()
 
 # Reload-mode test paths
 CRL_RELOAD_DIR    = "/tmp/xrd-crl-reload-test"
 CRL_RELOAD_CRLS   = os.path.join(CRL_RELOAD_DIR, "crls")
-CRL_RELOAD_PORT   = 11102
+CRL_RELOAD_PORT   = _free_port()
 RELOAD_INTERVAL   = 2  # seconds — keep short for testing
 
 # ---------------------------------------------------------------------------
@@ -128,119 +128,56 @@ def _wait_for_port(host, port, proc, timeout=5):
 # Fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def crl_file():
     """Generate a CRL revoking the test user certificate."""
     generate_crl(CA_CERT, CA_KEY, USER_CERT, CRL_PEM)
     return CRL_PEM
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session", autouse=True)
 def crl_nginx(crl_file):
     """Start an nginx with CRL checking enabled on a dedicated port."""
     if not os.path.exists(NGINX_BIN):
         pytest.skip(f"nginx binary not found at {NGINX_BIN}")
+    import server_control
 
-    conf_dir = os.path.join(CRL_DIR, "conf")
-    log_dir  = os.path.join(CRL_DIR, "logs")
-    tmp_dir  = os.path.join(CRL_DIR, "tmp")
-    os.makedirs(conf_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(tmp_dir, exist_ok=True)
-
-    conf_path = os.path.join(conf_dir, "nginx.conf")
-    with open(conf_path, "w") as fh:
-        fh.write(f"""\
-daemon off;
-worker_processes 1;
-error_log {log_dir}/error.log debug;
-pid       {log_dir}/nginx.pid;
-
-thread_pool default threads=4 max_queue=65536;
-events {{ worker_connections 64; }}
-
-stream {{
-    server {{
-        listen {CRL_PORT};
-        xrootd on;
-        xrootd_root {DATA_ROOT};
-        xrootd_auth gsi;
-        xrootd_allow_write on;
-        xrootd_certificate     {PKI_DIR}/server/hostcert.pem;
-        xrootd_certificate_key {PKI_DIR}/server/hostkey.pem;
-        xrootd_trusted_ca      {CA_CERT};
-        xrootd_crl             {crl_file};
-        xrootd_access_log {log_dir}/xrootd_access.log;
-    }}
-}}
-
-http {{
-    access_log            {log_dir}/http_access.log;
-    client_body_temp_path {tmp_dir};
-    proxy_temp_path       {tmp_dir};
-    fastcgi_temp_path     {tmp_dir};
-    uwsgi_temp_path       {tmp_dir};
-    scgi_temp_path        {tmp_dir};
-
-    server {{
-        listen {WEBDAV_CRL_PORT} ssl;
-        server_name localhost;
-
-        ssl_certificate     {PKI_DIR}/server/hostcert.pem;
-        ssl_certificate_key {PKI_DIR}/server/hostkey.pem;
-        ssl_verify_client   optional_no_ca;
-        ssl_verify_depth    10;
-
-        xrootd_webdav_proxy_certs on;
-
-        client_max_body_size 1g;
-
-        location / {{
-            xrootd_webdav         on;
-            xrootd_webdav_root    {DATA_ROOT};
-            xrootd_webdav_cafile  {CA_CERT};
-            xrootd_webdav_crl     {crl_file};
-            xrootd_webdav_auth    required;
-            xrootd_webdav_allow_write on;
-        }}
-    }}
-}}
-""")
-
-    stderr_path = os.path.join(log_dir, "stderr.log")
-    stderr_fh = open(stderr_path, "w")
-    proc = subprocess.Popen(
-        [NGINX_BIN, "-c", conf_path],
-        stdout=subprocess.DEVNULL,
-        stderr=stderr_fh,
+    info = server_control.start_nginx_instance(
+        port=CRL_PORT, nginx_bin=NGINX_BIN,
+        conf_file="nginx_crl.conf",
+        template_kwargs={
+            "DATA_DIR": DATA_ROOT,
+            "CRL_PATH": crl_file,
+            "WEBDAV_PORT": WEBDAV_CRL_PORT,
+        },
     )
-    stderr_fh.close()
 
-    ok_stream = _wait_for_port(CRL_HOST, CRL_PORT, proc)
-    ok_https  = _wait_for_port(CRL_HOST, WEBDAV_CRL_PORT, proc)
+    # Wait for the HTTPS port to become available as well
+    ok_https = False
+    for _ in range(30):
+        try:
+            with socket.create_connection(("127.0.0.1", WEBDAV_CRL_PORT), timeout=0.5):
+                ok_https = True
+                break
+        except Exception:
+            time.sleep(0.1)
 
-    if not ok_stream or not ok_https:
-        proc.terminate()
-        proc.wait(timeout=5)
-        with open(stderr_path) as f:
-            stderr_out = f.read()
-        pytest.fail(
-            f"CRL nginx did not start.\n"
-            f"stream={ok_stream} https={ok_https}\n"
-            f"stderr:\n{stderr_out}"
-        )
+    if not ok_https:
+        try:
+            info["stop"]()
+        except Exception:
+            pass
+        pytest.fail("CRL nginx did not start (HTTPS port not reachable)")
 
-    yield proc
+    yield info
 
-    proc.terminate()
     try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+        info["stop"]()
+    except Exception:
+        pass
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session", autouse=True)
 def crl_dir_nginx(crl_file):
     """Start nginx with xrootd_crl pointing at a *directory* of CRL files."""
     if not os.path.exists(NGINX_BIN):
@@ -252,106 +189,51 @@ def crl_dir_nginx(crl_file):
     import shutil
     shutil.copy2(crl_file, os.path.join(CRL_DIR_CRLS, "ca.r0"))
 
-    conf_dir = os.path.join(CRL_DIR_TEST, "conf")
-    log_dir  = os.path.join(CRL_DIR_TEST, "logs")
-    tmp_dir  = os.path.join(CRL_DIR_TEST, "tmp")
-    os.makedirs(conf_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(tmp_dir, exist_ok=True)
-
-    conf_path = os.path.join(conf_dir, "nginx.conf")
-    with open(conf_path, "w") as fh:
-        fh.write(f"""\
-daemon off;
-worker_processes 1;
-error_log {log_dir}/error.log debug;
-pid       {log_dir}/nginx.pid;
-
-thread_pool default threads=4 max_queue=65536;
-events {{ worker_connections 64; }}
-
-stream {{
-    server {{
-        listen {CRL_DIR_PORT};
-        xrootd on;
-        xrootd_root {DATA_ROOT};
-        xrootd_auth gsi;
-        xrootd_allow_write on;
-        xrootd_certificate     {PKI_DIR}/server/hostcert.pem;
-        xrootd_certificate_key {PKI_DIR}/server/hostkey.pem;
-        xrootd_trusted_ca      {CA_CERT};
-        xrootd_crl             {CRL_DIR_CRLS};
-        xrootd_access_log {log_dir}/xrootd_access.log;
-    }}
-}}
-
-http {{
-    access_log            {log_dir}/http_access.log;
-    client_body_temp_path {tmp_dir};
-    proxy_temp_path       {tmp_dir};
-    fastcgi_temp_path     {tmp_dir};
-    uwsgi_temp_path       {tmp_dir};
-    scgi_temp_path        {tmp_dir};
-
-    server {{
-        listen {WEBDAV_DIR_PORT} ssl;
-        server_name localhost;
-
-        ssl_certificate     {PKI_DIR}/server/hostcert.pem;
-        ssl_certificate_key {PKI_DIR}/server/hostkey.pem;
-        ssl_verify_client   optional_no_ca;
-        ssl_verify_depth    10;
-
-        xrootd_webdav_proxy_certs on;
-
-        client_max_body_size 1g;
-
-        location / {{
-            xrootd_webdav         on;
-            xrootd_webdav_root    {DATA_ROOT};
-            xrootd_webdav_cafile  {CA_CERT};
-            xrootd_webdav_crl     {CRL_DIR_CRLS};
-            xrootd_webdav_auth    required;
-            xrootd_webdav_allow_write on;
-        }}
-    }}
-}}
-""")
-
-    stderr_path = os.path.join(log_dir, "stderr.log")
-    stderr_fh = open(stderr_path, "w")
-    proc = subprocess.Popen(
-        [NGINX_BIN, "-c", conf_path],
-        stdout=subprocess.DEVNULL,
-        stderr=stderr_fh,
+    import server_control
+    info = server_control.start_nginx_instance(
+        port=CRL_DIR_PORT, nginx_bin=NGINX_BIN,
+        conf_file="nginx_crl.conf",
+        template_kwargs={
+            "DATA_DIR": DATA_ROOT,
+            "CRL_PATH": CRL_DIR_CRLS,
+            "WEBDAV_PORT": WEBDAV_DIR_PORT,
+        },
     )
-    stderr_fh.close()
 
-    ok_stream = _wait_for_port(CRL_HOST, CRL_DIR_PORT, proc)
-    ok_https  = _wait_for_port(CRL_HOST, WEBDAV_DIR_PORT, proc)
+    # Wait for both stream and HTTPS to be reachable
+    ok_stream = False
+    ok_https = False
+    for _ in range(30):
+        try:
+            with socket.create_connection(("127.0.0.1", CRL_DIR_PORT), timeout=0.5):
+                ok_stream = True
+        except Exception:
+            ok_stream = False
+        try:
+            with socket.create_connection(("127.0.0.1", WEBDAV_DIR_PORT), timeout=0.5):
+                ok_https = True
+        except Exception:
+            ok_https = False
+        if ok_stream and ok_https:
+            break
+        time.sleep(0.1)
 
     if not ok_stream or not ok_https:
-        proc.terminate()
-        proc.wait(timeout=5)
-        with open(stderr_path) as f:
-            stderr_out = f.read()
-        pytest.fail(
-            f"CRL dir nginx did not start.\n"
-            f"stream={ok_stream} https={ok_https}\n"
-            f"stderr:\n{stderr_out}"
-        )
+        try:
+            info["stop"]()
+        except Exception:
+            pass
+        pytest.fail(f"CRL dir nginx did not start. stream={ok_stream} https={ok_https}")
 
-    yield proc
+    yield info
 
-    proc.terminate()
     try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+        info["stop"]()
+    except Exception:
+        pass
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session", autouse=True)
 def crl_reload_nginx(crl_file):
     """Start nginx with CRL reload enabled, initially with NO CRL in the dir.
 
@@ -367,85 +249,43 @@ def crl_reload_nginx(crl_file):
     for f in os.listdir(CRL_RELOAD_CRLS):
         os.remove(os.path.join(CRL_RELOAD_CRLS, f))
 
-    conf_dir = os.path.join(CRL_RELOAD_DIR, "conf")
-    log_dir  = os.path.join(CRL_RELOAD_DIR, "logs")
-    tmp_dir  = os.path.join(CRL_RELOAD_DIR, "tmp")
-    os.makedirs(conf_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(tmp_dir, exist_ok=True)
-
-    conf_path = os.path.join(conf_dir, "nginx.conf")
-    with open(conf_path, "w") as fh:
-        fh.write(f"""\
-daemon off;
-worker_processes 1;
-error_log {log_dir}/error.log debug;
-pid       {log_dir}/nginx.pid;
-
-thread_pool default threads=4 max_queue=65536;
-events {{ worker_connections 64; }}
-
-stream {{
-    server {{
-        listen {CRL_RELOAD_PORT};
-        xrootd on;
-        xrootd_root {DATA_ROOT};
-        xrootd_auth gsi;
-        xrootd_allow_write on;
-        xrootd_certificate     {PKI_DIR}/server/hostcert.pem;
-        xrootd_certificate_key {PKI_DIR}/server/hostkey.pem;
-        xrootd_trusted_ca      {CA_CERT};
-        xrootd_crl             {CRL_RELOAD_CRLS};
-        xrootd_crl_reload      {RELOAD_INTERVAL};
-        xrootd_access_log {log_dir}/xrootd_access.log;
-    }}
-}}
-
-http {{
-    access_log            {log_dir}/http_access.log;
-    client_body_temp_path {tmp_dir};
-    proxy_temp_path       {tmp_dir};
-    fastcgi_temp_path     {tmp_dir};
-    uwsgi_temp_path       {tmp_dir};
-    scgi_temp_path        {tmp_dir};
-
-    server {{
-        listen 127.0.0.1:18999 ssl;
-        server_name localhost;
-        ssl_certificate     {PKI_DIR}/server/hostcert.pem;
-        ssl_certificate_key {PKI_DIR}/server/hostkey.pem;
-    }}
-}}
-""")
-
-    stderr_path = os.path.join(log_dir, "stderr.log")
-    stderr_fh = open(stderr_path, "w")
-    proc = subprocess.Popen(
-        [NGINX_BIN, "-c", conf_path],
-        stdout=subprocess.DEVNULL,
-        stderr=stderr_fh,
+    import server_control
+    info = server_control.start_nginx_instance(
+        port=CRL_RELOAD_PORT, nginx_bin=NGINX_BIN,
+        conf_file="nginx_crl_reload.conf",
+        template_kwargs={
+            "DATA_DIR": DATA_ROOT,
+            "CRL_PATH": CRL_RELOAD_CRLS,
+            "CRL_RELOAD_INTERVAL": RELOAD_INTERVAL,
+            "HTTP_STUB_PORT": 18999,
+        },
     )
-    stderr_fh.close()
 
-    ok = _wait_for_port(CRL_HOST, CRL_RELOAD_PORT, proc)
+    ok = False
+    for _ in range(30):
+        try:
+            with socket.create_connection((CRL_HOST, CRL_RELOAD_PORT), timeout=0.5):
+                ok = True
+                break
+        except Exception:
+            time.sleep(0.1)
 
     if not ok:
-        proc.terminate()
-        proc.wait(timeout=5)
-        with open(stderr_path) as f:
-            stderr_out = f.read()
-        pytest.fail(
-            f"CRL reload nginx did not start.\nstderr:\n{stderr_out}"
-        )
+        try:
+            info["stop"]()
+        except Exception:
+            pass
+        pytest.fail("CRL reload nginx did not start.")
 
-    yield {"proc": proc, "crl_src": crl_file, "log_dir": log_dir}
-
-    proc.terminate()
+    yield {"proc": None, "crl_src": crl_file, "log_dir": info["prefix"] + "/logs"}
     try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+        info["stop"]()
+    except Exception:
+        pass
+    try:
+        info["stop"]()
+    except Exception:
+        pass
 
 
 # =========================================================================

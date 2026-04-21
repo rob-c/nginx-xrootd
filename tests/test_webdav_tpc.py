@@ -29,12 +29,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from settings import NGINX_BIN, PKI_DIR as PKI_DIR_STR, XROOTD_BIN
 
-
-NGINX_BIN = "/tmp/nginx-1.28.3/objs/nginx"
-XROOTD_BIN = "xrootd"
-
-PKI_DIR = Path("/tmp/xrd-test/pki")
+PKI_DIR = Path(PKI_DIR_STR)
 CA_DIR = PKI_DIR / "ca"
 CA_PEM = CA_DIR / "ca.pem"
 CLIENT_CERT = PKI_DIR / "user" / "usercert.pem"
@@ -174,16 +171,11 @@ def _xrd_library(*names):
     return None
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session", autouse=True)
 def tpc_nginx(tmp_path_factory):
     _require_common_tools()
 
     workdir = tmp_path_factory.mktemp("webdav-tpc-nginx")
-    conf_dir = workdir / "conf"
-    log_dir = workdir / "logs"
-    temp_dir = workdir / "tmp"
-    for directory in (conf_dir, log_dir, temp_dir):
-        directory.mkdir(parents=True, exist_ok=True)
 
     roots = {
         name: workdir / "data" / name
@@ -210,137 +202,57 @@ def tpc_nginx(tmp_path_factory):
         "dest_readonly": _free_port(),
     }
 
-    def server_block(port, root, auth, extra, allow_write="on"):
-        return f"""
-    server {{
-        listen {port} ssl;
-        server_name localhost;
-
-        ssl_certificate     {SERVER_CERT};
-        ssl_certificate_key {SERVER_KEY};
-        ssl_verify_client   optional_no_ca;
-        ssl_verify_depth    10;
-
-        xrootd_webdav_proxy_certs on;
-        client_max_body_size 1g;
-
-        location / {{
-            xrootd_webdav         on;
-            xrootd_webdav_root    {root};
-            xrootd_webdav_cafile  {CA_PEM};
-            xrootd_webdav_auth    {auth};
-            xrootd_webdav_allow_write {allow_write};
-{extra}
-        }}
-    }}
-"""
-
-    tpc_cafile = f"""\
-            xrootd_webdav_tpc on;
-            xrootd_webdav_tpc_cert {CLIENT_CERT};
-            xrootd_webdav_tpc_key {CLIENT_KEY};
-            xrootd_webdav_tpc_cafile {CA_PEM};
-            xrootd_webdav_tpc_timeout 10;
-"""
-    tpc_no_service_cert = f"""\
-            xrootd_webdav_tpc on;
-            xrootd_webdav_tpc_cafile {CA_PEM};
-            xrootd_webdav_tpc_timeout 10;
-"""
-    tpc_disabled = "            xrootd_webdav_tpc off;\n"
-    tpc_readonly = f"""\
-            xrootd_webdav_tpc on;
-            xrootd_webdav_tpc_cert {CLIENT_CERT};
-            xrootd_webdav_tpc_key {CLIENT_KEY};
-            xrootd_webdav_tpc_cafile {CA_PEM};
-            xrootd_webdav_tpc_timeout 10;
-"""
-
-    cadir_dest = f"""
-    server {{
-        listen {ports["dest_cadir"]} ssl;
-        server_name localhost;
-
-        ssl_certificate     {SERVER_CERT};
-        ssl_certificate_key {SERVER_KEY};
-        ssl_verify_client   optional_no_ca;
-        ssl_verify_depth    10;
-
-        xrootd_webdav_proxy_certs on;
-        client_max_body_size 1g;
-
-        location / {{
-            xrootd_webdav         on;
-            xrootd_webdav_root    {roots["dest_cadir"]};
-            xrootd_webdav_cadir   {CA_DIR};
-            xrootd_webdav_auth    required;
-            xrootd_webdav_allow_write on;
-            xrootd_webdav_tpc on;
-            xrootd_webdav_tpc_cert {CLIENT_CERT};
-            xrootd_webdav_tpc_key {CLIENT_KEY};
-            xrootd_webdav_tpc_cadir {CA_DIR};
-            xrootd_webdav_tpc_timeout 10;
-        }}
-    }}
-"""
-
-    conf = f"""\
-daemon off;
-worker_processes 2;
-error_log {log_dir}/error.log debug;
-pid       {log_dir}/nginx.pid;
-
-events {{ worker_connections 128; }}
-
-http {{
-    access_log            {log_dir}/access.log;
-    client_body_temp_path {temp_dir}/client_body;
-    proxy_temp_path       {temp_dir}/proxy;
-    fastcgi_temp_path     {temp_dir}/fastcgi;
-    uwsgi_temp_path       {temp_dir}/uwsgi;
-    scgi_temp_path        {temp_dir}/scgi;
-
-{server_block(ports["source_required"], roots["source_required"], "required", "")}
-{server_block(ports["source_open"], roots["source_open"], "none", "")}
-{server_block(ports["dest_cafile"], roots["dest_cafile"], "required", tpc_cafile)}
-{cadir_dest}
-{server_block(ports["dest_no_service_cert"], roots["dest_no_service_cert"], "required", tpc_no_service_cert)}
-{server_block(ports["dest_disabled"], roots["dest_disabled"], "required", tpc_disabled)}
-{server_block(ports["dest_readonly"], roots["dest_readonly"], "required", tpc_readonly, allow_write="off")}
-}}
-"""
-    conf_path = conf_dir / "nginx.conf"
-    conf_path.write_text(conf)
-
-    test_result = subprocess.run(
-        [NGINX_BIN, "-p", str(workdir), "-c", str(conf_path), "-t"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=10,
+    import server_control
+    info = server_control.start_nginx_instance(
+        port=ports["source_required"], nginx_bin=NGINX_BIN,
+        conf_file="nginx_webdav_tpc.conf",
+        template_kwargs={
+            "SOURCE_REQUIRED_PORT": ports["source_required"],
+            "SOURCE_REQUIRED_ROOT": roots["source_required"],
+            "SOURCE_OPEN_PORT": ports["source_open"],
+            "SOURCE_OPEN_ROOT": roots["source_open"],
+            "DEST_CAFILE_PORT": ports["dest_cafile"],
+            "DEST_CAFILE_ROOT": roots["dest_cafile"],
+            "DEST_CADIR_PORT": ports["dest_cadir"],
+            "DEST_CADIR_ROOT": roots["dest_cadir"],
+            "DEST_NO_SERVICE_CERT_PORT": ports["dest_no_service_cert"],
+            "DEST_NO_SERVICE_CERT_ROOT": roots["dest_no_service_cert"],
+            "DEST_DISABLED_PORT": ports["dest_disabled"],
+            "DEST_DISABLED_ROOT": roots["dest_disabled"],
+            "DEST_READONLY_PORT": ports["dest_readonly"],
+            "DEST_READONLY_ROOT": roots["dest_readonly"],
+            "CA_PEM": CA_PEM,
+            "CA_DIR": CA_DIR,
+            "CLIENT_CERT": CLIENT_CERT,
+            "CLIENT_KEY": CLIENT_KEY,
+        },
     )
-    assert test_result.returncode == 0, test_result.stderr.decode(errors="replace")
 
-    stderr_path = log_dir / "stderr.log"
-    stderr_fh = open(stderr_path, "wb")
-    proc = subprocess.Popen(
-        [NGINX_BIN, "-p", str(workdir), "-c", str(conf_path)],
-        stdout=subprocess.DEVNULL,
-        stderr=stderr_fh,
-    )
-    stderr_fh.close()
+    # Wait for each HTTPS endpoint to respond to OPTIONS
+    for port in ports.values():
+        ok = False
+        for _ in range(40):
+            try:
+                result = _curl(
+                    "-X",
+                    "OPTIONS",
+                    f"https://localhost:{port}/",
+                    "-o",
+                    "/dev/null",
+                    timeout=3,
+                )
+            except subprocess.TimeoutExpired:
+                time.sleep(0.2)
+                continue
+            if result.returncode == 0:
+                ok = True
+                break
+            time.sleep(0.2)
+        if not ok:
+            info["stop"]()
+            pytest.fail(f"nginx WebDAV TPC fixture did not start on port {port}.")
 
     try:
-        for port in ports.values():
-            ready, stderr = _wait_for_https(port, proc)
-            if not ready:
-                proc.terminate()
-                proc.wait(timeout=5)
-                pytest.fail(
-                    f"nginx WebDAV TPC fixture did not start on port {port}.\n"
-                    f"curl stderr: {stderr.decode(errors='replace')}\n"
-                    f"nginx stderr: {stderr_path.read_text(errors='replace')}"
-                )
-
         yield TpcNginx(
             workdir=workdir,
             source_required_port=ports["source_required"],
@@ -359,15 +271,13 @@ http {{
             dest_readonly_root=roots["dest_readonly"],
         )
     finally:
-        proc.terminate()
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            info["stop"]()
+        except Exception:
+            pass
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session", autouse=True)
 def reference_xrd_http(tmp_path_factory):
     if shutil.which(XROOTD_BIN) is None:
         pytest.skip("xrootd binary not found")
@@ -396,26 +306,24 @@ def reference_xrd_http(tmp_path_factory):
     http_port = _free_port()
     cfg_path = workdir / "xrootd-http.cfg"
     log_path = workdir / "xrootd-http.log"
+    import server_control
     cfg_path.write_text(
-        f"""\
-all.role server
-all.export /
-oss.localroot {data_root}
-all.adminpath {admin_dir}
-all.pidpath {run_dir}
-
-xrd.port {root_port}
-xrootd.seclib {sec_lib}
-xrd.protocol XrdHttp:{http_port} {http_lib}
-
-http.cert {SERVER_CERT}
-http.key {SERVER_KEY}
-http.cadir {CA_DIR}
-http.desthttps yes
-http.selfhttps2http no
-http.exthandler xrdtpc {tpc_lib}
-tpc.timeout 10
-"""
+        server_control.render_config_file(
+            "xrootd_http_tpc.conf",
+            {
+                "DATA_DIR": str(data_root),
+                "ADMIN_DIR": str(admin_dir),
+                "RUN_DIR": str(run_dir),
+                "ROOT_PORT": str(root_port),
+                "HTTP_PORT": str(http_port),
+                "SECLIB": str(sec_lib),
+                "HTTP_LIB": str(http_lib),
+                "SERVER_CERT": str(SERVER_CERT),
+                "SERVER_KEY": str(SERVER_KEY),
+                "CA_DIR": str(CA_DIR),
+                "TPC_LIB": str(tpc_lib),
+            },
+        )
     )
 
     proc = subprocess.Popen(

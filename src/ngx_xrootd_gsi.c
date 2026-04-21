@@ -208,6 +208,26 @@ xrootd_gsi_parse_x509(xrootd_ctx_t *ctx, ngx_connection_t *c)
     EVP_PKEY_CTX_free(pkctx);
     EVP_PKEY_free(peer);
 
+    /* Derive HMAC-SHA256 signing key = SHA-256(DH shared secret).
+     * Stored on ctx so xrootd_handle_sigver() can verify request signatures. */
+    {
+        EVP_MD_CTX   *mdctx = EVP_MD_CTX_new();
+        unsigned int  dlen  = 32;
+        u_char        digest[32];
+
+        if (mdctx
+            && EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) == 1
+            && EVP_DigestUpdate(mdctx, secret, secret_len) == 1
+            && EVP_DigestFinal_ex(mdctx, digest, &dlen) == 1)
+        {
+            ngx_memcpy(ctx->signing_key, digest, 32);
+            ctx->signing_active = 1;
+            ngx_log_debug0(NGX_LOG_DEBUG_STREAM, log, 0,
+                           "xrootd: GSI signing key derived (HMAC-SHA256)");
+        }
+        if (mdctx) { EVP_MD_CTX_free(mdctx); }
+    }
+
     ngx_log_debug2(NGX_LOG_DEBUG_STREAM, log, 0,
                    "xrootd: GSI DH shared secret %uz bytes, cipher='%s'",
                    secret_len,

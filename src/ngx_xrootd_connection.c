@@ -216,6 +216,14 @@ ngx_stream_xrootd_recv(ngx_event_t *rev)
             return;
         }
 
+        if (ctx->state == XRD_ST_UPSTREAM) {
+            /* Upstream query in flight; hold client reads until it completes. */
+            if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+                break;
+            }
+            return;
+        }
+
         if (ctx->state == XRD_ST_TLS_HANDSHAKE) {
             /* ngx_ssl_handshake() owns the connection events during handshake. */
             return;
@@ -351,6 +359,8 @@ ngx_stream_xrootd_recv(ngx_event_t *rev)
                 } else if (ctx->cur_reqid == kXR_auth) {
                     /* GSI cert chains with VOMS extensions can exceed 4 KB. */
                     max_pl = XROOTD_MAX_AUTH_PAYLOAD;
+                } else if (ctx->cur_reqid == kXR_prepare) {
+                    max_pl = XROOTD_MAX_PREPARE_PAYLOAD;
                 } else {
                     max_pl = XROOTD_MAX_PATH + 64;
                 }
@@ -827,6 +837,11 @@ xrootd_on_disconnect(xrootd_ctx_t *ctx, ngx_connection_t *c)
 
     /* Async completion handlers consult this before touching session state. */
     ctx->destroyed = 1;
+
+    /* Close any in-flight upstream connection before cleaning up session state. */
+    if (ctx->upstream != NULL) {
+        xrootd_upstream_cleanup(ctx->upstream);
+    }
 
     if (ctx->metrics) {
         /*

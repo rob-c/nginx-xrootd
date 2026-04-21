@@ -225,6 +225,36 @@ static ngx_command_t ngx_stream_xrootd_commands[] = {
       0,
       NULL },
 
+    /* Dynamic upstream XRootD redirector (host:port to query for redirects). */
+    { ngx_string("xrootd_upstream"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      xrootd_conf_set_upstream,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      0,
+      NULL },
+
+    /* Optional CMS manager registration/heartbeat. */
+    { ngx_string("xrootd_cms_manager"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      xrootd_conf_set_cms_manager,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("xrootd_cms_paths"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_xrootd_srv_conf_t, cms_paths),
+      NULL },
+
+    { ngx_string("xrootd_cms_interval"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_sec_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_xrootd_srv_conf_t, cms_interval),
+      NULL },
+
 #if (NGX_THREADS)
     /*
      * Async pread/pwrite support is only compiled when nginx itself was built

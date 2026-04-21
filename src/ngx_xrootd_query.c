@@ -1,5 +1,6 @@
 #include "ngx_xrootd_module.h"
 #include <ctype.h>
+#include <errno.h>
 
 /* ================================================================== */
 /*  kXR_query handler                                                   */
@@ -186,6 +187,236 @@ xrootd_qconfig_append(char *resp, size_t resp_sz, size_t *pos,
 
     *pos += (size_t) n;
     return 1;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* kXR_prepare — local-storage staging/cache hint.                     */
+/* ------------------------------------------------------------------ */
+
+static ngx_flag_t
+xrootd_prepare_has_forbidden_component(const char *path)
+{
+    const char  *p;
+    const char  *seg;
+    size_t       len;
+
+    p = path;
+
+    while (*p != '\0') {
+        while (*p == '/') {
+            p++;
+        }
+
+        seg = p;
+        while (*p != '\0' && *p != '/') {
+            p++;
+        }
+
+        len = (size_t) (p - seg);
+        if ((len == 1 && seg[0] == '.')
+            || (len == 2 && seg[0] == '.' && seg[1] == '.'))
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+static ngx_int_t
+xrootd_prepare_send_fail(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    const char *path, uint16_t errcode, const char *errmsg)
+{
+    xrootd_log_access(ctx, c, "PREPARE", path != NULL ? path : "-",
+                      "-", 0, errcode, errmsg, 0);
+
+    return xrootd_send_error(ctx, c, errcode, errmsg);
+}
+
+
+static ngx_int_t
+xrootd_prepare_check_fail(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    const char *path, uint16_t errcode, const char *errmsg)
+{
+    ngx_int_t  rc;
+
+    rc = xrootd_prepare_send_fail(ctx, c, path, errcode, errmsg);
+    return (rc == NGX_OK) ? NGX_DONE : rc;
+}
+
+
+static ngx_int_t
+xrootd_prepare_check_path(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    ngx_stream_xrootd_srv_conf_t *conf, const u_char *line, size_t line_len,
+    ngx_flag_t noerrs, ngx_uint_t *missing)
+{
+    char         pathbuf[XROOTD_MAX_PATH + 1];
+    char         resolved[PATH_MAX];
+    struct stat  st;
+
+    if (line_len > XROOTD_MAX_PATH) {
+        return xrootd_prepare_check_fail(ctx, c, "-", kXR_ArgTooLong,
+                                         "prepare path too long");
+    }
+
+    if (!xrootd_extract_path(c->log, line, line_len, pathbuf,
+                             sizeof(pathbuf), 1))
+    {
+        return xrootd_prepare_check_fail(ctx, c, "-", kXR_ArgInvalid,
+                                         "invalid prepare path");
+    }
+
+    if (xrootd_prepare_has_forbidden_component(pathbuf)) {
+        return xrootd_prepare_check_fail(ctx, c, pathbuf, kXR_ArgInvalid,
+                                         "invalid prepare path");
+    }
+
+    if (!xrootd_resolve_path(c->log, &conf->root, pathbuf, resolved,
+                             sizeof(resolved)))
+    {
+        if (noerrs) {
+            (*missing)++;
+            return NGX_OK;
+        }
+
+        return xrootd_prepare_check_fail(ctx, c, pathbuf, kXR_NotFound,
+                                         "file not found");
+    }
+
+    if (xrootd_check_vo_acl(c->log, resolved, conf->vo_rules,
+                            ctx->vo_list) != NGX_OK)
+    {
+        return xrootd_prepare_check_fail(ctx, c, resolved, kXR_NotAuthorized,
+                                         "VO not authorized");
+    }
+
+    if (stat(resolved, &st) != 0) {
+        if ((errno == ENOENT || errno == ENOTDIR) && noerrs) {
+            (*missing)++;
+            return NGX_OK;
+        }
+
+        if (errno == ENOENT || errno == ENOTDIR) {
+            return xrootd_prepare_check_fail(ctx, c, pathbuf, kXR_NotFound,
+                                             "file not found");
+        }
+
+        if (errno == EACCES || errno == EPERM) {
+            return xrootd_prepare_check_fail(ctx, c, resolved, kXR_NotAuthorized,
+                                             "not authorized");
+        }
+
+        return xrootd_prepare_check_fail(ctx, c, resolved, kXR_IOError,
+                                         "prepare stat failed");
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        if (noerrs) {
+            (*missing)++;
+            return NGX_OK;
+        }
+
+        return xrootd_prepare_check_fail(ctx, c, pathbuf, kXR_isDirectory,
+                                         "prepare target is a directory");
+    }
+
+    return NGX_OK;
+}
+
+
+ngx_int_t
+xrootd_handle_prepare(xrootd_ctx_t *ctx, ngx_connection_t *c,
+    ngx_stream_xrootd_srv_conf_t *conf)
+{
+    ClientPrepareRequest  *req;
+    const u_char          *p;
+    const u_char          *end;
+    const u_char          *line;
+    size_t                 line_len;
+    ngx_uint_t             paths;
+    ngx_uint_t             missing;
+    uint16_t               optionx;
+    ngx_int_t              rc;
+    char                   detail[96];
+
+    req = (ClientPrepareRequest *) ctx->hdr_buf;
+    optionx = ntohs(req->optionX);
+    paths = 0;
+    missing = 0;
+
+    if ((req->options & kXR_wmode) && !conf->allow_write) {
+        return xrootd_prepare_send_fail(ctx, c, "-", kXR_fsReadOnly,
+                                        "this is a read-only server");
+    }
+
+    /*
+     * Local disk has no staging queue or cache layer to cancel/evict from.
+     * Acknowledge those hints so official clients do not treat them as fatal.
+     */
+    if ((req->options & kXR_cancel) || (optionx & kXR_evict)) {
+        snprintf(detail, sizeof(detail), "noop opts=0x%02x optx=0x%04x",
+                 (unsigned int) req->options, (unsigned int) optionx);
+        xrootd_log_access(ctx, c, "PREPARE", "-", detail, 1, kXR_ok, NULL, 0);
+        return xrootd_send_ok(ctx, c, NULL, 0);
+    }
+
+    if (ctx->cur_dlen == 0 || ctx->payload == NULL) {
+        return xrootd_prepare_send_fail(ctx, c, "-", kXR_ArgMissing,
+                                        "prepare file list is missing");
+    }
+
+    p = ctx->payload;
+    end = ctx->payload + ctx->cur_dlen;
+
+    while (p < end) {
+        line = p;
+        while (p < end && *p != '\n') {
+            p++;
+        }
+
+        line_len = (size_t) (p - line);
+        if (p < end && *p == '\n') {
+            p++;
+        }
+
+        while (line_len > 0
+               && (line[line_len - 1] == '\r'
+                   || line[line_len - 1] == '\0'))
+        {
+            line_len--;
+        }
+
+        if (line_len == 0) {
+            continue;
+        }
+
+        paths++;
+
+        rc = xrootd_prepare_check_path(ctx, c, conf, line, line_len,
+                                       (req->options & kXR_noerrs) != 0,
+                                       &missing);
+        if (rc == NGX_DONE) {
+            return NGX_OK;
+        }
+        if (rc != NGX_OK) {
+            return rc;
+        }
+    }
+
+    if (paths == 0) {
+        return xrootd_prepare_send_fail(ctx, c, "-", kXR_ArgMissing,
+                                        "prepare file list is empty");
+    }
+
+    snprintf(detail, sizeof(detail),
+             "paths=%u missing=%u opts=0x%02x optx=0x%04x",
+             (unsigned int) paths, (unsigned int) missing,
+             (unsigned int) req->options, (unsigned int) optionx);
+
+    xrootd_log_access(ctx, c, "PREPARE", "-", detail, 1, kXR_ok, NULL, 0);
+    return xrootd_send_ok(ctx, c, NULL, 0);
 }
 
 

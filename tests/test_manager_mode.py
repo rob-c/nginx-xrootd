@@ -11,12 +11,11 @@ import os
 import shutil
 import socket
 import struct
-import subprocess
-import time
 
 import pytest
 
-NGINX_BIN = "/tmp/nginx-1.28.3/objs/nginx"
+from settings import NGINX_BIN
+
 WORKDIR = "/tmp/xrd-manager-mode-test"
 
 
@@ -26,30 +25,14 @@ def _free_port():
         return sock.getsockname()[1]
 
 
-def _wait_for_port(host, port, proc, timeout=5):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            return False
-        try:
-            with socket.create_connection((host, port), timeout=0.2):
-                return True
-        except OSError:
-            time.sleep(0.1)
-    return False
-
-
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session", autouse=True)
 def manager_nginx():
     if not os.path.exists(NGINX_BIN):
         pytest.skip(f"nginx binary not found at {NGINX_BIN}")
 
     # Prepare workspace
     shutil.rmtree(WORKDIR, ignore_errors=True)
-    conf_dir = os.path.join(WORKDIR, "conf")
-    log_dir = os.path.join(WORKDIR, "logs")
-    os.makedirs(conf_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
+    import server_control
 
     port = _free_port()
 
@@ -59,13 +42,10 @@ def manager_nginx():
     map_b_host = "backend2.example.org"
     map_b_port = 12345
 
-    conf_path = os.path.join(conf_dir, "nginx.conf")
-    with open(conf_path, "w", encoding="utf-8") as fh:
-        fh.write(f"""\
-daemon off;
+    conf_text = f"""\
 worker_processes 1;
-error_log {log_dir}/error.log info;
-pid       {log_dir}/nginx.pid;
+error_log {{LOG_DIR}}/error.log info;
+pid       {{LOG_DIR}}/nginx.pid;
 
 events {{ worker_connections 128; }}
 
@@ -77,36 +57,32 @@ stream {{
         xrootd_manager_map /maps/prefix {map_b_host}:{map_b_port};
     }}
 }}
-""")
+"""
 
-    stderr_path = os.path.join(log_dir, "stderr.log")
-    stderr_fh = open(stderr_path, "w")
-    proc = subprocess.Popen(
-        [NGINX_BIN, "-c", conf_path],
-        stdout=subprocess.DEVNULL,
-        stderr=stderr_fh,
+    info = server_control.start_nginx_instance(
+        port=port, nginx_bin=NGINX_BIN,
+        conf_file="nginx_manager.conf",
+        template_kwargs={
+            "MAP_A_HOST": map_a_host,
+            "MAP_A_PORT": map_a_port,
+            "MAP_B_HOST": map_b_host,
+            "MAP_B_PORT": map_b_port,
+        },
     )
-    stderr_fh.close()
 
-    if not _wait_for_port("127.0.0.1", port, proc):
-        proc.terminate()
-        proc.wait(timeout=5)
-        with open(stderr_path, encoding="utf-8", errors="replace") as fh:
-            stderr = fh.read()
-        pytest.fail(f"manager-mode nginx did not start\nstderr:\n{stderr}")
-
-    yield {
-        "proc": proc,
-        "port": port,
-        "map_a": (map_a_host, map_a_port),
-        "map_b": (map_b_host, map_b_port),
-    }
-
-    proc.terminate()
     try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+        yield {
+            "proc": None,
+            "port": info["port"],
+            "map_a": (map_a_host, map_a_port),
+            "map_b": (map_b_host, map_b_port),
+            "stop": info["stop"],
+        }
+    finally:
+        try:
+            info["stop"]()
+        except Exception:
+            pass
 
 
 def _xrd_handshake_and_login(host: str, port: int):

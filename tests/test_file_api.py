@@ -23,16 +23,19 @@ from XRootD.client.flags import (
     OpenFlags,
     StatInfoFlags,
 )
+from backend_matrix import selected_backend_name
+from settings import CA_DIR as DEFAULT_CA_DIR, DATA_ROOT as DEFAULT_DATA_ROOT, PROXY_STD
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-ANON_URL  = "root://localhost:11094"
-GSI_URL   = "root://localhost:11095"
-DATA_DIR  = "/tmp/xrd-test/data"
-CA_DIR    = "/tmp/xrd-test/pki/ca"
-PROXY_PEM = "/tmp/xrd-test/pki/user/proxy_std.pem"
+CROSS_BACKEND = selected_backend_name()
+ANON_URL  = ""
+GSI_URL   = ""
+DATA_DIR  = DEFAULT_DATA_ROOT
+CA_DIR    = DEFAULT_CA_DIR
+PROXY_PEM = PROXY_STD
 
 PREFIX = "_api_test_"   # all test files/dirs carry this prefix
 
@@ -81,6 +84,22 @@ def md5file(path: str) -> str:
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module", autouse=True)
+def _configure(test_env, ref_xrootd, ref_xrootd_gsi_shared):
+    """Bind module constants from the selected shared test environment."""
+    global ANON_URL, GSI_URL, DATA_DIR, CA_DIR, PROXY_PEM
+    if CROSS_BACKEND == "xrootd":
+        ANON_URL = ref_xrootd["url"]
+        GSI_URL = ref_xrootd_gsi_shared["url"]
+        DATA_DIR = ref_xrootd["data_dir"]
+    else:
+        ANON_URL = test_env["anon_url"]
+        GSI_URL = test_env["gsi_url"]
+        DATA_DIR = test_env["data_dir"]
+    CA_DIR    = test_env["ca_dir"]
+    PROXY_PEM = test_env["proxy_pem"]
+
 
 @pytest.fixture(autouse=True)
 def clean_prefix():

@@ -15,6 +15,7 @@ import time
 
 import pytest
 from XRootD import client
+from settings import CA_DIR as DEFAULT_CA_DIR, DATA_ROOT as DEFAULT_DATA_ROOT, PROXY_STD
 
 # All tests in this module transfer 200 MB files — give them ample time.
 pytestmark = pytest.mark.timeout(240)
@@ -23,12 +24,12 @@ pytestmark = pytest.mark.timeout(240)
 # Configuration
 # ---------------------------------------------------------------------------
 
-ANON_URL  = "root://localhost:11094"
-GSI_URL   = "root://localhost:11095"
+ANON_URL  = ""
+GSI_URL   = ""
 
-DATA_ROOT  = "/tmp/xrd-test/data"
-CA_DIR     = "/tmp/xrd-test/pki/ca"
-PROXY_PEM  = "/tmp/xrd-test/pki/user/proxy_std.pem"
+DATA_ROOT  = DEFAULT_DATA_ROOT
+CA_DIR     = DEFAULT_CA_DIR
+PROXY_PEM  = PROXY_STD
 
 LARGE_FILE      = "large200.bin"
 LARGE_FILE_SIZE = 200 * 1024 * 1024   # 200 MiB
@@ -118,7 +119,13 @@ def _check_md5(data: bytes):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module", autouse=True)
-def gsi_env():
+def _configure(test_env):
+    global ANON_URL, GSI_URL, DATA_ROOT, CA_DIR, PROXY_PEM
+    ANON_URL  = test_env["anon_url"]
+    GSI_URL   = test_env["gsi_url"]
+    DATA_ROOT = test_env["data_dir"]
+    CA_DIR    = test_env["ca_dir"]
+    PROXY_PEM = test_env["proxy_pem"]
     _set_gsi_env()
 
 

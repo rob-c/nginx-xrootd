@@ -20,12 +20,24 @@ import time
 
 import pytest
 import urllib.request
+from settings import CA_DIR as DEFAULT_CA_DIR, PROXY_STD
 
-METRICS_URL = "http://localhost:9100/metrics"
-ANON_PORT   = "11094"
-GSI_PORT    = "11095"
-CA_DIR      = "/tmp/xrd-test/pki/ca"
-PROXY_PEM   = "/tmp/xrd-test/pki/user/proxy_std.pem"
+METRICS_URL = ""
+ANON_PORT   = ""
+GSI_PORT    = ""
+CA_DIR      = DEFAULT_CA_DIR
+PROXY_PEM   = PROXY_STD
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _configure(test_env):
+    """Bind module constants from the shared test environment."""
+    global METRICS_URL, ANON_PORT, GSI_PORT, CA_DIR, PROXY_PEM
+    METRICS_URL = test_env["metrics_url"]
+    ANON_PORT   = str(test_env["anon_port"])
+    GSI_PORT    = str(test_env["gsi_port"])
+    CA_DIR      = test_env["ca_dir"]
+    PROXY_PEM   = test_env["proxy_pem"]
 
 
 # ---------------------------------------------------------------------------
@@ -245,10 +257,12 @@ class TestAnonCounters:
 class TestGSICounters:
     """Basic GSI metrics — verify the gsi server slot appears after a transfer."""
 
-    GSI_ENV = {
-        "X509_CERT_DIR":   CA_DIR,
-        "X509_USER_PROXY": PROXY_PEM,
-    }
+    @property
+    def GSI_ENV(self):
+        return {
+            "X509_CERT_DIR":   CA_DIR,
+            "X509_USER_PROXY": PROXY_PEM,
+        }
 
     def test_gsi_server_appears_in_metrics(self):
         with tempfile.NamedTemporaryFile(delete=False) as f:

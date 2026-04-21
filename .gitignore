@@ -20,3 +20,6 @@ __pycache__/
 .codex/
 .pytest_cache/
 .venv/
+
+# Local helper scripts not for upstream
+tools/

@@ -290,11 +290,52 @@ Map requests for a path prefix to an external manager/redirector endpoint. When 
 
 The `host:port` value may be an IPv4 address or an IPv6 literal using bracket notation (for example: `[::1]:1234`). See [Manager Mode](manager-mode.md) for full semantics and examples.
 
-Example:
-
 ```nginx
 xrootd_manager_map /maps backend.example.org:54321;
 ```
+
+---
+
+### `xrootd_upstream host:port`
+
+Configures an upstream XRootD redirector to forward requests to when no local `xrootd_manager_map` prefix matches. The module connects to the specified host:port, performs a minimal XRootD handshake, and relays the client request (currently `kXR_locate`, `kXR_open`, and `kXR_stat`). Upstream responses are forwarded verbatim:
+
+- `kXR_redirect` — forwarded to the client as-is
+- `kXR_wait` — timer is scheduled; the request is retried after the specified delay (capped at 60 s)
+- `kXR_waitresp` — forwarded to the client; the upstream sends an unsolicited reply when ready
+- `kXR_ok` / `kXR_error` — forwarded to the client
+
+Used together with `xrootd_manager_map` to build a two-tier topology: static prefix rules handle known paths, and the catch-all upstream handles anything else.
+
+```nginx
+xrootd_upstream redirector.example.org:1094;
+```
+
+---
+
+### `xrootd_cms_manager host:port`
+
+Registers this data server with an XRootD CMS manager and starts a per-worker
+heartbeat connection. The manager address is resolved during config parsing.
+
+```nginx
+xrootd_cms_manager cms-manager.example.org:1213;
+xrootd_cms_paths /store;
+xrootd_cms_interval 30s;
+```
+
+### `xrootd_cms_paths <string>`
+
+**Default:** `xrootd_root`
+
+Path string advertised in the CMS login packet. Use this when the exported CMS
+namespace differs from the local filesystem root.
+
+### `xrootd_cms_interval <time>`
+
+**Default:** `30s`
+
+How often each worker sends CMS load/availability heartbeats after registration.
 
 ## Complete examples
 
@@ -472,6 +513,11 @@ http {
 | `xrootd_token_audience <string>` | `server` | — | If token JWKS is configured |
 | `xrootd_access_log <path>\|off` | `server` | `off` | No |
 | `xrootd_thread_pool <name>` | `server` | `default` | No |
+| `xrootd_manager_map /prefix host:port` | `server` | — | No |
+| `xrootd_upstream host:port` | `server` | — | No |
+| `xrootd_cms_manager host:port` | `server` | — | No |
+| `xrootd_cms_paths <string>` | `server` | `xrootd_root` | No |
+| `xrootd_cms_interval <time>` | `server` | `30s` | No |
 | `xrootd_metrics on\|off` | `location` (HTTP) | `off` | No |
 
 ---

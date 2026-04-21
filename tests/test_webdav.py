@@ -40,15 +40,16 @@ import xml.etree.ElementTree as ET
 import pytest
 import urllib.request
 import ssl
+from settings import CA_CERT, DATA_ROOT as DEFAULT_DATA_ROOT, PROXY_STD
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-BASE_URL   = "https://localhost:8443"
-CA_PEM     = "/tmp/xrd-test/pki/ca/ca.pem"
-PROXY_PEM  = "/tmp/xrd-test/pki/user/proxy_std.pem"
-DATA_ROOT  = "/tmp/xrd-test/data"
+BASE_URL   = ""
+CA_PEM     = CA_CERT
+PROXY_PEM  = PROXY_STD
+DATA_ROOT  = DEFAULT_DATA_ROOT
 
 # Unique prefix for test artefacts so parallel runs don't collide
 _PFX = "wdav_"
@@ -139,15 +140,19 @@ def _data_path(rel: str) -> str:
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session", autouse=True)
-def nginx_webdav_ready():
-    """Skip the whole module if the WebDAV endpoint is not up."""
+def nginx_webdav_ready(test_env):
+    """Bind module constants from the shared test environment."""
+    global BASE_URL, CA_PEM, PROXY_PEM, DATA_ROOT
+    BASE_URL  = test_env["webdav_url"]
+    CA_PEM    = test_env["ca_pem"]
+    PROXY_PEM = test_env["proxy_pem"]
+    DATA_ROOT = test_env["data_dir"]
+
     rc, _, _ = _curl("-X", "OPTIONS", f"{BASE_URL}/", "-o", "/dev/null",
                      timeout=5)
     if rc != 0:
         pytest.skip(
-            f"WebDAV endpoint {BASE_URL} not reachable. "
-            "Start nginx with: /tmp/nginx-1.28.3/objs/nginx "
-            "-p /tmp/xrd-test -c conf/nginx.conf"
+            f"WebDAV endpoint {BASE_URL} not reachable."
         )
 
 

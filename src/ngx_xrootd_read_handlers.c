@@ -335,6 +335,13 @@ xrootd_handle_open(xrootd_ctx_t *ctx, ngx_connection_t *c,
         /* Read opens are strict: the final target must already exist and canonicalize. */
         if (!xrootd_resolve_path(c->log, &conf->root,
                                  clean_path, resolved, sizeof(resolved))) {
+            /* No local file — query upstream redirector if configured */
+            if (conf->upstream_host.len > 0) {
+                xrootd_log_access(ctx, c, "OPEN", clean_path,
+                                  "upstream", 1, 0, NULL, 0);
+                XROOTD_OP_OK(ctx, XROOTD_OP_OPEN_RD);
+                return xrootd_upstream_start(ctx, c, conf);
+            }
             xrootd_log_access(ctx, c, "OPEN", clean_path, "rd",
                               0, kXR_NotFound, "file not found", 0);
             XROOTD_OP_ERR(ctx, XROOTD_OP_OPEN_RD);
@@ -1003,6 +1010,47 @@ xrootd_handle_read(xrootd_ctx_t *ctx, ngx_connection_t *c)
         return NGX_ERROR;
     }
 
+#if (NGX_THREADS)
+    {
+        ngx_stream_xrootd_srv_conf_t *rconf =
+            ngx_stream_get_module_srv_conf(
+                (ngx_stream_session_t *)(c->data), ngx_stream_xrootd_module);
+
+        if (rconf->thread_pool != NULL) {
+            ngx_thread_task_t *task;
+            xrootd_read_aio_t *t;
+
+            task = ngx_thread_task_alloc(c->pool, sizeof(xrootd_read_aio_t));
+            if (task == NULL) {
+                xrootd_release_read_buffer(ctx, c, databuf);
+                return NGX_ERROR;
+            }
+
+            t = task->ctx;
+            t->c           = c;
+            t->ctx         = ctx;
+            t->fd          = fd;
+            t->handle_idx  = idx;
+            t->offset      = (off_t) offset;
+            t->rlen        = rlen;
+            t->databuf     = databuf;
+            t->streamid[0] = ctx->cur_streamid[0];
+            t->streamid[1] = ctx->cur_streamid[1];
+
+            task->handler       = xrootd_read_aio_thread;
+            task->event.handler = xrootd_read_aio_done;
+            task->event.data    = task;
+
+            if (ngx_thread_task_post(rconf->thread_pool, task) == NGX_OK) {
+                ctx->state = XRD_ST_AIO;
+                return NGX_OK;
+            }
+            ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                          "xrootd: thread_task_post failed, sync read fallback");
+        }
+    }
+#endif /* NGX_THREADS */
+
     nread = pread(fd, databuf, rlen, (off_t) offset);
     if (nread < 0) {
         xrootd_release_read_buffer(ctx, c, databuf);
@@ -1106,6 +1154,55 @@ xrootd_handle_pgread(xrootd_ctx_t *ctx, ngx_connection_t *c)
     }
 
     fd = ctx->files[idx].fd;
+
+#if (NGX_THREADS)
+    {
+        ngx_stream_xrootd_srv_conf_t *rconf =
+            ngx_stream_get_module_srv_conf(
+                (ngx_stream_session_t *)(c->data), ngx_stream_xrootd_module);
+
+        if (rconf->thread_pool != NULL) {
+            ngx_thread_task_t    *task;
+            xrootd_pgread_aio_t  *t;
+            size_t                n_pages_max, scratch_size;
+            u_char               *scratch;
+
+            n_pages_max  = (rlen + kXR_pgPageSZ - 1) / kXR_pgPageSZ;
+            if (n_pages_max == 0) { n_pages_max = 1; }
+            /* scratch holds flat data first, then interleaved data+CRC output */
+            scratch_size = rlen + n_pages_max * kXR_pgUnitSZ;
+
+            scratch = xrootd_get_read_scratch(ctx, c, scratch_size);
+            if (scratch == NULL) { return NGX_ERROR; }
+
+            task = ngx_thread_task_alloc(c->pool, sizeof(xrootd_pgread_aio_t));
+            if (task == NULL) { return NGX_ERROR; }
+
+            t = task->ctx;
+            t->c           = c;
+            t->ctx         = ctx;
+            t->fd          = fd;
+            t->handle_idx  = idx;
+            t->offset      = (off_t) offset;
+            t->rlen        = rlen;
+            t->scratch     = scratch;
+            t->out_size    = 0;
+            t->streamid[0] = ctx->cur_streamid[0];
+            t->streamid[1] = ctx->cur_streamid[1];
+
+            task->handler       = xrootd_pgread_aio_thread;
+            task->event.handler = xrootd_pgread_aio_done;
+            task->event.data    = task;
+
+            if (ngx_thread_task_post(rconf->thread_pool, task) == NGX_OK) {
+                ctx->state = XRD_ST_AIO;
+                return NGX_OK;
+            }
+            ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                          "xrootd: thread_task_post failed, sync pgread fallback");
+        }
+    }
+#endif /* NGX_THREADS */
 
     /* Read raw data into a temporary flat buffer. */
     flat_buf = ngx_palloc(c->pool, rlen);
@@ -1260,6 +1357,13 @@ xrootd_handle_locate(xrootd_ctx_t *ctx, ngx_connection_t *c,
         /* Verify the path exists and is accessible. */
         if (!xrootd_resolve_path(c->log, &conf->root,
                                  reqpath_buf, resolved, sizeof(resolved))) {
+            /* No local file — query upstream redirector if configured */
+            if (conf->upstream_host.len > 0) {
+                xrootd_log_access(ctx, c, "LOCATE", reqpath_buf,
+                                  "upstream", 1, 0, NULL, 0);
+                XROOTD_OP_OK(ctx, XROOTD_OP_LOCATE);
+                return xrootd_upstream_start(ctx, c, conf);
+            }
             xrootd_log_access(ctx, c, "LOCATE", reqpath_buf, "-",
                               0, kXR_NotFound, "file not found", 0);
             XROOTD_OP_ERR(ctx, XROOTD_OP_LOCATE);

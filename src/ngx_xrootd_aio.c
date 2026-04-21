@@ -654,4 +654,144 @@ xrootd_readv_aio_done(ngx_event_t *ev)
     xrootd_aio_resume(c);
 }
 
+void
+xrootd_pgread_aio_thread(void *data, ngx_log_t *log)
+{
+    xrootd_pgread_aio_t *t = data;
+    size_t    n_pages, i;
+    u_char   *src, *dst;
+    size_t    remaining;
+    uint32_t  crc, crc_be;
+    size_t    page_data;
+
+    /*
+     * Phase 1: pread into the flat portion of scratch (scratch[0..rlen-1]).
+     * Phase 2: interleave data + CRC32c into scratch[rlen..], page by page.
+     * Both phases run on the worker thread to keep CRC off the event loop.
+     */
+
+    t->nread = pread(t->fd, t->scratch, t->rlen, t->offset);
+    if (t->nread <= 0) {
+        t->io_errno = (t->nread < 0) ? errno : 0;
+        t->out_size = 0;
+        return;
+    }
+
+    n_pages   = ((size_t) t->nread + kXR_pgPageSZ - 1) / kXR_pgPageSZ;
+    src       = t->scratch;
+    dst       = t->scratch + t->rlen;   /* interleaved output region */
+    remaining = (size_t) t->nread;
+
+    for (i = 0; i < n_pages; i++) {
+        page_data = (remaining >= (size_t) kXR_pgPageSZ)
+                    ? (size_t) kXR_pgPageSZ : remaining;
+        crc    = xrootd_crc32c(src, page_data);
+        crc_be = htonl(crc);
+
+        ngx_memcpy(dst, src, page_data);
+        dst       += page_data;
+        src       += page_data;
+        remaining -= page_data;
+
+        ngx_memcpy(dst, &crc_be, 4);
+        dst += 4;
+    }
+
+    t->out_size = (size_t)(dst - (t->scratch + t->rlen));
+}
+
+void
+xrootd_pgread_aio_done(ngx_event_t *ev)
+{
+    ngx_thread_task_t    *task = ev->data;
+    xrootd_pgread_aio_t  *t   = task->ctx;
+    xrootd_ctx_t         *ctx = t->ctx;
+    ngx_connection_t     *c   = t->c;
+    ServerStatusResponse_pgRead *hdr_buf;
+    ngx_chain_t *cl_hdr, *cl_data, *rsp_chain;
+    char detail[64];
+
+    if (ctx->destroyed) { return; }
+
+    ctx->cur_streamid[0] = t->streamid[0];
+    ctx->cur_streamid[1] = t->streamid[1];
+    ctx->state   = XRD_ST_REQ_HEADER;
+    ctx->hdr_pos = 0;
+
+    if (t->nread < 0) {
+        xrootd_release_read_buffer(ctx, c, t->scratch);
+        XROOTD_OP_ERR(ctx, XROOTD_OP_PGREAD);
+        xrootd_send_error(ctx, c, kXR_IOError,
+                          t->io_errno ? strerror(t->io_errno) : "async pgread error");
+        xrootd_aio_resume(c);
+        return;
+    }
+
+    /* EOF at requested offset: return an empty kXR_status frame. */
+    if (t->nread == 0 || t->out_size == 0) {
+        hdr_buf = ngx_palloc(c->pool, sizeof(*hdr_buf));
+        if (hdr_buf) {
+            xrootd_build_pgread_status(ctx, t->offset, 0, hdr_buf);
+            XROOTD_OP_OK(ctx, XROOTD_OP_PGREAD);
+            xrootd_queue_response(ctx, c, (u_char *) hdr_buf, sizeof(*hdr_buf));
+        }
+        xrootd_release_read_buffer(ctx, c, t->scratch);
+        xrootd_aio_resume(c);
+        return;
+    }
+
+    /* Build the 32-byte kXR_status header. */
+    hdr_buf = ngx_palloc(c->pool, sizeof(*hdr_buf));
+    if (hdr_buf == NULL) {
+        xrootd_release_read_buffer(ctx, c, t->scratch);
+        xrootd_aio_resume(c);
+        return;
+    }
+    xrootd_build_pgread_status(ctx, t->offset, (uint32_t) t->out_size, hdr_buf);
+
+    /* Chain: status header → interleaved data (scratch + rlen). */
+    cl_hdr = ngx_alloc_chain_link(c->pool);
+    if (cl_hdr == NULL) {
+        xrootd_release_read_buffer(ctx, c, t->scratch);
+        xrootd_aio_resume(c);
+        return;
+    }
+    cl_hdr->buf = ngx_calloc_buf(c->pool);
+    if (cl_hdr->buf == NULL) {
+        xrootd_release_read_buffer(ctx, c, t->scratch);
+        xrootd_aio_resume(c);
+        return;
+    }
+    cl_hdr->buf->pos      = (u_char *) hdr_buf;
+    cl_hdr->buf->last     = cl_hdr->buf->pos + sizeof(*hdr_buf);
+    cl_hdr->buf->memory   = 1;
+    cl_hdr->buf->last_buf = 0;
+
+    /* The interleaved output sits at scratch + rlen for out_size bytes. */
+    cl_data = xrootd_build_chunked_chain(ctx, c,
+                                         t->scratch + t->rlen, t->out_size);
+    if (cl_data == NULL) {
+        xrootd_release_read_buffer(ctx, c, t->scratch);
+        xrootd_aio_resume(c);
+        return;
+    }
+    cl_hdr->next = cl_data;
+    rsp_chain    = cl_hdr;
+
+    ctx->files[t->handle_idx].bytes_read += (size_t) t->nread;
+    ctx->session_bytes                   += (size_t) t->nread;
+
+    snprintf(detail, sizeof(detail), "%lld+%zu",
+             (long long) t->offset, (size_t) t->nread);
+    xrootd_log_access(ctx, c, "PGREAD", ctx->files[t->handle_idx].path,
+                      detail, 1, 0, NULL, (size_t) t->nread);
+    XROOTD_OP_OK(ctx, XROOTD_OP_PGREAD);
+
+    xrootd_queue_response_chain(ctx, c, rsp_chain, t->scratch);
+    if (ctx->state != XRD_ST_SENDING) {
+        xrootd_release_read_buffer(ctx, c, t->scratch);
+    }
+    xrootd_aio_resume(c);
+}
+
 #endif /* NGX_THREADS */
